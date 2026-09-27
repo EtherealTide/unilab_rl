@@ -394,6 +394,10 @@ METRIC_SPECS: dict[str, MetricSpec] = {
         _collector_ms("Perf/collector_inference_request_ms", "Request policy inference."),
         _collector_ms("Perf/collector_learner_action_wait_ms", "Wait for learner actions."),
         _collector_ms("Perf/collector_env_step_ms", "Environment step wall time."),
+        _collector_ms(
+            "Perf/collector_env_step_action_backend_ms",
+            "Apply actions and execute the backend step.",
+        ),
         _collector_ms("Perf/collector_env_step_backend_ms", "Backend environment step."),
         _collector_ms(
             "Perf/collector_env_step_update_state_ms",

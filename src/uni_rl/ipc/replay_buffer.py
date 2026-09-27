@@ -30,6 +30,7 @@ class ReplayBuffer(SharedBufferBase):
         ingress_slot_rows: int,
         critic_dim: int = 0,
         ingress_depth: int = DEFAULT_INGRESS_DEPTH,
+        ingress_device: str | torch.device = "cpu",
     ):
         super().__init__(capacity, device, defer_gpu=True)
         self._obs_dim = obs_dim
@@ -47,6 +48,7 @@ class ReplayBuffer(SharedBufferBase):
         self._init_bounded_ingress(
             slot_rows=ingress_slot_rows,
             depth=int(ingress_depth),
+            ingress_device=ingress_device,
         )
 
     def _init_packed_layout(self, obs_dim: int, action_dim: int, critic_dim: int) -> None:
@@ -72,7 +74,13 @@ class ReplayBuffer(SharedBufferBase):
             self._ncritic_sl = slice(c, c + critic_dim)
             c += critic_dim
 
-    def _init_bounded_ingress(self, *, slot_rows: int, depth: int) -> None:
+    def _init_bounded_ingress(
+        self,
+        *,
+        slot_rows: int,
+        depth: int,
+        ingress_device: str | torch.device = "cpu",
+    ) -> None:
         if slot_rows <= 0:
             raise ValueError("ingress_slot_rows must be positive")
         if slot_rows > self.capacity:
@@ -81,8 +89,17 @@ class ReplayBuffer(SharedBufferBase):
             raise ValueError("ingress_depth must be positive")
         self._ingress_slot_rows = slot_rows
         self._ingress_depth = depth
+        self._ingress_device = torch.device(ingress_device)
+        if self._ingress_device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"CUDA replay ingress requested on unavailable {self._ingress_device}"
+            )
         self._ingress_slots = [
-            torch.empty((slot_rows, self._storage_width), dtype=torch.float32).share_memory_()
+            torch.empty(
+                (slot_rows, self._storage_width),
+                dtype=torch.float32,
+                device=self._ingress_device,
+            ).share_memory_()
             for _ in range(depth)
         ]
         self._ingress_starts = torch.zeros(depth, dtype=torch.int64).share_memory_()
@@ -102,7 +119,13 @@ class ReplayBuffer(SharedBufferBase):
 
     @property
     def host_storage_bytes(self) -> int:
+        if self._ingress_device.type == "cuda":
+            return 0
         return sum(slot.numel() * slot.element_size() for slot in self._ingress_slots)
+
+    @property
+    def ingress_device(self) -> torch.device:
+        return self._ingress_device
 
     @property
     def published_ptr(self) -> int:
@@ -136,9 +159,16 @@ class ReplayBuffer(SharedBufferBase):
         self._ingress_free.release()
 
     def close(self) -> None:
+        if bool(self._ingress_closed[0]):
+            return
         self._ingress_closed[0] = True
         for _ in range(self._ingress_depth):
             self._ingress_free.release()
+        self._ingress_slots.clear()
+
+    def release_ipc(self) -> None:
+        """Release this process's ingress IPC views without closing the buffer."""
+        self._ingress_slots.clear()
 
     def __getstate__(self) -> dict:
         """Custom pickle support.
@@ -247,6 +277,12 @@ class ReplayBuffer(SharedBufferBase):
                 target[:, self._ncritic_sl] if has_critic else None,
                 terminal_next_critic,
             )
+            if self._ingress_device.type == "cuda":
+                # The CPU semaphore cannot order producer CUDA writes against
+                # the learner's ingress copy. Publish only after the producer
+                # stream that wrote this slot has completed; retain this
+                # conservative barrier rather than using a cross-process event.
+                torch.cuda.current_stream(self._ingress_device).synchronize()
             start = int(self._published_ptr[0])
             self._ingress_starts[slot] = start
             self._ingress_counts[slot] = count

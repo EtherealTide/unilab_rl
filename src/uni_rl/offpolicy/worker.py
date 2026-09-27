@@ -160,6 +160,8 @@ def _wait_for_inference_tick(
         try:
             received_tick = int(coordination_queue.get(timeout=0.1))
         except queue.Empty:
+            if stop_event.is_set():
+                return False
             if learner_coordination is None:
                 if time.monotonic() - last_progress_change >= timeout:
                     raise TimeoutError(f"Timed out waiting for off-policy inference tick {tick_id}")
@@ -188,6 +190,38 @@ def _wait_for_inference_tick(
             )
         return True
     return False
+
+
+def _collector_action_numpy(actions: np.ndarray | torch.Tensor) -> np.ndarray:
+    """Return the legacy NumPy action contract for CPU collectors."""
+    if isinstance(actions, torch.Tensor):
+        return actions.detach().cpu().numpy()
+    return np.asarray(actions, dtype=np.float32)
+
+
+def _tensor_count_pair_to_cpu(first: torch.Tensor, second: torch.Tensor) -> tuple[int, int]:
+    """Transfer two scalar counts with one GPU-to-host synchronization."""
+    values = torch.stack((first.reshape(()), second.reshape(()))).cpu()
+    return int(values[0].item()), int(values[1].item())
+
+
+def _finished_episode_values_to_cpu(
+    rewards: torch.Tensor,
+    lengths: torch.Tensor,
+    rows: torch.Tensor,
+) -> tuple[list[float], list[int]]:
+    """Transfer finished reward/length pairs with one host transfer."""
+    # Episode lengths are bounded well below 2^53, so float64 preserves their
+    # exact integer values while allowing both metric columns to share a copy.
+    packed = torch.stack(
+        (
+            rewards[rows].to(dtype=torch.float64),
+            lengths[rows].to(dtype=torch.float64),
+        ),
+        dim=1,
+    ).cpu()
+    values = packed.tolist()
+    return [row[0] for row in values], [int(row[1]) for row in values]
 
 
 def off_policy_collector_fn(
@@ -307,8 +341,21 @@ def _run_collector(
     # unbounded list here grows for the entire run.
     ep_rewards: deque[float] = deque(maxlen=100)
     ep_lengths: deque[int] = deque(maxlen=100)
+    state = env.state
+    assert state is not None
+    tensor_collector = isinstance(state.obs.get("obs"), torch.Tensor)
     current_ep_rewards = np.zeros(num_envs, dtype=np.float32)
     current_ep_lengths = np.zeros(num_envs, dtype=np.int32)
+    current_ep_rewards_t = (
+        torch.zeros(num_envs, dtype=torch.float32, device=state.obs["obs"].device)
+        if tensor_collector
+        else None
+    )
+    current_ep_lengths_t = (
+        torch.zeros(num_envs, dtype=torch.int32, device=state.obs["obs"].device)
+        if tensor_collector
+        else None
+    )
 
     ep_reward_components = defaultdict(list)
     timing_accum_ms: defaultdict[str, float] = defaultdict(float)
@@ -316,13 +363,33 @@ def _run_collector(
     done_count_window = 0
     timeout_count_window = 0
 
-    state = env.state
-    assert state is not None
-    obs_np, critic_np = split_obs_dict(state.obs)
-    obs_np = np.asarray(obs_np, dtype=np.float32)
-    critic_np = np.asarray(critic_np, dtype=np.float32)
+    obs_t: torch.Tensor | None = None
+    critic_t: torch.Tensor | None = None
+    obs_np: np.ndarray | None = None
+    critic_np: np.ndarray | None = None
+    next_obs_t: torch.Tensor | None = None
+    next_critic_t: torch.Tensor | None = None
+    rewards_t: torch.Tensor | None = None
+    truncated_t: torch.Tensor | None = None
+    combined_dones_t: torch.Tensor | None = None
+    done_mask_t: torch.Tensor | None = None
+    terminal_obs_t: torch.Tensor | None = None
+    terminal_critic_t: torch.Tensor | None = None
+    next_obs_np: np.ndarray | None = None
+    next_critic_np: np.ndarray | None = None
+    rewards_np: np.ndarray | None = None
+    truncated_np: np.ndarray | None = None
+    combined_dones: np.ndarray | None = None
+    terminal_contract: Any | None = None
+    if tensor_collector:
+        obs_t, critic_t = cast(tuple[torch.Tensor, torch.Tensor], split_obs_dict(state.obs))
+    else:
+        obs_np, critic_np = split_obs_dict(state.obs)
+        obs_np = np.asarray(obs_np, dtype=np.float32)
+        critic_np = np.asarray(critic_np, dtype=np.float32)
     info_dict = state.info
     prev_dones_np = np.zeros(num_envs, dtype=np.float32)
+    prev_dones_t = torch.zeros(num_envs, dtype=torch.float32, device=state.obs["obs"].device)
     import time as _time
 
     runtime_manifest = {
@@ -333,6 +400,8 @@ def _run_collector(
         "collector_accelerator_context": configured_backend_device is not None,
         "collector_backend_device": configured_backend_device,
         "cuda_context_initialized": bool(torch.cuda.is_initialized()),
+        "tensor_native_env": tensor_collector,
+        "inference_slot_device": getattr(inference_slot, "device", torch.device("cpu")),
     }
     if trace_recorder:
         manifest_ns = _time.perf_counter_ns()
@@ -361,23 +430,38 @@ def _run_collector(
         while not stop_event.is_set():
             cycle_timing_ms: dict[str, float] = dict.fromkeys(COLLECTOR_TIMING_KEYS, 0.0)
             phase_start_ns = _time.perf_counter_ns()
+            actor_input_t: torch.Tensor | None = None
+            actor_input_np: np.ndarray | None = None
 
-            actor_context_np = resolve_offpolicy_actor_priv_info(
-                algo_type=algo_type,
-                obs_np=obs_np,
-                critic_np=critic_np,
-                info=info_dict,
-            )
-            actor_input_np = (
-                np.concatenate((obs_np, actor_context_np), axis=1)
-                if actor_context_np is not None
-                else obs_np
-            )
+            if tensor_collector:
+                assert obs_t is not None
+                adapter = get_offpolicy_actor_adapter(algo_type)
+                if adapter is not None and adapter.resolve_priv_info is not None:
+                    raise ValueError(
+                        "Tensor-native FlashSAC collector does not support privileged actor adapters"
+                    )
+                actor_input_t = obs_t
+            else:
+                assert obs_np is not None
+                assert critic_np is not None
+                actor_context_np = resolve_offpolicy_actor_priv_info(
+                    algo_type=algo_type,
+                    obs_np=obs_np,
+                    critic_np=critic_np,
+                    info=info_dict,
+                )
+                actor_input_np = (
+                    np.concatenate((obs_np, actor_context_np), axis=1)
+                    if actor_context_np is not None
+                    else obs_np
+                )
             request_ns = _time.perf_counter_ns()
+            actor_input = actor_input_t if tensor_collector else actor_input_np
+            assert actor_input is not None
             inference_slot.publish_observation(
                 tick_id=inference_tick,
-                observations=actor_input_np,
-                dones=prev_dones_np,
+                observations=actor_input,
+                dones=prev_dones_t if tensor_collector else prev_dones_np,
             )
             if not _publish_inference_tick(
                 inference_request_queue,
@@ -405,7 +489,8 @@ def _run_collector(
                 learner_pid=learner_pid,
             ):
                 break
-            actions_np, policy_version = inference_slot.consume_action(tick_id=inference_tick)
+            actions, policy_version = inference_slot.consume_action(tick_id=inference_tick)
+            actions_np = None if tensor_collector else _collector_action_numpy(actions)
             if trace_recorder:
                 trace_recorder.add_slice(
                     "collector/wait_for_learner_action",
@@ -424,7 +509,7 @@ def _run_collector(
 
             # Step environment
             _env_ns = _time.perf_counter_ns()
-            state = env.step(actions_np)
+            state = env.step(actions if tensor_collector else actions_np)
             if trace_recorder:
                 trace_recorder.add_slice(
                     "collector/env_step",
@@ -437,56 +522,134 @@ def _run_collector(
             cycle_timing_ms.update(extract_env_step_breakdown_timing_ms(state.info))
 
             # Extract data as numpy
-            next_obs_np, next_critic_np = split_obs_dict(state.obs)
-            next_obs_np = np.asarray(next_obs_np, dtype=np.float32)
-            next_critic_np = np.asarray(next_critic_np, dtype=np.float32)
-            rewards_np = np.asarray(state.reward, dtype=np.float32).ravel()
-
-            truncated_np = state.truncated.astype(np.float32, copy=False).ravel()
-            combined_dones = (
-                (state.terminated | state.truncated).astype(np.float32, copy=False).ravel()
-            )
-            prev_dones_np = combined_dones
-            done_mask_np = combined_dones > 0.5
-            timeout_mask_np = truncated_np > 0.5
-
-            done_count_window += int(np.count_nonzero(done_mask_np))
-            timeout_count_window += int(np.count_nonzero(timeout_mask_np))
-
-            terminal_contract = resolve_terminal_observation_contract(
-                next_obs_batch_size=next_obs_np.shape[0],
-                final_observation=state.final_observation,
-                done=done_mask_np,
-                info=state.info,
-                truncated=truncated_np,
-            )
+            if tensor_collector:
+                assert obs_t is not None
+                assert critic_t is not None
+                next_obs_t, next_critic_t = cast(
+                    tuple[torch.Tensor, torch.Tensor], split_obs_dict(state.obs)
+                )
+                rewards_t = state.reward.to(dtype=torch.float32).ravel()
+                truncated_t = state.truncated.to(dtype=torch.float32).ravel()
+                combined_dones_t = (state.terminated | state.truncated).to(dtype=torch.float32)
+                assert rewards_t is not None
+                assert truncated_t is not None
+                assert combined_dones_t is not None
+                prev_dones_t = combined_dones_t
+                done_mask_t = combined_dones_t > 0.5
+                done_count, timeout_count = _tensor_count_pair_to_cpu(
+                    torch.count_nonzero(done_mask_t),
+                    torch.count_nonzero(truncated_t > 0.5),
+                )
+                done_count_window += done_count
+                timeout_count_window += timeout_count
+                terminal_final = state.final_observation
+                if terminal_final is not None:
+                    terminal_obs_t = terminal_final.get("obs")
+                    terminal_critic_t = terminal_final.get("critic")
+                else:
+                    terminal_obs_t = None
+                    terminal_critic_t = None
+            else:
+                next_obs_np, next_critic_np = split_obs_dict(state.obs)
+                next_obs_np = np.asarray(next_obs_np, dtype=np.float32)
+                next_critic_np = np.asarray(next_critic_np, dtype=np.float32)
+                rewards_np = np.asarray(state.reward, dtype=np.float32).ravel()
+                truncated_np = state.truncated.astype(np.float32, copy=False).ravel()
+                combined_dones = (
+                    (state.terminated | state.truncated).astype(np.float32, copy=False).ravel()
+                )
+                assert rewards_np is not None
+                assert truncated_np is not None
+                assert combined_dones is not None
+                prev_dones_np = combined_dones
+                done_mask_np = combined_dones > 0.5
+                timeout_mask_np = truncated_np > 0.5
+                done_count_window += int(np.count_nonzero(done_mask_np))
+                timeout_count_window += int(np.count_nonzero(timeout_mask_np))
+                terminal_contract = resolve_terminal_observation_contract(
+                    next_obs_batch_size=next_obs_np.shape[0],
+                    final_observation=state.final_observation,
+                    done=done_mask_np,
+                    info=state.info,
+                    truncated=truncated_np,
+                )
+            if tensor_collector:
+                assert obs_t is not None
+                assert critic_t is not None
+                assert next_obs_t is not None
+                assert next_critic_t is not None
+                assert rewards_t is not None
+                assert combined_dones_t is not None
+                assert truncated_t is not None
+                assert done_mask_t is not None
+            else:
+                assert obs_np is not None
+                assert critic_np is not None
+                assert next_obs_np is not None
+                assert next_critic_np is not None
+                assert rewards_np is not None
+                assert combined_dones is not None
+                assert truncated_np is not None
+                assert terminal_contract is not None
             phase_start_ns = _record_phase_ms(cycle_timing_ms, "replay_write_ms", phase_start_ns)
 
             # ReplayBuffer `dones` follows the UniLab env lifecycle contract:
             # done = terminated | truncated. Learners use `truncated` to keep
             # bootstrap enabled for timeout/truncation rows.
             _rb_ns = _time.perf_counter_ns()
-            replay_buffer.add(
-                torch.from_numpy(obs_np),
-                torch.from_numpy(actions_np),
-                torch.from_numpy(rewards_np),
-                torch.from_numpy(next_obs_np),
-                torch.from_numpy(combined_dones),
-                torch.from_numpy(truncated_np),
-                terminal_mask=torch.from_numpy(terminal_contract.terminal_mask),
-                terminal_next_obs=(
-                    torch.from_numpy(terminal_contract.terminal_obs)
-                    if terminal_contract.terminal_obs is not None
-                    else None
-                ),
-                critic=torch.from_numpy(critic_np),
-                next_critic=torch.from_numpy(next_critic_np),
-                terminal_next_critic=(
-                    torch.from_numpy(terminal_contract.terminal_critic)
-                    if terminal_contract.terminal_critic is not None
-                    else None
-                ),
-            )
+            if tensor_collector:
+                assert obs_t is not None
+                assert critic_t is not None
+                assert next_obs_t is not None
+                assert next_critic_t is not None
+                assert rewards_t is not None
+                assert combined_dones_t is not None
+                assert truncated_t is not None
+                assert done_mask_t is not None
+                replay_buffer.add(
+                    obs_t,
+                    actions.to(dtype=torch.float32),
+                    rewards_t,
+                    next_obs_t,
+                    combined_dones_t,
+                    truncated_t,
+                    terminal_mask=done_mask_t,
+                    terminal_next_obs=terminal_obs_t,
+                    critic=critic_t,
+                    next_critic=next_critic_t,
+                    terminal_next_critic=terminal_critic_t,
+                )
+            else:
+                assert obs_np is not None
+                assert critic_np is not None
+                assert next_obs_np is not None
+                assert next_critic_np is not None
+                assert actions_np is not None
+                assert rewards_np is not None
+                assert combined_dones is not None
+                assert truncated_np is not None
+                assert terminal_contract is not None
+                replay_buffer.add(
+                    torch.from_numpy(obs_np),
+                    torch.from_numpy(actions_np),
+                    torch.from_numpy(rewards_np),
+                    torch.from_numpy(next_obs_np),
+                    torch.from_numpy(combined_dones),
+                    torch.from_numpy(truncated_np),
+                    terminal_mask=torch.from_numpy(terminal_contract.terminal_mask),
+                    terminal_next_obs=(
+                        torch.from_numpy(terminal_contract.terminal_obs)
+                        if terminal_contract.terminal_obs is not None
+                        else None
+                    ),
+                    critic=torch.from_numpy(critic_np),
+                    next_critic=torch.from_numpy(next_critic_np),
+                    terminal_next_critic=(
+                        torch.from_numpy(terminal_contract.terminal_critic)
+                        if terminal_contract.terminal_critic is not None
+                        else None
+                    ),
+                )
             if trace_recorder:
                 trace_recorder.add_slice(
                     "collector/replay_add",
@@ -497,18 +660,44 @@ def _run_collector(
             phase_start_ns = _record_phase_ms(cycle_timing_ms, "replay_write_ms", phase_start_ns)
 
             # Track episode rewards - vectorized
-            current_ep_rewards += rewards_np
-            current_ep_lengths += 1
-            reset_mask = combined_dones > 0.5
-            reset_indices = np.where(reset_mask)[0]
-            if len(reset_indices) > 0:
-                ep_rewards.extend(current_ep_rewards[reset_indices].tolist())
-                ep_lengths.extend(current_ep_lengths[reset_indices].tolist())
-                current_ep_rewards[reset_indices] = 0.0
-                current_ep_lengths[reset_indices] = 0
-
-            obs_np = next_obs_np
-            critic_np = next_critic_np
+            if tensor_collector:
+                assert current_ep_rewards_t is not None
+                assert current_ep_lengths_t is not None
+                assert rewards_t is not None
+                assert done_mask_t is not None
+                assert next_obs_t is not None
+                assert next_critic_t is not None
+                current_ep_rewards_t += rewards_t
+                current_ep_lengths_t += 1
+                reset_indices_t = done_mask_t.nonzero(as_tuple=False).flatten()
+                if reset_indices_t.numel() > 0:
+                    finished_rewards, finished_lengths = _finished_episode_values_to_cpu(
+                        current_ep_rewards_t,
+                        current_ep_lengths_t,
+                        reset_indices_t,
+                    )
+                    ep_rewards.extend(finished_rewards)
+                    ep_lengths.extend(finished_lengths)
+                    current_ep_rewards_t[reset_indices_t] = 0.0
+                    current_ep_lengths_t[reset_indices_t] = 0
+                obs_t = next_obs_t
+                critic_t = next_critic_t
+            else:
+                assert rewards_np is not None
+                assert combined_dones is not None
+                assert next_obs_np is not None
+                assert next_critic_np is not None
+                current_ep_rewards += rewards_np
+                current_ep_lengths += 1
+                reset_mask = combined_dones > 0.5
+                reset_indices = np.where(reset_mask)[0]
+                if len(reset_indices) > 0:
+                    ep_rewards.extend(current_ep_rewards[reset_indices].tolist())
+                    ep_lengths.extend(current_ep_lengths[reset_indices].tolist())
+                    current_ep_rewards[reset_indices] = 0.0
+                    current_ep_lengths[reset_indices] = 0
+                obs_np = next_obs_np
+                critic_np = next_critic_np
             info_dict = state.info
             total_steps += num_envs
 
@@ -567,6 +756,31 @@ def _run_collector(
                 _record_timing_ms(timing_accum_ms, timing_counts, key, value)
 
     finally:
+        cleanup = getattr(env, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+        else:
+            env.close()
+        inference_slot.close()
+        replay_buffer.release_ipc()
+        # Drop the final tensor/state references before the spawn process
+        # exits. This prevents CUDA IPC handles from outliving explicit env
+        # teardown until interpreter finalization.
+        state = None
+        obs_t = None
+        critic_t = None
+        next_obs_t = None
+        next_critic_t = None
+        terminal_obs_t = None
+        terminal_critic_t = None
+        current_ep_rewards_t = None
+        current_ep_lengths_t = None
+        inference_slot = None
+        replay_buffer = None
+        env = None
+        import gc
+
+        gc.collect()
         if metrics_queue is not None and trace_recorder:
             try:
                 metrics_queue.put_nowait({"trace_events": trace_recorder.drain_events()})

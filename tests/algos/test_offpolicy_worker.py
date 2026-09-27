@@ -4,18 +4,84 @@ import queue
 import threading
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 import uni_rl.offpolicy.worker as worker_module
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
 from uni_rl.offpolicy.worker import (
+    _collector_action_numpy,
+    _finished_episode_values_to_cpu,
     _publish_collector_ready,
     _publish_inference_tick,
+    _tensor_count_pair_to_cpu,
     _wait_for_inference_tick,
     resolve_offpolicy_actor_priv_info,
     sample_offpolicy_actions,
 )
+
+
+@pytest.mark.parametrize("actions_is_tensor", [False, True])
+def test_cpu_collector_action_conversion_preserves_legacy_contract(
+    actions_is_tensor: bool,
+) -> None:
+    values = [[1.0, 2.0], [3.0, 4.0]]
+    actions = (
+        torch.tensor(values, dtype=torch.float32)
+        if actions_is_tensor
+        else np.asarray(values, dtype=np.float32)
+    )
+
+    converted = _collector_action_numpy(actions)
+
+    assert isinstance(converted, np.ndarray)
+    assert converted.dtype == np.float32
+    np.testing.assert_array_equal(converted, values)
+
+
+def test_tensor_count_pair_uses_one_host_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original_cpu = torch.Tensor.cpu
+
+    def counting_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return original_cpu(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", counting_cpu)
+
+    assert _tensor_count_pair_to_cpu(
+        torch.tensor(3, dtype=torch.int64),
+        torch.tensor(2, dtype=torch.int64),
+    ) == (3, 2)
+    assert calls == 1
+
+
+def test_finished_episode_values_use_one_host_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original_cpu = torch.Tensor.cpu
+
+    def counting_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return original_cpu(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", counting_cpu)
+
+    rewards, lengths = _finished_episode_values_to_cpu(
+        rewards=torch.tensor([1.0, -2.5, 7.0], dtype=torch.float32),
+        lengths=torch.tensor([10, 20, 30], dtype=torch.int32),
+        rows=torch.tensor([2, 0]),
+    )
+
+    assert rewards == [7.0, 1.0]
+    assert lengths == [30, 10]
+    assert calls == 1
 
 
 def test_collector_publishes_ready_after_initialization(

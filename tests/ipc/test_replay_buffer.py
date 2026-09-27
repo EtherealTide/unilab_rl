@@ -105,6 +105,51 @@ def test_ingress_patches_terminal_rows_before_publication():
     buf.close()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cuda_ingress_publication_uses_current_stream_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_current_stream = torch.cuda.current_stream
+    current_stream_devices: list[torch.device] = []
+
+    def fail_device_sync(*args, **kwargs) -> None:
+        raise AssertionError("replay ingress must not synchronize the whole device")
+
+    def tracking_current_stream(device=None, *args, **kwargs):
+        current_stream_devices.append(
+            torch.device(device) if device is not None else torch.device("cuda")
+        )
+        return original_current_stream(device, *args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "synchronize", fail_device_sync)
+    monkeypatch.setattr(torch.cuda, "current_stream", tracking_current_stream)
+
+    buf = ReplayBuffer(
+        capacity=16,
+        obs_dim=_OBS_DIM,
+        action_dim=_ACTION_DIM,
+        device="cuda",
+        ingress_slot_rows=4,
+        ingress_device="cuda",
+    )
+    try:
+        batch = tuple(tensor.to("cuda") for tensor in _random_batch(4))
+        buf.add(*batch)
+
+        assert buf.published_ptr == 4
+        ingress = buf.take_published_ingress()
+        assert ingress is not None
+        slot, start, count, packed = ingress
+        buf.commit_ingress(slot=slot, start=start, count=count)
+
+        assert (start, count) == (0, 4)
+        torch.testing.assert_close(packed[:, buf._obs_sl], batch[0])
+        torch.testing.assert_close(packed[:, buf._act_sl], batch[1])
+        assert len(current_stream_devices) == 1
+    finally:
+        buf.close()
+
+
 def test_ingress_stores_done_and_truncated_contract():
     buf = _make_buf(slot_rows=3)
     truncated = torch.tensor([0.0, 1.0, 0.0])

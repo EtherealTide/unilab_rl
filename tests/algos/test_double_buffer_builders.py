@@ -190,7 +190,49 @@ def test_flashsac_builder_forwards_backend_device_binder(
 
     assert runner.kwargs["backend_device_binder"] is (_binder if with_binder else None)
     assert runner.kwargs["log_interval"] == 3
+    assert runner.kwargs["collector_tensor_native"] is False
     assert _FakeLearner.last_kwargs["compile_full_objectives"] is True
+
+
+def test_flashsac_builder_resolves_tensor_runtime_before_collector_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    monkeypatch.setattr(module, "FlashSACLearner", _FakeLearner)
+    monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
+    monkeypatch.setattr(module, "require_offpolicy_replay_device", lambda device: device)
+    monkeypatch.setattr(module, "apply_training_seed", lambda *args, **kwargs: None)
+
+    cfg = _flashsac_cfg()
+    cfg.env = {"tensor_runtime": False}
+    runner = module.build_flashsac_double_buffer_runner(
+        cfg,
+        env_factory=_fake_env_factory,
+        env_cfg_override=None,
+        replay_prefetch_mode="one_tick",
+        device="cpu",
+    )
+    assert runner.kwargs["collector_tensor_native"] is False
+
+
+def test_flashsac_builder_rejects_tensor_runtime_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    monkeypatch.setattr(module, "require_offpolicy_replay_device", lambda device: device)
+    cfg = _flashsac_cfg()
+    cfg.env = {"tensor_runtime": True}
+
+    with pytest.raises(ValueError, match="env.tensor_runtime=true requires CUDA"):
+        module.build_flashsac_double_buffer_runner(
+            cfg,
+            env_factory=_fake_env_factory,
+            env_cfg_override=None,
+            replay_prefetch_mode="one_tick",
+            device="cpu",
+        )
 
 
 def test_sac_builder_forwards_custom_runtime_preparation_hook(

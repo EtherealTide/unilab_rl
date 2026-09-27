@@ -173,6 +173,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         replay_pipeline_factory: Callable[..., GPUResidentReplayPipeline] | None = None,
         target_frequency: int = 1,
         policy_before_critic: bool = False,
+        collector_tensor_native: bool = False,
         **kwargs,
     ):
         kwargs["device"] = require_offpolicy_replay_device(kwargs.get("device"))
@@ -212,6 +213,16 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         # merged into the collector-only env override at collector startup.
         self.collector_cpu_ids = list(collector_cpu_ids) if collector_cpu_ids is not None else None
         self.collector_backend_device = collector_backend_device
+        if not isinstance(collector_tensor_native, bool):
+            raise TypeError(
+                f"collector_tensor_native must be a boolean, got {collector_tensor_native!r}"
+            )
+        if collector_tensor_native and torch.device(str(kwargs["device"])).type != "cuda":
+            raise ValueError(
+                "collector_tensor_native=True requires a CUDA replay device; "
+                f"got {kwargs['device']!r}"
+            )
+        self.collector_tensor_native = collector_tensor_native
         # Backend-owned process-device binder forwarded to the collector
         # subprocess (e.g. mjwarp); None for backends that need no binding.
         self.backend_device_binder = backend_device_binder
@@ -233,6 +244,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "collector_accelerator_context": self.collector_backend_device is not None,
             "collector_backend_device": self.collector_backend_device,
             "collector_torch_inference": False,
+            "collector_tensor_native": self.collector_tensor_native,
             "learner_actor_reused": True,
             "logger_owner_rank": 0,
             "logger_cross_rank_aggregation": self.dp_sync is not None,
@@ -750,6 +762,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         d2h_end_ns = time.perf_counter_ns()
         inference_forward_time = (forward_end_ns - forward_start_ns) / 1e9
         if cuda_forward_events is not None:
+            cuda_forward_events[1].synchronize()
             inference_forward_time = (
                 cuda_forward_events[0].elapsed_time(cuda_forward_events[1]) / 1e3
             )
@@ -960,6 +973,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
         # --- bounded collector ingress (the complete ring lives on device) ---
         buffer_capacity = self.replay_buffer_n * self.num_envs
+        gpu_centric_collector = self.collector_tensor_native
         replay_buffer = ReplayBuffer(
             capacity=buffer_capacity,
             obs_dim=self.obs_dim,
@@ -968,6 +982,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             critic_dim=self.critic_obs_dim,
             ingress_slot_rows=self.num_envs,
             ingress_depth=DEFAULT_REPLAY_INGRESS_DEPTH,
+            ingress_device=self.device if gpu_centric_collector else "cpu",
         )
         self._shared_resources.append(replay_buffer)
         replay_buffer.trace_recorder = trace_recorder
@@ -1011,6 +1026,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             self.num_envs,
             inference_input_dim,
             self.action_dim,
+            device=self.device if gpu_centric_collector else "cpu",
         )
         self._shared_resources.append(inference_slot)
         inference_obs_device = torch.empty(

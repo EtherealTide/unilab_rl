@@ -316,6 +316,9 @@ def _make_device_runner(
     *,
     device: str = "cuda",
     sim_backend: str = "mujoco",
+    env_name: str = "DummyEnv",
+    algo_type: str = "sac",
+    collector_tensor_native: bool = False,
 ):
     monkeypatch.setattr(
         device_runner_module, "require_offpolicy_replay_device", lambda value: value
@@ -323,8 +326,8 @@ def _make_device_runner(
     monkeypatch.setattr(runner_module, "get_env_dims", lambda *args, **kwargs: (4, 2, 5))
     return device_runner_module.DoubleBufferOffPolicyRunner(
         learner=learner or _Learner(),
-        env_name="DummyEnv",
-        algo_type="sac",
+        env_name=env_name,
+        algo_type=algo_type,
         env_factory=_unused_env_factory,
         num_envs=2,
         replay_buffer_n=8,
@@ -335,6 +338,7 @@ def _make_device_runner(
         env_steps_per_sync=1,
         device=device,
         sim_backend=sim_backend,
+        collector_tensor_native=collector_tensor_native,
     )
 
 
@@ -429,6 +433,7 @@ def test_runner_constructs_only_bounded_device_replay(
         "critic_dim": 5,
         "ingress_slot_rows": 2,
         "ingress_depth": 2,
+        "ingress_device": "cpu",
     }
     assert _FakePipeline.last_kwargs == {
         "device": "cuda",
@@ -451,6 +456,62 @@ def test_runner_constructs_only_bounded_device_replay(
     assert "collection_ready_queue" not in collector_kwargs
     assert "trainer_done_queue" not in collector_kwargs
     assert _FakePipeline.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("collector_tensor_native", "expected_device"),
+    [
+        (True, "cuda"),
+        (False, "cpu"),
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_runner_collector_resources_follow_tensor_runtime_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    collector_tensor_native: bool,
+    expected_device: str,
+):
+    _FakePipeline.close_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+
+    runner = _make_device_runner(
+        monkeypatch,
+        env_name="G1MotionTrackingSAC",
+        algo_type="flashsac",
+        device="cuda",
+        sim_backend="mjwarp",
+        collector_tensor_native=collector_tensor_native,
+    )
+    collector_kwargs = {}
+
+    def capture_collector(*, target_fn, kwargs):
+        del target_fn
+        collector_kwargs.update(kwargs)
+
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_start_collector", capture_collector)
+    runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    assert _FakeReplayBuffer.last_kwargs["ingress_device"] == expected_device
+    assert collector_kwargs["inference_slot"].device == torch.device(expected_device)
+    assert runner.runtime_manifest["collector_tensor_native"] is collector_tensor_native
+
+
+def test_runner_rejects_tensor_native_collector_without_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="collector_tensor_native=True requires a CUDA"):
+        _make_device_runner(
+            monkeypatch,
+            device="cpu",
+            collector_tensor_native=True,
+        )
 
 
 class _ReadyAfterPoll:

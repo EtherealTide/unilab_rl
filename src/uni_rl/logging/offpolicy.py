@@ -100,6 +100,7 @@ _COLLECTOR_TIMING_SPECS = {
     "inference_request_ms": (1.0, "Inference Request", "cycle_phase"),
     "learner_action_wait_ms": (1.1, "Learner Action Wait", "cycle_phase"),
     "env_step_ms": (2.0, "Env Step", "cycle_phase"),
+    "env_step_action_backend_ms": (2.1, "  Action+Backend", "env_step_detail"),
     "env_step_backend_ms": (2.1, "  Backend Step", "env_step_detail"),
     "env_step_update_state_ms": (2.2, "  Update State", "env_step_detail"),
     "env_step_reset_done_ms": (2.3, "  Reset Done", "env_step_detail"),
@@ -108,6 +109,7 @@ _COLLECTOR_TIMING_SPECS = {
 }
 
 OFFPOLICY_ENV_STEP_DETAIL_KEYS = (
+    "env_step_action_backend_ms",
     "env_step_backend_ms",
     "env_step_update_state_ms",
     "env_step_reset_done_ms",

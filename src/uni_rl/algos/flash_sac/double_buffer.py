@@ -6,7 +6,8 @@ import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from omegaconf import DictConfig
+import torch
+from omegaconf import DictConfig, OmegaConf
 
 from uni_rl.algos.flash_sac.learner import FlashSACLearner
 from uni_rl.env_contract import EnvFactory
@@ -32,6 +33,20 @@ def _validate_flashsac_double_buffer_runtime(
         raise ValueError("FlashSAC-B initially supports n_step=1 only")
 
 
+def _resolve_collector_tensor_native(cfg: DictConfig, device: str) -> bool:
+    """Resolve the task-owner tensor-runtime capability before spawning."""
+    value = OmegaConf.select(cfg, "env.tensor_runtime", default=False)
+    if value is None:
+        value = False
+    if type(value) is not bool:
+        raise TypeError(f"FlashSAC env.tensor_runtime must be a boolean or omitted, got {value!r}")
+    if value and torch.device(device).type != "cuda":
+        raise ValueError(
+            f"FlashSAC env.tensor_runtime=true requires CUDA, but the replay device is {device!r}"
+        )
+    return value
+
+
 def build_flashsac_double_buffer_runner(
     cfg: DictConfig,
     *,
@@ -52,6 +67,7 @@ def build_flashsac_double_buffer_runner(
         cfg,
         replay_prefetch_mode=replay_prefetch_mode,
     )
+    collector_tensor_native = _resolve_collector_tensor_native(cfg, device)
 
     if "inference_request_timeout_sec" in cfg.training:
         warnings.warn(
@@ -135,5 +151,6 @@ def build_flashsac_double_buffer_runner(
         collector_cpu_ids=collector_cpu_ids,
         dp_sync=dp_sync,
         backend_device_binder=backend_device_binder,
+        collector_tensor_native=collector_tensor_native,
         log_interval=int(cfg.training.log_interval),
     )
