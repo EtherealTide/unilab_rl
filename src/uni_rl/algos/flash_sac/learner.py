@@ -155,6 +155,10 @@ class RewardNormalizer:
 class FlashSACLearner(LearnerBoilerplateMixin):
     supports_deferred_update_metrics = True
 
+    def inference_startup_memory_categories(self, batch_size: int) -> dict[str, int]:
+        """Expose exact inference-owned persistent scratch before collection."""
+        return self.actor.inference_startup_memory_categories(batch_size)
+
     def __init__(
         self,
         obs_dim: int,

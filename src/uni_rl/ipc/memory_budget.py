@@ -10,6 +10,140 @@ import os
 import shutil
 import sys
 
+from uni_rl.ipc.inference_ring import estimate_inference_ring_bytes
+
+# CUDA IPC event objects are small in the CUDA API, but each handle has driver
+# bookkeeping and allocator slack.  Reserving a page-sized amount per event is
+# deliberately conservative: this budget is a fail-closed guard, not an exact
+# reproduction of driver allocation.
+CUDA_INFERENCE_EVENT_RESERVE_BYTES = 64 * 1024
+CUDA_INFERENCE_OVERHEAD_FRACTION = 0.10
+CUDA_INFERENCE_MIN_OVERHEAD_BYTES = 32 * 1024 * 1024
+CUDA_INFERENCE_TIMING_EVENT_COUNT = 2
+
+
+def estimate_cuda_inference_ipc_bytes(
+    num_envs: int,
+    inference_obs_dim: int,
+    action_dim: int,
+    *,
+    capacity: int,
+    ring_on_device: bool,
+    persistent_exploration_scratch: int = 0,
+) -> dict[str, int | str]:
+    """Return a conservative pre-flight budget for CUDA learner inference IPC.
+
+    Exact CUDA allocator and driver overhead is not observable across all
+    supported Torch/CUDA combinations.  The estimate therefore separates exact
+    tensor bytes from event reserves and a conservative workspace/driver slack.
+    It is intended to fail before any inference ring, event, or scratch tensor
+    is allocated, not to predict ``torch.cuda.memory_allocated()`` exactly.
+    """
+    values = (num_envs, inference_obs_dim, action_dim, capacity)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        raise TypeError("CUDA inference IPC byte dimensions must be integers")
+    if min(values) <= 0:
+        raise ValueError("CUDA inference IPC byte dimensions and capacity must be positive")
+    if not isinstance(ring_on_device, bool):
+        raise TypeError("ring_on_device must be boolean")
+    if (
+        isinstance(persistent_exploration_scratch, bool)
+        or not isinstance(persistent_exploration_scratch, int)
+        or persistent_exploration_scratch < 0
+    ):
+        raise ValueError("persistent exploration scratch bytes must be a non-negative integer")
+
+    ring_storage = (
+        estimate_inference_ring_bytes(num_envs, inference_obs_dim, action_dim, capacity=capacity)
+        if ring_on_device
+        else 0
+    )
+    observation_scratch = num_envs * inference_obs_dim * 4
+    done_scratch = num_envs * 4
+    action_output = num_envs * action_dim * 4
+    ipc_event_count = capacity * 3 if ring_on_device else 0
+    timing_event_count = CUDA_INFERENCE_TIMING_EVENT_COUNT
+    cuda_event_count = ipc_event_count + timing_event_count
+    cuda_events = cuda_event_count * CUDA_INFERENCE_EVENT_RESERVE_BYTES
+    exact = (
+        ring_storage
+        + observation_scratch
+        + done_scratch
+        + action_output
+        + persistent_exploration_scratch
+    )
+    overhead = max(
+        int(exact * CUDA_INFERENCE_OVERHEAD_FRACTION),
+        CUDA_INFERENCE_MIN_OVERHEAD_BYTES,
+    )
+    total = exact + cuda_events + overhead
+    lines = (
+        f"  Inference ring storage: {ring_storage / 1024**2:.1f} MB\n"
+        f"  Inference obs/done scratch: "
+        f"{(observation_scratch + done_scratch) / 1024**2:.1f} MB\n"
+        f"  Inference action output: {action_output / 1024**2:.1f} MB\n"
+        "  Persistent exploration scratch: "
+        f"{persistent_exploration_scratch / 1024**2:.1f} MB\n"
+        f"  CUDA IPC event reserve: {cuda_events / 1024**2:.1f} MB "
+        f"({ipc_event_count} IPC + {timing_event_count} timing events)\n"
+        f"  Conservative workspace/driver/allocator slack: "
+        f"{overhead / 1024**2:.1f} MB\n"
+    )
+    return {
+        "ring_storage": ring_storage,
+        "observation_scratch": observation_scratch,
+        "done_scratch": done_scratch,
+        "action_output": action_output,
+        "persistent_exploration_scratch": persistent_exploration_scratch,
+        "cuda_events": cuda_events,
+        "cuda_event_count": cuda_event_count,
+        "ipc_event_count": ipc_event_count,
+        "observation_event_count": capacity if ring_on_device else 0,
+        "action_event_count": capacity if ring_on_device else 0,
+        "consumer_done_event_count": capacity if ring_on_device else 0,
+        "timing_event_count": timing_event_count,
+        "conservative_overhead": overhead,
+        "total": total,
+        "breakdown": (
+            "CUDA inference IPC budget (conservative pre-flight):\n"
+            + lines
+            + "  The reserve intentionally over-accounts rather than treating "
+            "Torch/CUDA byte accounting as exact."
+        ),
+    }
+
+
+def raise_if_cuda_memory_over_budget(
+    estimated: dict[str, int | str],
+    *,
+    label: str,
+    available_bytes: int,
+    threshold: float = 0.8,
+    user_knob: str = "training.inference_slot_capacity",
+) -> None:
+    """Fail closed before CUDA inference IPC resources are materialized."""
+    if isinstance(available_bytes, bool) or not isinstance(available_bytes, int):
+        raise TypeError("available_bytes must be an integer")
+    if available_bytes < 0:
+        raise ValueError("available_bytes must be non-negative")
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        raise TypeError("memory budget threshold must be a number")
+    if not 0.0 < float(threshold) < 1.0:
+        raise ValueError("memory budget threshold must be between zero and one")
+
+    total = int(estimated["total"])
+    allowed = int(available_bytes * float(threshold))
+    if total <= allowed:
+        return
+    ratio = total / max(available_bytes, 1)
+    raise MemoryError(
+        f"{label}: conservative CUDA inference IPC budget "
+        f"{total / 1024**2:.1f} MB exceeds the {float(threshold):.0%} limit "
+        f"of {allowed / 1024**2:.1f} MB (device free {available_bytes / 1024**2:.1f} MB, "
+        f"{ratio:.0%} requested). Reduce {user_knob}, algo.num_envs, or model/input "
+        f"dimensions before startup. Budget breakdown:\n{estimated['breakdown']}"
+    )
+
 
 def estimate_offpolicy_bytes(
     num_envs: int,
@@ -19,11 +153,14 @@ def estimate_offpolicy_bytes(
     critic_dim: int,
     ingress_depth: int = 2,
     inference_ring_bytes: int = 0,
+    ingress_on_device: bool = False,
 ) -> dict[str, int | str]:
     """Estimate host shared memory for bounded off-policy replay ingress."""
+    if not isinstance(ingress_on_device, bool):
+        raise TypeError("ingress_on_device must be boolean")
     row_width = 2 * obs_dim + action_dim + 3 + 2 * critic_dim
     capacity = replay_buffer_n * num_envs
-    ingress_bytes = int(ingress_depth) * num_envs * row_width * 4
+    ingress_bytes = 0 if ingress_on_device else int(ingress_depth) * num_envs * row_width * 4
     inference_ring_line = (
         f"  Inference ring: {inference_ring_bytes / 1024**2:.0f} MB\n"
         if inference_ring_bytes
@@ -37,8 +174,15 @@ def estimate_offpolicy_bytes(
         "breakdown": (
             "Replay: 0 MB shared host memory "
             f"({capacity} rows remain authoritative on the learner device)\n"
-            f"  Bounded ingress: {ingress_bytes / 1024**2:.0f} MB "
-            f"({int(ingress_depth)} slots × {num_envs} rows × {row_width} cols × 4B)\n"
+            "  Bounded ingress: "
+            + (
+                "0 MB (device-resident)\n"
+                if ingress_on_device
+                else (
+                    f"{ingress_bytes / 1024**2:.0f} MB "
+                    f"({int(ingress_depth)} slots × {num_envs} rows × {row_width} cols × 4B)\n"
+                )
+            )
             + inference_ring_line
             + "  Excludes MuJoCo BatchEnvPool/native allocations, CUDA pinned/shared "
             "registration, and driver memory."

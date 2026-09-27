@@ -47,6 +47,7 @@ class FlashSACActor(nn.Module):
         device: str | torch.device = "cpu",
     ):
         super().__init__()
+        self.action_dim = int(action_dim)
         self.embedder = FlashSACEmbedder(input_dim=input_dim, hidden_dim=hidden_dim)
         self.encoder = nn.ModuleList([FlashSACBlock(hidden_dim) for _ in range(num_blocks)])
         self.post_norm = UnitRMSNorm(hidden_dim)
@@ -64,6 +65,16 @@ class FlashSACActor(nn.Module):
 
     def normalize_parameters(self) -> None:
         _normalize_module_tree(self)
+
+    def inference_startup_memory_categories(self, batch_size: int) -> dict[str, int]:
+        """Return inference-only persistent tensor bytes for a collector batch."""
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+            raise TypeError("FlashSAC inference batch size must be an integer")
+        if batch_size <= 0:
+            raise ValueError("FlashSAC inference batch size must be positive")
+        # Persistent exploration state is lazily allocated by the first actor
+        # call: float32 noise plus two int32 repeat counters per environment.
+        return {"persistent_exploration_scratch": batch_size * (self.action_dim * 4 + 2 * 4)}
 
     def _encode(self, observations: torch.Tensor, training: bool) -> torch.Tensor:
         x = self.embedder(observations, training=training)

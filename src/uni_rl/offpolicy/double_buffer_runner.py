@@ -420,6 +420,47 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         if self.learner_prepare_hook is not None:
             self.learner_prepare_hook(self.learner, context)
 
+    def _persistent_inference_scratch_bytes(self) -> int:
+        """Read algorithm-owned, inference-only persistent scratch categories."""
+        startup_hook = getattr(self.learner, "inference_startup_memory_categories", None)
+        if startup_hook is None:
+            # Unknown custom learners remain covered by the conservative
+            # workspace reserve; no exact per-category claim is made for them.
+            return 0
+        if not callable(startup_hook):
+            raise TypeError(
+                f"{type(self.learner).__name__}.inference_startup_memory_categories "
+                "must be callable"
+            )
+        categories = startup_hook(self.num_envs)
+        if not isinstance(categories, dict) or set(categories) != {
+            "persistent_exploration_scratch"
+        }:
+            raise TypeError(
+                "inference_startup_memory_categories() must return exactly "
+                "{'persistent_exploration_scratch': bytes}"
+            )
+        value = categories["persistent_exploration_scratch"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("persistent exploration scratch bytes must be a non-negative int")
+        return value
+
+    def _prepare_inference_timing_events(self) -> None:
+        """Allocate the two CUDA timing events accounted for by the startup budget."""
+        if torch.device(self.device).type != "cuda":
+            return
+        try:
+            self._inference_forward_cuda_events = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+        except BaseException:
+            # CUDA event wrappers do not expose an explicit close method. Remove
+            # all local references so a partial allocation cannot survive startup.
+            if hasattr(self, "_inference_forward_cuda_events"):
+                delattr(self, "_inference_forward_cuda_events")
+            raise
+
     def _shutdown_collector(self) -> None:
         """Release the lock-step collector without waiting on a tick deadline."""
         self._learner_coordination.mark_stopped()
@@ -764,11 +805,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         if device.type == "cuda":
             cuda_forward_events = getattr(self, "_inference_forward_cuda_events", None)
             if cuda_forward_events is None:
-                cuda_forward_events = (
-                    torch.cuda.Event(enable_timing=True),
-                    torch.cuda.Event(enable_timing=True),
-                )
-                self._inference_forward_cuda_events = cuda_forward_events
+                raise RuntimeError("CUDA inference timing events were not prepared at startup")
             cuda_forward_events[0].record(torch.cuda.current_stream(device))
         with torch.no_grad():
             actions_device = sample_offpolicy_actions(
@@ -991,7 +1028,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
         # --- memory budget check ---
         from uni_rl.ipc.memory_budget import (
+            estimate_cuda_inference_ipc_bytes,
             estimate_offpolicy_bytes,
+            raise_if_cuda_memory_over_budget,
             raise_if_shared_memory_over_budget,
             warn_if_over_budget,
         )
@@ -1013,9 +1052,37 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             critic_dim=self.critic_obs_dim,
             ingress_depth=DEFAULT_REPLAY_INGRESS_DEPTH,
             inference_ring_bytes=0 if gpu_centric_collector else inference_ring_bytes,
+            ingress_on_device=gpu_centric_collector,
         )
         warn_if_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
         raise_if_shared_memory_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
+
+        # This guard runs before replay ingress, the inference ring, IPC events,
+        # or learner inference scratch is materialized. It intentionally uses a
+        # conservative reserve rather than claiming exact allocator accounting.
+        learner_device = torch.device(self.device)
+        if learner_device.type == "cuda":
+            cuda_free_bytes, _cuda_total_bytes = torch.cuda.mem_get_info(learner_device)
+            cuda_inference_budget = estimate_cuda_inference_ipc_bytes(
+                self.num_envs,
+                inference_input_dim,
+                self.action_dim,
+                capacity=self.inference_slot_capacity,
+                ring_on_device=gpu_centric_collector,
+                persistent_exploration_scratch=self._persistent_inference_scratch_bytes(),
+            )
+            raise_if_cuda_memory_over_budget(
+                cuda_inference_budget,
+                label=f"Off-policy ({self.algo_type})",
+                available_bytes=cuda_free_bytes,
+            )
+            self.runtime_manifest["inference_memory_budget"] = {
+                **cuda_inference_budget,
+                "available_bytes": cuda_free_bytes,
+                "threshold": 0.8,
+                "allowed_bytes": int(cuda_free_bytes * 0.8),
+            }
+            self._prepare_inference_timing_events()
 
         # --- bounded collector ingress (the complete ring lives on device) ---
         buffer_capacity = self.replay_buffer_n * self.num_envs
@@ -1065,15 +1132,6 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             }
         )
 
-        if gpu_centric_collector:
-            free_bytes, _total_bytes = torch.cuda.mem_get_info(self.device)
-            if inference_ring_bytes > free_bytes * 0.8:
-                raise MemoryError(
-                    f"Off-policy ({self.algo_type}): CUDA inference ring needs "
-                    f"{inference_ring_bytes / 1024**2:.1f} MB but only "
-                    f"{free_bytes / 1024**2:.1f} MB is free. Reduce "
-                    "training.inference_slot_capacity."
-                )
         inference_slot = SharedInferenceRing(
             self.num_envs,
             inference_input_dim,

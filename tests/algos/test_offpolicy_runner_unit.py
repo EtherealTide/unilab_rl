@@ -373,6 +373,21 @@ def test_mjwarp_collector_start_forwards_learner_device(
     monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
     monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
     monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
 
     real_empty = torch.empty
 
@@ -387,6 +402,7 @@ def test_mjwarp_collector_start_forwards_learner_device(
         device="cuda:3",
         sim_backend="mjwarp",
     )
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
     collector_kwargs = {}
     lifecycle: list[str] = []
 
@@ -451,6 +467,11 @@ def test_runner_constructs_only_bounded_device_replay(
     runtime_manifest = runner.last_run_summary["runtime_manifest"]
     assert runtime_manifest["replay_h2d_submitter"] == runner.replay_h2d_submitter
     assert "replay_device_submission_thread" in runtime_manifest
+    budget = runtime_manifest["inference_memory_budget"]
+    assert budget["ipc_event_count"] == 0
+    assert budget["timing_event_count"] == 2
+    assert budget["cuda_event_count"] == 2
+    assert len(runner._inference_forward_cuda_events) == 2
     assert not any(key.startswith("collector_pack") for key in collector_kwargs)
     assert "weight_sync_name" not in collector_kwargs
     assert "weight_param_shapes" not in collector_kwargs
@@ -462,6 +483,36 @@ def test_runner_constructs_only_bounded_device_replay(
     assert "collection_ready_queue" not in collector_kwargs
     assert "trainer_done_queue" not in collector_kwargs
     assert _FakePipeline.close_calls == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cuda_inference_budget_fails_before_resource_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    monkeypatch.setattr(device_runner_module.torch.cuda, "mem_get_info", lambda device: (1, 2))
+
+    def fail_allocation(*args, **kwargs):
+        raise AssertionError("inference resources must not be allocated after budget failure")
+
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", fail_allocation)
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", fail_allocation)
+    runner = _make_device_runner(
+        monkeypatch,
+        device="cuda",
+        collector_tensor_native=True,
+        inference_slot_capacity=2,
+    )
+
+    with pytest.raises(MemoryError) as excinfo:
+        runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    message = str(excinfo.value)
+    assert "conservative CUDA inference IPC budget" in message
+    assert "80% limit" in message
+    assert "device free" in message
+    assert "training.inference_slot_capacity" in message
+    assert not runner._shared_resources
 
 
 @pytest.mark.parametrize(
@@ -515,6 +566,10 @@ def test_runner_collector_resources_follow_tensor_runtime_capability(
     )
     assert manifest["inference_epoch"] == 0
     assert manifest["inference_slot_bytes"] == 56
+    budget = manifest["inference_memory_budget"]
+    assert budget["ipc_event_count"] == (1 if collector_tensor_native else 0) * 3
+    assert budget["timing_event_count"] == 2
+    assert budget["cuda_event_count"] == budget["ipc_event_count"] + 2
     assert manifest["collector_metrics_interval"] == 1
     assert collector_kwargs["inference_epoch"] == 0
     assert collector_kwargs["collector_metrics_interval"] == 1

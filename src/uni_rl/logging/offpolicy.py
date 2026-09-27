@@ -108,6 +108,19 @@ _COLLECTOR_TIMING_SPECS = {
     "rollout_ms": (9.0, "Rollout Wall", "rollout_total"),
 }
 
+_COLLECTOR_INFERENCE_TAG_SPECS: dict[str, str | None] = {
+    "queue_depth": "Perf/collector_inference_queue_depth",
+    "action_backlog": "Perf/collector_inference_action_backlog",
+    "max_action_backlog": "Perf/collector_inference_max_action_backlog",
+    "in_flight": "Perf/collector_inference_in_flight",
+    "max_in_flight": "Perf/collector_inference_max_in_flight",
+    # Wait time is persisted by the collector timing map; keep the value in the
+    # inference snapshot without emitting a duplicate canonical tag.
+    "wait_time_ms": None,
+    "publication_lag": "Perf/collector_inference_publication_lag",
+    "max_publication_lag": "Perf/collector_inference_max_publication_lag",
+}
+
 OFFPOLICY_ENV_STEP_DETAIL_KEYS = (
     "env_step_action_backend_ms",
     "env_step_backend_ms",
@@ -230,6 +243,7 @@ class OffPolicyLogger(BaseTrainingLogger):
         self._learner_replay_rows_per_iter: int = 0
         self._has_iteration_extra_info: bool = False
         self._collector_timing: dict[str, float] = {}
+        self._collector_inference: dict[str, float] = {}
         if timing_profile not in _LEARNER_TIMING_PROFILES:
             raise ValueError("timing_profile must be 'sac_family' or 'appo'")
         self._timing_profile = timing_profile
@@ -460,6 +474,21 @@ class OffPolicyLogger(BaseTrainingLogger):
             raise ValueError(f"unregistered collector timing keys: {names}")
         self._collector_timing.update(normalized)
 
+    def update_collector_inference(self, diagnostics: dict[str, float | int]):
+        unknown = sorted(set(diagnostics) - set(_COLLECTOR_INFERENCE_TAG_SPECS))
+        if unknown:
+            names = ", ".join(unknown)
+            raise ValueError(f"unregistered collector inference keys: {names}")
+        normalized: dict[str, float] = {}
+        for key, value in diagnostics.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"collector inference {key} must be numeric")
+            number = float(value)
+            if number < 0.0:
+                raise ValueError(f"collector inference {key} must be non-negative")
+            normalized[key] = number
+        self._collector_inference.update(normalized)
+
     def update_timeout_rate(self, timeout_rate: float):
         self._timeout_rate = float(timeout_rate)
 
@@ -604,6 +633,11 @@ class OffPolicyLogger(BaseTrainingLogger):
                 _set_backend_scalar(scalars, "Perf/collection_time", value / 1000.0)
             else:
                 _set_backend_scalar(scalars, f"Perf/collector_{key}", value)
+        for key, inference_tag in _COLLECTOR_INFERENCE_TAG_SPECS.items():
+            if inference_tag is None:
+                continue
+            if key in self._collector_inference:
+                _set_backend_scalar(scalars, inference_tag, self._collector_inference[key])
         if iter_steps_per_sec is not None:
             _set_backend_scalar(scalars, "Perf/total_fps", iter_steps_per_sec)
         for key, value in learner_timing_scalars.items():

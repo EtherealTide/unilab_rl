@@ -74,24 +74,11 @@ class SharedInferenceRing:
         self.action_dim = int(action_dim)
         self.capacity = int(capacity)
         self.device = target
-        self.observations = torch.empty(
-            (self.capacity, self.num_envs, self.obs_dim),
-            dtype=torch.float32,
-            device=target,
-        ).share_memory_()
-        self.dones = torch.empty(
-            (self.capacity, self.num_envs), dtype=torch.float32, device=target
-        ).share_memory_()
-        self.actions = torch.empty(
-            (self.capacity, self.num_envs, self.action_dim),
-            dtype=torch.float32,
-            device=target,
-        ).share_memory_()
-
         self._epoch = _SPAWN_CTX.Value("q", int(epoch))
         self._closed = _SPAWN_CTX.Value("i", 0)
         self._published_tick = _SPAWN_CTX.Value("q", -1)
         self._observation_tick = _SPAWN_CTX.Value("q", -1)
+        self._action_tick = _SPAWN_CTX.Value("q", -1)
         self._consumed_tick = _SPAWN_CTX.Value("q", -1)
         self._request_ticks = _SPAWN_CTX.RawArray("q", self.capacity)
         self._request_epochs = _SPAWN_CTX.RawArray("q", self.capacity)
@@ -105,14 +92,8 @@ class SharedInferenceRing:
             self._policy_versions[index] = -1
             self._consumer_done_ticks[index] = -1
 
-        self._free_slots = _SPAWN_CTX.Semaphore(self.capacity)
-        self._observation_ready = _SPAWN_CTX.Semaphore(0)
-        self._action_ready = _SPAWN_CTX.Semaphore(0)
-        self._producer_lock = _SPAWN_CTX.Lock()
-        self._observation_lock = _SPAWN_CTX.Lock()
-        self._response_lock = _SPAWN_CTX.Lock()
-        self._action_lock = _SPAWN_CTX.Lock()
-
+        self._shared_semaphores: list = []
+        self._shared_locks: list = []
         self._local_observation_events: dict[int, torch.cuda.Event] = {}
         self._local_action_events: dict[int, torch.cuda.Event] = {}
         self._local_consumer_done_events: dict[int, torch.cuda.Event] = {}
@@ -120,24 +101,78 @@ class SharedInferenceRing:
         self._action_event_handles: tuple[bytes, ...] = ()
         self._consumer_done_event_handles: tuple[bytes, ...] = ()
         self._local_closed = False
-        if target.type == "cuda":
-            observation_events = tuple(
-                torch.cuda.Event(interprocess=True) for _ in range(self.capacity)
-            )
-            action_events = tuple(torch.cuda.Event(interprocess=True) for _ in range(self.capacity))
-            consumer_done_events = tuple(
-                torch.cuda.Event(interprocess=True) for _ in range(self.capacity)
-            )
-            self._observation_event_handles = tuple(
-                event.ipc_handle() for event in observation_events
-            )
-            self._action_event_handles = tuple(event.ipc_handle() for event in action_events)
-            self._consumer_done_event_handles = tuple(
-                event.ipc_handle() for event in consumer_done_events
-            )
-            self._local_observation_events = dict(enumerate(observation_events))
-            self._local_action_events = dict(enumerate(action_events))
-            self._local_consumer_done_events = dict(enumerate(consumer_done_events))
+        try:
+            self.observations = torch.empty(
+                (self.capacity, self.num_envs, self.obs_dim),
+                dtype=torch.float32,
+                device=target,
+            ).share_memory_()
+            self.dones = torch.empty(
+                (self.capacity, self.num_envs), dtype=torch.float32, device=target
+            ).share_memory_()
+            self.actions = torch.empty(
+                (self.capacity, self.num_envs, self.action_dim),
+                dtype=torch.float32,
+                device=target,
+            ).share_memory_()
+
+            self._free_slots = _SPAWN_CTX.Semaphore(self.capacity)
+            self._observation_ready = _SPAWN_CTX.Semaphore(0)
+            self._action_ready = _SPAWN_CTX.Semaphore(0)
+            self._shared_semaphores = [
+                self._free_slots,
+                self._observation_ready,
+                self._action_ready,
+            ]
+            self._producer_lock = _SPAWN_CTX.Lock()
+            self._observation_lock = _SPAWN_CTX.Lock()
+            self._response_lock = _SPAWN_CTX.Lock()
+            self._action_lock = _SPAWN_CTX.Lock()
+            self._shared_locks = [
+                self._producer_lock,
+                self._observation_lock,
+                self._response_lock,
+                self._action_lock,
+            ]
+
+            if target.type == "cuda":
+                event_groups = (
+                    ("observation", self._local_observation_events),
+                    ("action", self._local_action_events),
+                    ("consumer_done", self._local_consumer_done_events),
+                )
+                for event_kind, local_events in event_groups:
+                    events = []
+                    handles = []
+                    try:
+                        for slot in range(self.capacity):
+                            event = torch.cuda.Event(interprocess=True)
+                            events.append(event)
+                            local_events[slot] = event
+                            handles.append(event.ipc_handle())
+                    finally:
+                        if len(handles) != self.capacity:
+                            local_events.clear()
+                            if event_kind == "observation":
+                                self._observation_event_handles = ()
+                            elif event_kind == "action":
+                                self._action_event_handles = ()
+                            else:
+                                self._consumer_done_event_handles = ()
+                        elif event_kind == "observation":
+                            self._observation_event_handles = tuple(handles)
+                        elif event_kind == "action":
+                            self._action_event_handles = tuple(handles)
+                        else:
+                            self._consumer_done_event_handles = tuple(handles)
+        except BaseException:
+            # Keep constructor failures deterministic: no partially allocated
+            # tensor, local CUDA event, IPC handle, semaphore, or lock is left
+            # for garbage collection to discover later.
+            self._closed.value = 1
+            self._local_closed = True
+            self._release_local_resources()
+            raise
 
     def __getstate__(self) -> dict[str, Any]:
         # CUDA event wrappers are process-local. Their IPC handles are copied to
@@ -167,6 +202,7 @@ class SharedInferenceRing:
             "epoch": int(self._epoch.value),
             "published_tick": int(self._published_tick.value),
             "observation_tick": int(self._observation_tick.value),
+            "action_tick": int(self._action_tick.value),
             "consumed_tick": int(self._consumed_tick.value),
             "closed": bool(self._closed.value),
         }
@@ -333,6 +369,7 @@ class SharedInferenceRing:
                 self._action_event(slot).record(torch.cuda.current_stream(self.device))
             self._response_ticks[slot] = int(tick_id)
             self._policy_versions[slot] = int(policy_version)
+            self._action_tick.value = int(tick_id)
             self._action_ready.release()
 
     def consume_action(
@@ -371,7 +408,7 @@ class SharedInferenceRing:
             if self.device.type == "cuda":
                 self._action_event(slot).wait(torch.cuda.current_stream(self.device))
             actions = (
-                self.actions[slot].clone()
+                self._clone_action(slot)
                 if self.device.type == "cuda"
                 else self.actions[slot].detach().cpu().numpy().copy()
             )
@@ -400,22 +437,36 @@ class SharedInferenceRing:
         for name in ("observations", "dones", "actions"):
             if hasattr(self, name):
                 delattr(self, name)
+        self._release_local_resources()
+
+    def _release_local_resources(self) -> None:
+        """Best-effort local cleanup that never masks the original failure."""
+        for name in ("observations", "dones", "actions"):
+            if hasattr(self, name):
+                delattr(self, name)
         self._local_observation_events.clear()
         self._local_action_events.clear()
         self._local_consumer_done_events.clear()
-        for semaphore in (
-            self._free_slots,
-            self._observation_ready,
-            self._action_ready,
-        ):
-            close = getattr(semaphore, "close", None)
+        self._observation_event_handles = ()
+        self._action_event_handles = ()
+        self._consumer_done_event_handles = ()
+        for primitive in (*self._shared_semaphores, *self._shared_locks):
+            close = getattr(primitive, "close", None)
             if callable(close):
-                close()
+                try:
+                    close()
+                except Exception:
+                    # Teardown must preserve the constructor/runtime exception.
+                    pass
 
     cleanup = close
 
     def _slot_index(self, tick_id: int) -> int:
         return int(tick_id) % self.capacity
+
+    def _clone_action(self, slot: int) -> torch.Tensor:
+        """Clone CUDA action storage on the consumer's current stream."""
+        return self.actions[slot].clone()
 
     def _observation_inputs(
         self, observations: np.ndarray | torch.Tensor, dones: np.ndarray | torch.Tensor

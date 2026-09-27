@@ -79,6 +79,8 @@ def drain_collector_metrics(
                 logger.update_mean_episode_length(metrics["mean_episode_length"])
             if "collector_timing_ms" in metrics:
                 logger.update_collector_timing(metrics["collector_timing_ms"])
+            if "collector_inference" in metrics:
+                logger.update_collector_inference(metrics["collector_inference"])
             if "timeout_rate" in metrics:
                 logger.update_timeout_rate(float(metrics["timeout_rate"]))
             if "total_steps" in metrics and (not require_buffer_size or "buffer_size" in metrics):

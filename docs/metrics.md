@@ -82,6 +82,12 @@ metrics.
   group instead of a custom pipeline namespace.
 - Additional timing fields stay under `Perf/*`. Millisecond fields end in `_ms`;
   the two upstream second fields retain their exact names.
+- The learner-owned inference queue reports dynamic observation depth, action
+  backlog, current/maximum in-flight requests, and publication lag under
+  `Perf/collector_inference_*`. These are ordering diagnostics: a serial
+  `observation[t] -> action[t] -> transition[t] -> observation[t+1]` dependency
+  can legally use only one outstanding request even when the configured ring
+  capacity is greater.
 
 Learner main-thread phases are mutually exclusive. Nested inference and
 env-step diagnostics are descriptions, not additional slices of the parent

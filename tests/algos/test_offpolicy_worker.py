@@ -10,6 +10,7 @@ import torch
 
 import uni_rl.offpolicy.worker as worker_module
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
+from uni_rl.ipc.inference_ring import SharedInferenceRing
 from uni_rl.offpolicy.tensor_metrics import TensorCollectorMetrics
 from uni_rl.offpolicy.worker import (
     _collector_action_numpy,
@@ -323,6 +324,144 @@ def test_collector_binds_backend_device_before_env_materialization(
         ("bind", "cuda:3"),
         ("make", "2"),
     ]
+
+
+def test_tensor_collector_reports_bounded_inference_scheduling_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = threading.Event()
+    inference_request_queue: queue.Queue[int] = queue.Queue()
+    inference_response_queue: queue.Queue[int] = queue.Queue()
+    metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=4)
+    events: list[str] = []
+
+    initial_obs = {"obs": torch.zeros((2, 2), dtype=torch.float32)}
+    next_obs = {"obs": torch.ones((2, 2), dtype=torch.float32)}
+
+    class _State:
+        obs = initial_obs
+        reward = torch.ones(2)
+        terminated = torch.zeros(2, dtype=torch.bool)
+        truncated = torch.zeros(2, dtype=torch.bool)
+        final_observation = None
+        info = {"timing": {}}
+
+    class _Env:
+        state = _State()
+
+        def step(self, actions):
+            torch.testing.assert_close(actions, torch.zeros((2, 2)))
+            events.append("step")
+            stop_event.set()
+            self.state = SimpleNamespace(
+                obs=next_obs,
+                reward=torch.ones(2),
+                terminated=torch.zeros(2, dtype=torch.bool),
+                truncated=torch.zeros(2, dtype=torch.bool),
+                final_observation=None,
+                info={"timing": {}},
+            )
+            return self.state
+
+        def close(self):
+            events.append("close")
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+        size = torch.zeros(1, dtype=torch.int64)
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+        def add(self, *args, **kwargs) -> None:
+            del args, kwargs
+            events.append("replay_add")
+
+        def release_ipc(self) -> None:
+            events.append("replay_release")
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *a, **kw: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *a, **kw: None)
+    ring = SharedInferenceRing(2, 2, 2, capacity=4)
+
+    def serve_learner_action(
+        coordination_queue,
+        tick_id,
+        stop,
+        **kwargs,
+    ):
+        del coordination_queue, stop, kwargs
+        ring.copy_observation_to(
+            tick_id=tick_id,
+            observations=torch.empty((2, 2)),
+            dones=torch.empty(2),
+            epoch=0,
+        )
+        ring.publish_action(
+            tick_id=tick_id,
+            policy_version=0,
+            actions=torch.zeros((2, 2)),
+            epoch=0,
+        )
+        return True
+
+    monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
+    original_consume_action = ring.consume_action
+
+    def consume_tensor_action(**kwargs):
+        actions, policy_version = original_consume_action(**kwargs)
+        if isinstance(actions, np.ndarray):
+            actions = torch.from_numpy(actions)
+        return actions, policy_version
+
+    ring.consume_action = consume_tensor_action
+
+    worker_module._run_collector(
+        stop_event=stop_event,
+        env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+        num_envs=2,
+        replay_buffer=_ReplayBuffer(),
+        inference_slot=ring,
+        inference_request_queue=inference_request_queue,
+        inference_response_queue=inference_response_queue,
+        algo_type="sac",
+        actor_adapter_modules=None,
+        metrics_queue=metrics_queue,
+        sim_backend="mujoco",
+        backend_device=None,
+        env_cfg_override=None,
+        inference_epoch=0,
+        collector_metrics_interval=1,
+        seed=1,
+        trace_enabled=False,
+        trace_thread_time=False,
+    )
+
+    manifest_message = metrics_queue.get_nowait()
+    manifest = manifest_message["runtime_manifest"]
+    assert manifest["inference_queue_capacity"] == 4
+    assert manifest["inference_scheduling_policy"] == "sequential_transition_dependency"
+    assert manifest["inference_legal_max_in_flight"] == 1
+    assert manifest["inference_dependency_graph"]["transition_to_next_observation"] == (
+        "env.step(action[t]) -> observation[t+1]"
+    )
+
+    report_message = metrics_queue.get_nowait()
+    report = report_message["collector_inference"]
+    assert report["queue_depth"] == 0
+    assert report["action_backlog"] == 0
+    assert report["max_action_backlog"] == 0
+    assert report["in_flight"] == 0
+    assert report["max_in_flight"] == 1
+    assert report["wait_time_ms"] >= 0.0
+    assert report["publication_lag"] == 0
+    assert report["max_publication_lag"] == 1
+    manifest_flight = report_message["runtime_manifest"]["inference_flight"]
+    assert manifest_flight == report
+    assert events == ["step", "replay_add", "close", "replay_release"]
+    assert inference_request_queue.get_nowait() == worker_module.COLLECTOR_READY_TICK
+    assert inference_request_queue.get_nowait() == 0
 
 
 def test_inference_request_publish_timeout_is_explicit() -> None:

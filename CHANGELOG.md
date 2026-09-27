@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Bounded inference scheduling diagnostics for tensor-native collectors, including
+  queue depth, action backlog, in-flight depth, publication lag, wait time, and
+  the legal sequential dependency graph in runtime manifests.
+- Conservative pre-flight CUDA inference accounting for the shared inference
+  ring, IPC/timing events, learner inference scratch, FlashSAC persistent
+  exploration scratch, and allocator/workspace reserve. CUDA learners now
+  preallocate timing events before collector startup.
+- A deterministic cross-process CUDA regression covering delayed action clones
+  with bounded slot reuse, plus deterministic cleanup for partially constructed
+  inference rings.
+
+### Fixed
+
+- Collector inference metrics distinguish configured ring capacity from dynamic
+  observation backlog and action backlog, preventing capacity from being
+  interpreted as concurrent in-flight requests.
+
 ## [1.4.2] - 2026-09-27
 
 ### Added

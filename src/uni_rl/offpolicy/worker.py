@@ -34,6 +34,28 @@ COLLECTOR_TIMING_KEYS = (
     "replay_write_ms",
 )
 COLLECTOR_READY_TICK = -1
+INFERENCE_SCHEDULING_POLICY = "sequential_transition_dependency"
+INFERENCE_DEPENDENCY_GRAPH = {
+    "observation_to_action": "observation[t] -> learner action[t]",
+    "action_to_transition": "action[t] -> env.step(action[t])",
+    "transition_to_next_observation": "env.step(action[t]) -> observation[t+1]",
+    "replay_write_boundary": "transition[t] -> replay ingress[t] (order-preserving)",
+    "reset_boundary": "terminal/reset rows are committed before observation[t+1]",
+    "legal_concurrent_work": "replay/metrics work may overlap only after its transition is published",
+}
+
+
+def _inference_flight_metrics(inference_slot) -> tuple[int, int, int, int]:
+    diagnostics = inference_slot.diagnostics
+    published_tick = int(diagnostics["published_tick"])
+    observation_tick = int(diagnostics["observation_tick"])
+    action_tick = int(diagnostics["action_tick"])
+    consumed_tick = int(diagnostics["consumed_tick"])
+    queue_depth = max(published_tick - observation_tick, 0)
+    action_backlog = max(action_tick - consumed_tick, 0)
+    in_flight = max(published_tick - consumed_tick, 0)
+    publication_lag = in_flight
+    return queue_depth, action_backlog, in_flight, publication_lag
 
 
 def sample_offpolicy_actions(
@@ -343,6 +365,12 @@ def _run_collector(
     timing_counts: defaultdict[str, int] = defaultdict(int)
     done_count_window = 0
     timeout_count_window = 0
+    inference_queue_depth = 0
+    inference_action_backlog = 0
+    inference_in_flight = 0
+    max_action_backlog_since_metric = 0
+    max_in_flight_since_metric = 0
+    max_publication_lag_since_metric = 0
 
     obs_t: torch.Tensor | None = None
     critic_t: torch.Tensor | None = None
@@ -383,6 +411,10 @@ def _run_collector(
         "cuda_context_initialized": bool(torch.cuda.is_initialized()),
         "tensor_native_env": tensor_collector,
         "inference_slot_device": getattr(inference_slot, "device", torch.device("cpu")),
+        "inference_queue_capacity": int(getattr(inference_slot, "capacity", 0)),
+        "inference_scheduling_policy": INFERENCE_SCHEDULING_POLICY,
+        "inference_legal_max_in_flight": 1,
+        "inference_dependency_graph": dict(INFERENCE_DEPENDENCY_GRAPH),
     }
     if trace_recorder:
         manifest_ns = _time.perf_counter_ns()
@@ -452,6 +484,26 @@ def _run_collector(
                     break
             if not observation_published:
                 break
+            (
+                inference_queue_depth,
+                inference_action_backlog,
+                inference_in_flight,
+                publication_lag,
+            ) = _inference_flight_metrics(inference_slot)
+            max_action_backlog_since_metric = max(
+                max_action_backlog_since_metric,
+                inference_action_backlog,
+            )
+            max_in_flight_since_metric = max(max_in_flight_since_metric, inference_in_flight)
+            max_publication_lag_since_metric = max(
+                max_publication_lag_since_metric, publication_lag
+            )
+            if trace_recorder:
+                trace_recorder.add_counter(
+                    "inference/in_flight",
+                    inference_in_flight,
+                    category="collector_inference",
+                )
             if not _publish_inference_tick(
                 inference_request_queue,
                 inference_tick,
@@ -482,6 +534,12 @@ def _run_collector(
                 tick_id=inference_tick,
                 epoch=inference_epoch,
             )
+            (
+                inference_queue_depth,
+                inference_action_backlog,
+                inference_in_flight,
+                publication_lag,
+            ) = _inference_flight_metrics(inference_slot)
             actions_np = None if tensor_collector else _collector_action_numpy(actions)
             if trace_recorder:
                 trace_recorder.add_slice(
@@ -721,6 +779,21 @@ def _run_collector(
                             for k, v in timing_accum_ms.items()
                             if timing_counts[k] > 0
                         }
+                    inference_diagnostics = {
+                        "queue_depth": int(inference_queue_depth),
+                        "action_backlog": int(inference_action_backlog),
+                        "max_action_backlog": int(max_action_backlog_since_metric),
+                        "in_flight": int(inference_in_flight),
+                        "max_in_flight": int(max_in_flight_since_metric),
+                        "wait_time_ms": float(cycle_timing_ms["learner_action_wait_ms"]),
+                        "publication_lag": int(inference_in_flight),
+                        "max_publication_lag": int(max_publication_lag_since_metric),
+                    }
+                    msg["collector_inference"] = inference_diagnostics
+                    # Keep the latest bounded-flight snapshot alongside the
+                    # canonical scalar stream so run summaries do not need to
+                    # infer it from configured ring capacity.
+                    msg["runtime_manifest"] = {"inference_flight": dict(inference_diagnostics)}
                     if done_count_window > 0:
                         msg["timeout_rate"] = timeout_count_window / done_count_window
                         done_count_window = 0
@@ -730,6 +803,9 @@ def _run_collector(
                         msg["trace_events"] = trace_recorder.drain_events()
 
                     metrics_queue.put_nowait(msg)
+                    max_action_backlog_since_metric = 0
+                    max_in_flight_since_metric = 0
+                    max_publication_lag_since_metric = 0
                     if "collector_timing_ms" in msg:
                         timing_accum_ms.clear()
                         timing_counts.clear()

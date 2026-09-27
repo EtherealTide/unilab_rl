@@ -74,6 +74,14 @@ def test_flashsac_learner_exposes_expected_dims():
     assert learner.action_dim == 29
 
 
+def test_flashsac_learner_declares_inference_startup_scratch():
+    learner = _make_small_learner()
+
+    assert learner.inference_startup_memory_categories(2048) == {
+        "persistent_exploration_scratch": 2048 * (2 * 4 + 2 * 4)
+    }
+
+
 def test_flashsac_cuda_adam_optimizers_are_capturable(monkeypatch) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA-only optimizer kwargs require a CUDA-enabled torch build")
