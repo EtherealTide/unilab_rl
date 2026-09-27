@@ -162,6 +162,7 @@ def test_sac_builder_forwards_backend_device_binder(
 
     assert runner.kwargs["backend_device_binder"] is (_binder if with_binder else None)
     assert runner.kwargs["log_interval"] == 3
+    assert runner.kwargs["collector_tensor_native"] is False
 
 
 @pytest.mark.parametrize("with_binder", [False, True])
@@ -214,6 +215,47 @@ def test_flashsac_builder_resolves_tensor_runtime_before_collector_spawn(
         device="cpu",
     )
     assert runner.kwargs["collector_tensor_native"] is False
+
+
+def test_sac_builder_resolves_tensor_runtime_before_collector_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.fast_sac.double_buffer as module
+
+    monkeypatch.setattr(module, "FastSACLearner", _FakeLearner)
+    monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
+    cfg = _sac_cfg()
+    cfg.env = {"tensor_runtime": False}
+
+    runner = module.build_sac_double_buffer_runner(
+        cfg,
+        env_factory=_fake_env_factory,
+        env_cfg_override=None,
+        replay_prefetch_mode="one_tick",
+        device="cpu",
+    )
+
+    assert runner.kwargs["collector_tensor_native"] is False
+
+
+def test_sac_builder_rejects_tensor_runtime_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.fast_sac.double_buffer as module
+
+    monkeypatch.setattr(module, "FastSACLearner", _FakeLearner)
+    monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
+    cfg = _sac_cfg()
+    cfg.env = {"tensor_runtime": True}
+
+    with pytest.raises(ValueError, match="FastSAC env.tensor_runtime=true requires CUDA"):
+        module.build_sac_double_buffer_runner(
+            cfg,
+            env_factory=_fake_env_factory,
+            env_cfg_override=None,
+            replay_prefetch_mode="one_tick",
+            device="cpu",
+        )
 
 
 def test_flashsac_builder_rejects_tensor_runtime_on_cpu(

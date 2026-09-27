@@ -6,7 +6,6 @@ import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-import torch
 from omegaconf import DictConfig, OmegaConf
 
 from uni_rl.algos.flash_sac.learner import FlashSACLearner
@@ -17,6 +16,7 @@ from uni_rl.utils.device import get_default_device
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
 from uni_rl.utils.seed import apply_training_seed
+from uni_rl.utils.tensor_runtime import resolve_collector_tensor_native
 
 if TYPE_CHECKING:
     from uni_rl.ipc.dp_sync import DpParameterSync
@@ -31,20 +31,6 @@ def _validate_flashsac_double_buffer_runtime(
         raise ValueError("FlashSAC device replay requires replay_prefetch_mode='one_tick'")
     if cfg.algo.algo_params.n_step != 1:
         raise ValueError("FlashSAC-B initially supports n_step=1 only")
-
-
-def _resolve_collector_tensor_native(cfg: DictConfig, device: str) -> bool:
-    """Resolve the task-owner tensor-runtime capability before spawning."""
-    value = OmegaConf.select(cfg, "env.tensor_runtime", default=False)
-    if value is None:
-        value = False
-    if type(value) is not bool:
-        raise TypeError(f"FlashSAC env.tensor_runtime must be a boolean or omitted, got {value!r}")
-    if value and torch.device(device).type != "cuda":
-        raise ValueError(
-            f"FlashSAC env.tensor_runtime=true requires CUDA, but the replay device is {device!r}"
-        )
-    return value
 
 
 def build_flashsac_double_buffer_runner(
@@ -67,7 +53,9 @@ def build_flashsac_double_buffer_runner(
         cfg,
         replay_prefetch_mode=replay_prefetch_mode,
     )
-    collector_tensor_native = _resolve_collector_tensor_native(cfg, device)
+    collector_tensor_native = resolve_collector_tensor_native(
+        cfg, device=device, algo_name="FlashSAC"
+    )
 
     if "inference_request_timeout_sec" in cfg.training:
         warnings.warn(
