@@ -163,6 +163,8 @@ def test_sac_builder_forwards_backend_device_binder(
     assert runner.kwargs["backend_device_binder"] is (_binder if with_binder else None)
     assert runner.kwargs["log_interval"] == 3
     assert runner.kwargs["collector_tensor_native"] is False
+    assert runner.kwargs["inference_slot_capacity"] == 1
+    assert runner.kwargs["collector_metrics_interval"] == 1
 
 
 @pytest.mark.parametrize("with_binder", [False, True])
@@ -174,7 +176,12 @@ def test_flashsac_builder_forwards_backend_device_binder(
     monkeypatch.setattr(module, "FlashSACLearner", _FakeLearner)
     monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
     # CPU-only test host: bypass the CUDA/MPS replay-device gate and seeding.
-    monkeypatch.setattr(module, "require_offpolicy_replay_device", lambda device: device)
+    monkeypatch.setattr(
+        module,
+        "require_offpolicy_replay_device",
+        lambda device: device,
+        raising=False,
+    )
     monkeypatch.setattr(module, "apply_training_seed", lambda *args, **kwargs: None)
 
     kwargs: dict[str, Any] = {}
@@ -192,7 +199,55 @@ def test_flashsac_builder_forwards_backend_device_binder(
     assert runner.kwargs["backend_device_binder"] is (_binder if with_binder else None)
     assert runner.kwargs["log_interval"] == 3
     assert runner.kwargs["collector_tensor_native"] is False
+    assert runner.kwargs["inference_slot_capacity"] == 1
+    assert runner.kwargs["collector_metrics_interval"] == 1
     assert _FakeLearner.last_kwargs["compile_full_objectives"] is True
+
+
+@pytest.mark.parametrize("algo", ["sac", "flashsac"])
+def test_double_buffer_builders_forward_tensor_runtime_intervals(
+    monkeypatch: pytest.MonkeyPatch, algo: str
+) -> None:
+    if algo == "sac":
+        import uni_rl.algos.fast_sac.double_buffer as module
+
+        cfg = _sac_cfg()
+        learner_name = "FastSACLearner"
+    else:
+        import uni_rl.algos.flash_sac.double_buffer as module
+
+        cfg = _flashsac_cfg()
+        learner_name = "FlashSACLearner"
+
+    monkeypatch.setattr(module, learner_name, _FakeLearner)
+    monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
+    if algo == "flashsac":
+        monkeypatch.setattr(module, "require_offpolicy_replay_device", lambda device: device)
+    if algo == "flashsac":
+        monkeypatch.setattr(module, "apply_training_seed", lambda *args, **kwargs: None)
+    cfg.env = {"tensor_runtime": False}
+    cfg.training.inference_slot_capacity = 3
+    cfg.training.collector_metrics_interval = 7
+
+    if algo == "sac":
+        runner = module.build_sac_double_buffer_runner(
+            cfg,
+            env_factory=_fake_env_factory,
+            env_cfg_override=None,
+            replay_prefetch_mode="one_tick",
+            device="cpu",
+        )
+    else:
+        runner = module.build_flashsac_double_buffer_runner(
+            cfg,
+            env_factory=_fake_env_factory,
+            env_cfg_override=None,
+            replay_prefetch_mode="one_tick",
+            device="cpu",
+        )
+
+    assert runner.kwargs["inference_slot_capacity"] == 3
+    assert runner.kwargs["collector_metrics_interval"] == 7
 
 
 def test_flashsac_builder_resolves_tensor_runtime_before_collector_spawn(

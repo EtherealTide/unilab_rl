@@ -16,6 +16,7 @@ from uni_rl.offpolicy.coordination import (
     LearnerPhase,
     learner_pid_is_alive,
 )
+from uni_rl.offpolicy.tensor_metrics import TensorCollectorMetrics
 from uni_rl.offpolicy.thread_budget import apply_torch_thread_runtime
 from uni_rl.utils.device import configure_backend_process_device
 from uni_rl.utils.final_observation import resolve_terminal_observation_contract
@@ -199,31 +200,6 @@ def _collector_action_numpy(actions: np.ndarray | torch.Tensor) -> np.ndarray:
     return np.asarray(actions, dtype=np.float32)
 
 
-def _tensor_count_pair_to_cpu(first: torch.Tensor, second: torch.Tensor) -> tuple[int, int]:
-    """Transfer two scalar counts with one GPU-to-host synchronization."""
-    values = torch.stack((first.reshape(()), second.reshape(()))).cpu()
-    return int(values[0].item()), int(values[1].item())
-
-
-def _finished_episode_values_to_cpu(
-    rewards: torch.Tensor,
-    lengths: torch.Tensor,
-    rows: torch.Tensor,
-) -> tuple[list[float], list[int]]:
-    """Transfer finished reward/length pairs with one host transfer."""
-    # Episode lengths are bounded well below 2^53, so float64 preserves their
-    # exact integer values while allowing both metric columns to share a copy.
-    packed = torch.stack(
-        (
-            rewards[rows].to(dtype=torch.float64),
-            lengths[rows].to(dtype=torch.float64),
-        ),
-        dim=1,
-    ).cpu()
-    values = packed.tolist()
-    return [row[0] for row in values], [int(row[1]) for row in values]
-
-
 def off_policy_collector_fn(
     stop_event,
     env_factory: EnvFactory,
@@ -235,6 +211,8 @@ def off_policy_collector_fn(
     algo_type: str = "sac",
     actor_adapter_modules: list[str] | tuple[str, ...] | None = None,
     metrics_queue=None,
+    inference_epoch: int = 0,
+    collector_metrics_interval: int = 1,
     sim_backend: str = "mujoco",
     backend_device: str | None = None,
     env_cfg_override: dict | None = None,
@@ -263,6 +241,8 @@ def off_policy_collector_fn(
         algo_type=algo_type,
         actor_adapter_modules=actor_adapter_modules,
         metrics_queue=metrics_queue,
+        inference_epoch=inference_epoch,
+        collector_metrics_interval=collector_metrics_interval,
         sim_backend=sim_backend,
         backend_device=backend_device,
         env_cfg_override=env_cfg_override,
@@ -294,6 +274,8 @@ def _run_collector(
     seed,
     trace_enabled,
     trace_thread_time,
+    inference_epoch=0,
+    collector_metrics_interval=1,
     nan_guard_cfg=None,
     torch_thread_runtime=None,
     backend_device_binder=None,
@@ -346,13 +328,12 @@ def _run_collector(
     tensor_collector = isinstance(state.obs.get("obs"), torch.Tensor)
     current_ep_rewards = np.zeros(num_envs, dtype=np.float32)
     current_ep_lengths = np.zeros(num_envs, dtype=np.int32)
-    current_ep_rewards_t = (
-        torch.zeros(num_envs, dtype=torch.float32, device=state.obs["obs"].device)
-        if tensor_collector
-        else None
-    )
-    current_ep_lengths_t = (
-        torch.zeros(num_envs, dtype=torch.int32, device=state.obs["obs"].device)
+    tensor_metrics = (
+        TensorCollectorMetrics(
+            num_envs,
+            interval=collector_metrics_interval,
+            device=state.obs["obs"].device,
+        )
         if tensor_collector
         else None
     )
@@ -458,11 +439,19 @@ def _run_collector(
             request_ns = _time.perf_counter_ns()
             actor_input = actor_input_t if tensor_collector else actor_input_np
             assert actor_input is not None
-            inference_slot.publish_observation(
-                tick_id=inference_tick,
-                observations=actor_input,
-                dones=prev_dones_t if tensor_collector else prev_dones_np,
-            )
+            observation_published = False
+            while not stop_event.is_set():
+                observation_published = inference_slot.try_publish_observation(
+                    tick_id=inference_tick,
+                    observations=actor_input,
+                    dones=prev_dones_t if tensor_collector else prev_dones_np,
+                    epoch=inference_epoch,
+                    timeout_sec=0.1,
+                )
+                if observation_published:
+                    break
+            if not observation_published:
+                break
             if not _publish_inference_tick(
                 inference_request_queue,
                 inference_tick,
@@ -489,7 +478,10 @@ def _run_collector(
                 learner_pid=learner_pid,
             ):
                 break
-            actions, policy_version = inference_slot.consume_action(tick_id=inference_tick)
+            actions, policy_version = inference_slot.consume_action(
+                tick_id=inference_tick,
+                epoch=inference_epoch,
+            )
             actions_np = None if tensor_collector else _collector_action_numpy(actions)
             if trace_recorder:
                 trace_recorder.add_slice(
@@ -536,12 +528,12 @@ def _run_collector(
                 assert combined_dones_t is not None
                 prev_dones_t = combined_dones_t
                 done_mask_t = combined_dones_t > 0.5
-                done_count, timeout_count = _tensor_count_pair_to_cpu(
-                    torch.count_nonzero(done_mask_t),
-                    torch.count_nonzero(truncated_t > 0.5),
+                assert tensor_metrics is not None
+                tensor_metrics.update(
+                    rewards_t,
+                    done_mask_t,
+                    truncated_t > 0.5,
                 )
-                done_count_window += done_count
-                timeout_count_window += timeout_count
                 terminal_final = state.final_observation
                 if terminal_final is not None:
                     terminal_obs_t = terminal_final.get("obs")
@@ -661,25 +653,8 @@ def _run_collector(
 
             # Track episode rewards - vectorized
             if tensor_collector:
-                assert current_ep_rewards_t is not None
-                assert current_ep_lengths_t is not None
-                assert rewards_t is not None
-                assert done_mask_t is not None
                 assert next_obs_t is not None
                 assert next_critic_t is not None
-                current_ep_rewards_t += rewards_t
-                current_ep_lengths_t += 1
-                reset_indices_t = done_mask_t.nonzero(as_tuple=False).flatten()
-                if reset_indices_t.numel() > 0:
-                    finished_rewards, finished_lengths = _finished_episode_values_to_cpu(
-                        current_ep_rewards_t,
-                        current_ep_lengths_t,
-                        reset_indices_t,
-                    )
-                    ep_rewards.extend(finished_rewards)
-                    ep_lengths.extend(finished_lengths)
-                    current_ep_rewards_t[reset_indices_t] = 0.0
-                    current_ep_lengths_t[reset_indices_t] = 0
                 obs_t = next_obs_t
                 critic_t = next_critic_t
             else:
@@ -710,8 +685,16 @@ def _run_collector(
 
             # Send metrics every collector cycle so learner-side reward and
             # throughput displays track the current policy without extra lag.
-            if metrics_queue is not None:
+            if metrics_queue is not None and (tensor_metrics is None or tensor_metrics.ready):
                 import statistics
+
+                if tensor_collector:
+                    assert tensor_metrics is not None
+                    metric_flush = tensor_metrics.flush()
+                    ep_rewards.extend(metric_flush.rewards)
+                    ep_lengths.extend(metric_flush.lengths)
+                    done_count_window += metric_flush.done_count
+                    timeout_count_window += metric_flush.timeout_count
 
                 try:
                     msg = {
@@ -773,8 +756,7 @@ def _run_collector(
         next_critic_t = None
         terminal_obs_t = None
         terminal_critic_t = None
-        current_ep_rewards_t = None
-        current_ep_lengths_t = None
+        tensor_metrics = None
         inference_slot = None
         replay_buffer = None
         env = None

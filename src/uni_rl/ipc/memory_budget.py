@@ -18,21 +18,29 @@ def estimate_offpolicy_bytes(
     action_dim: int,
     critic_dim: int,
     ingress_depth: int = 2,
+    inference_ring_bytes: int = 0,
 ) -> dict[str, int | str]:
     """Estimate host shared memory for bounded off-policy replay ingress."""
     row_width = 2 * obs_dim + action_dim + 3 + 2 * critic_dim
     capacity = replay_buffer_n * num_envs
     ingress_bytes = int(ingress_depth) * num_envs * row_width * 4
+    inference_ring_line = (
+        f"  Inference ring: {inference_ring_bytes / 1024**2:.0f} MB\n"
+        if inference_ring_bytes
+        else ""
+    )
     return {
         "replay_buffer": 0,
         "bounded_ingress_slots": ingress_bytes,
-        "total": ingress_bytes,
+        "inference_ring": int(inference_ring_bytes),
+        "total": ingress_bytes + int(inference_ring_bytes),
         "breakdown": (
             "Replay: 0 MB shared host memory "
             f"({capacity} rows remain authoritative on the learner device)\n"
             f"  Bounded ingress: {ingress_bytes / 1024**2:.0f} MB "
             f"({int(ingress_depth)} slots × {num_envs} rows × {row_width} cols × 4B)\n"
-            "  Excludes MuJoCo BatchEnvPool/native allocations, CUDA pinned/shared "
+            + inference_ring_line
+            + "  Excludes MuJoCo BatchEnvPool/native allocations, CUDA pinned/shared "
             "registration, and driver memory."
         ),
     }

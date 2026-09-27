@@ -4,6 +4,7 @@ import shutil
 
 import pytest
 
+from uni_rl.ipc.inference_ring import estimate_inference_ring_bytes
 from uni_rl.ipc.memory_budget import (
     estimate_offpolicy_bytes,
     raise_if_shared_memory_over_budget,
@@ -42,6 +43,23 @@ def test_device_replay_host_budget_is_independent_of_replay_capacity() -> None:
     assert estimates[0]["bounded_ingress_slots"] > 0
     assert estimates[0]["total"] == estimates[1]["total"]
     assert "authoritative on the learner device" in str(estimates[0]["breakdown"])
+
+
+def test_host_budget_includes_cpu_inference_ring_storage() -> None:
+    estimate = estimate_offpolicy_bytes(
+        num_envs=2,
+        replay_buffer_n=4,
+        obs_dim=4,
+        action_dim=2,
+        critic_dim=5,
+        ingress_depth=2,
+        inference_ring_bytes=168,
+    )
+
+    assert estimate["inference_ring"] == 168
+    assert estimate["total"] == estimate["bounded_ingress_slots"] + 168
+    assert "Inference ring" in str(estimate["breakdown"])
+    assert estimate_inference_ring_bytes(2, 4, 2, capacity=3) == 168
 
 
 def test_shared_memory_budget_unknown_available_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:

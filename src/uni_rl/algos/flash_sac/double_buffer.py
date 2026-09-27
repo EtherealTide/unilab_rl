@@ -16,7 +16,11 @@ from uni_rl.utils.device import get_default_device
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
 from uni_rl.utils.seed import apply_training_seed
-from uni_rl.utils.tensor_runtime import resolve_collector_tensor_native
+from uni_rl.utils.tensor_runtime import (
+    resolve_collector_metrics_interval,
+    resolve_collector_tensor_native,
+    resolve_inference_slot_capacity,
+)
 
 if TYPE_CHECKING:
     from uni_rl.ipc.dp_sync import DpParameterSync
@@ -56,6 +60,8 @@ def build_flashsac_double_buffer_runner(
     collector_tensor_native = resolve_collector_tensor_native(
         cfg, device=device, algo_name="FlashSAC"
     )
+    inference_slot_capacity = resolve_inference_slot_capacity(cfg, algo_name="FlashSAC")
+    collector_metrics_interval = resolve_collector_metrics_interval(cfg, algo_name="FlashSAC")
 
     if "inference_request_timeout_sec" in cfg.training:
         warnings.warn(
@@ -140,5 +146,7 @@ def build_flashsac_double_buffer_runner(
         dp_sync=dp_sync,
         backend_device_binder=backend_device_binder,
         collector_tensor_native=collector_tensor_native,
+        inference_slot_capacity=inference_slot_capacity,
+        collector_metrics_interval=collector_metrics_interval,
         log_interval=int(cfg.training.log_interval),
     )

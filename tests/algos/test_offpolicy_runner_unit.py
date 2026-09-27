@@ -15,7 +15,7 @@ import torch
 import uni_rl.offpolicy.double_buffer_runner as device_runner_module
 import uni_rl.offpolicy.runner as runner_module
 from uni_rl.ipc.async_runner import AsyncRunner
-from uni_rl.ipc.inference_slot import SharedInferenceSlot
+from uni_rl.ipc.inference_ring import SharedInferenceRing
 from uni_rl.logging.metric_schema import normalize_metric_map
 from uni_rl.offpolicy.coordination import LearnerPhase
 from uni_rl.offpolicy.double_buffer_runner import (
@@ -319,6 +319,9 @@ def _make_device_runner(
     env_name: str = "DummyEnv",
     algo_type: str = "sac",
     collector_tensor_native: bool = False,
+    inference_slot_capacity: int = 1,
+    inference_epoch: int = 0,
+    collector_metrics_interval: int = 1,
 ):
     monkeypatch.setattr(
         device_runner_module, "require_offpolicy_replay_device", lambda value: value
@@ -339,6 +342,9 @@ def _make_device_runner(
         device=device,
         sim_backend=sim_backend,
         collector_tensor_native=collector_tensor_native,
+        inference_slot_capacity=inference_slot_capacity,
+        inference_epoch=inference_epoch,
+        collector_metrics_interval=collector_metrics_interval,
     )
 
 
@@ -499,8 +505,19 @@ def test_runner_collector_resources_follow_tensor_runtime_capability(
     runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
 
     assert _FakeReplayBuffer.last_kwargs["ingress_device"] == expected_device
-    assert collector_kwargs["inference_slot"].device == torch.device(expected_device)
-    assert runner.runtime_manifest["collector_tensor_native"] is collector_tensor_native
+    assert collector_kwargs["inference_slot"].device.type == expected_device
+    manifest = runner.runtime_manifest
+    assert manifest["collector_tensor_native"] is collector_tensor_native
+    assert manifest["inference_ring_capacity"] == 1
+    assert manifest["inference_publication_ordering"] == "contiguous_ticks"
+    assert manifest["inference_publication_sync"] == (
+        "cuda_ipc_events" if collector_tensor_native else "cpu_synchronous"
+    )
+    assert manifest["inference_epoch"] == 0
+    assert manifest["inference_slot_bytes"] == 56
+    assert manifest["collector_metrics_interval"] == 1
+    assert collector_kwargs["inference_epoch"] == 0
+    assert collector_kwargs["collector_metrics_interval"] == 1
 
 
 def test_runner_rejects_tensor_native_collector_without_cuda(
@@ -512,6 +529,69 @@ def test_runner_rejects_tensor_native_collector_without_cuda(
             device="cpu",
             collector_tensor_native=True,
         )
+
+
+@pytest.mark.parametrize("field", ["inference_slot_capacity", "collector_metrics_interval"])
+@pytest.mark.parametrize("value", [0, -1, True, "2", 1.0])
+def test_runner_rejects_invalid_tensor_runtime_intervals(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value,
+) -> None:
+    with pytest.raises(ValueError, match=f"{field} must be a positive integer"):
+        _make_device_runner(monkeypatch, **{field: value})
+
+
+@pytest.mark.parametrize("value", [-1, True, "0"])
+def test_runner_rejects_invalid_inference_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+    value,
+) -> None:
+    expected = TypeError if isinstance(value, bool) or not isinstance(value, int) else ValueError
+    with pytest.raises(expected, match="inference_epoch must be"):
+        _make_device_runner(monkeypatch, inference_epoch=value)
+
+
+def test_runner_manifest_and_collector_forward_ring_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _FakePipeline.close_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    runner = _make_device_runner(
+        monkeypatch,
+        device="cpu",
+        inference_slot_capacity=3,
+        inference_epoch=2,
+        collector_metrics_interval=4,
+    )
+    collector_kwargs = {}
+
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+
+    def capture_collector(*, target_fn, kwargs):
+        del target_fn
+        collector_kwargs.update(kwargs)
+
+    monkeypatch.setattr(runner, "_start_collector", capture_collector)
+    runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    assert _FakeReplayBuffer.last_kwargs["ingress_device"] == "cpu"
+    assert collector_kwargs["inference_epoch"] == 2
+    assert collector_kwargs["collector_metrics_interval"] == 4
+    assert collector_kwargs["inference_slot"].diagnostics["capacity"] == 3
+    manifest = runner.runtime_manifest
+    assert manifest["inference_ring_capacity"] == 3
+    assert manifest["inference_publication_ordering"] == "contiguous_ticks"
+    assert manifest["inference_publication_sync"] == "cpu_synchronous"
+    assert manifest["inference_epoch"] == 2
+    assert manifest["inference_slot_bytes"] == 168
+    assert manifest["collector_metrics_interval"] == 4
 
 
 class _ReadyAfterPoll:
@@ -962,18 +1042,19 @@ def test_learner_inference_matches_existing_actor_exploration(algo_type: str) ->
     runner.obs_normalization = False
     runner.algo_type = algo_type
     runner.learner = SimpleNamespace(actor=actor)
-    slot = SharedInferenceSlot(2, 3, 2)
-    slot.publish_observation(tick_id=4, observations=observations, dones=dones)
+    runner.inference_epoch = 0
+    slot = SharedInferenceRing(2, 3, 2)
+    slot.publish_observation(tick_id=0, observations=observations, dones=dones, epoch=0)
     torch.manual_seed(17)
     runner._serve_learner_inference(
         slot,
-        tick_id=4,
+        tick_id=0,
         policy_version=9,
         obs_device=torch.empty(2, 3),
         dones_device=torch.empty(2),
         trace_recorder=None,
     )
-    actual, policy_version = slot.consume_action(tick_id=4)
+    actual, policy_version = slot.consume_action(tick_id=0, epoch=0)
 
     torch.testing.assert_close(torch.from_numpy(actual), expected)
     assert policy_version == 9
@@ -1023,17 +1104,18 @@ def test_adapter_learner_inference_uses_actor_context(
     runner.obs_normalization = False
     runner.algo_type = "dummy_priv_sac"
     runner.learner = SimpleNamespace(actor=actor)
-    slot = SharedInferenceSlot(2, 5, 2)
-    slot.publish_observation(tick_id=5, observations=actor_input, dones=dones)
+    runner.inference_epoch = 0
+    slot = SharedInferenceRing(2, 5, 2)
+    slot.publish_observation(tick_id=0, observations=actor_input, dones=dones, epoch=0)
     runner._serve_learner_inference(
         slot,
-        tick_id=5,
+        tick_id=0,
         policy_version=10,
         obs_device=torch.empty(2, 5),
         dones_device=torch.empty(2),
         trace_recorder=None,
     )
-    actual, policy_version = slot.consume_action(tick_id=5)
+    actual, policy_version = slot.consume_action(tick_id=0, epoch=0)
 
     torch.testing.assert_close(torch.from_numpy(actual), expected)
     assert policy_version == 10

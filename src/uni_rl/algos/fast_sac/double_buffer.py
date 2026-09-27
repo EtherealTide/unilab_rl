@@ -15,7 +15,11 @@ from uni_rl.offpolicy.double_buffer_runner import DoubleBufferOffPolicyRunner
 from uni_rl.offpolicy.runtime import resolve_actor_adapter_modules, resolve_custom_offpolicy_runtime
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
-from uni_rl.utils.tensor_runtime import resolve_collector_tensor_native
+from uni_rl.utils.tensor_runtime import (
+    resolve_collector_metrics_interval,
+    resolve_collector_tensor_native,
+    resolve_inference_slot_capacity,
+)
 
 if TYPE_CHECKING:
     from uni_rl.ipc.dp_sync import DpParameterSync
@@ -45,6 +49,8 @@ def build_sac_double_buffer_runner(
     collector_tensor_native = resolve_collector_tensor_native(
         cfg, device=device, algo_name="FastSAC"
     )
+    inference_slot_capacity = resolve_inference_slot_capacity(cfg, algo_name="FastSAC")
+    collector_metrics_interval = resolve_collector_metrics_interval(cfg, algo_name="FastSAC")
 
     if "inference_request_timeout_sec" in cfg.training:
         warnings.warn(
@@ -137,5 +143,7 @@ def build_sac_double_buffer_runner(
         backend_device_binder=backend_device_binder,
         actor_adapter_modules=actor_adapter_modules,
         collector_tensor_native=collector_tensor_native,
+        inference_slot_capacity=inference_slot_capacity,
+        collector_metrics_interval=collector_metrics_interval,
         log_interval=int(cfg.training.log_interval),
     )

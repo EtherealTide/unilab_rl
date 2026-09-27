@@ -20,7 +20,10 @@ if TYPE_CHECKING:
     from uni_rl.ipc.dp_sync import DpParameterSync
 
 from uni_rl.ipc.async_runner import _SPAWN_CTX
-from uni_rl.ipc.inference_slot import SharedInferenceSlot
+from uni_rl.ipc.inference_ring import (
+    SharedInferenceRing,
+    estimate_inference_ring_bytes,
+)
 from uni_rl.ipc.replay_buffer import DEFAULT_REPLAY_INGRESS_DEPTH, ReplayBuffer
 from uni_rl.ipc.replay_pipelines.gpu_resident import (
     GPUResidentReplayPipeline,
@@ -174,6 +177,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         target_frequency: int = 1,
         policy_before_critic: bool = False,
         collector_tensor_native: bool = False,
+        inference_slot_capacity: int = 1,
+        inference_epoch: int = 0,
+        collector_metrics_interval: int = 1,
         **kwargs,
     ):
         kwargs["device"] = require_offpolicy_replay_device(kwargs.get("device"))
@@ -223,6 +229,31 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 f"got {kwargs['device']!r}"
             )
         self.collector_tensor_native = collector_tensor_native
+        if (
+            isinstance(inference_slot_capacity, bool)
+            or not isinstance(inference_slot_capacity, int)
+            or inference_slot_capacity <= 0
+        ):
+            raise ValueError(
+                "inference_slot_capacity must be a positive integer, "
+                f"got {inference_slot_capacity!r}"
+            )
+        self.inference_slot_capacity = int(inference_slot_capacity)
+        if isinstance(inference_epoch, bool) or not isinstance(inference_epoch, int):
+            raise TypeError(f"inference_epoch must be an integer, got {inference_epoch!r}")
+        if inference_epoch < 0:
+            raise ValueError("inference_epoch must be non-negative")
+        self.inference_epoch = int(inference_epoch)
+        if (
+            isinstance(collector_metrics_interval, bool)
+            or not isinstance(collector_metrics_interval, int)
+            or collector_metrics_interval <= 0
+        ):
+            raise ValueError(
+                "collector_metrics_interval must be a positive integer, "
+                f"got {collector_metrics_interval!r}"
+            )
+        self.collector_metrics_interval = int(collector_metrics_interval)
         # Backend-owned process-device binder forwarded to the collector
         # subprocess (e.g. mjwarp); None for backends that need no binding.
         self.backend_device_binder = backend_device_binder
@@ -245,6 +276,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "collector_backend_device": self.collector_backend_device,
             "collector_torch_inference": False,
             "collector_tensor_native": self.collector_tensor_native,
+            "inference_ring_capacity": self.inference_slot_capacity,
+            "inference_publication_ordering": "contiguous_ticks",
+            "inference_epoch": self.inference_epoch,
             "learner_actor_reused": True,
             "logger_owner_rank": 0,
             "logger_cross_rank_aggregation": self.dp_sync is not None,
@@ -699,7 +733,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
     def _serve_learner_inference(
         self,
-        inference_slot: SharedInferenceSlot,
+        inference_slot: SharedInferenceRing,
         *,
         tick_id: int,
         policy_version: int,
@@ -714,6 +748,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             observations=obs_device,
             dones=dones_device,
             non_blocking=False,
+            epoch=self.inference_epoch,
         )
         h2d_end_ns = time.perf_counter_ns()
 
@@ -758,6 +793,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             policy_version=policy_version,
             actions=actions_device,
             non_blocking=False,
+            epoch=self.inference_epoch,
         )
         d2h_end_ns = time.perf_counter_ns()
         inference_forward_time = (forward_end_ns - forward_start_ns) / 1e9
@@ -960,6 +996,15 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             warn_if_over_budget,
         )
 
+        gpu_centric_collector = self.collector_tensor_native
+        actor_context_dim = int(getattr(self.learner, "priv_info_dim", 0))
+        inference_input_dim = self.obs_dim + actor_context_dim
+        inference_ring_bytes = estimate_inference_ring_bytes(
+            self.num_envs,
+            inference_input_dim,
+            self.action_dim,
+            capacity=self.inference_slot_capacity,
+        )
         mem_est = estimate_offpolicy_bytes(
             num_envs=self.num_envs,
             replay_buffer_n=self.replay_buffer_n,
@@ -967,13 +1012,13 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             action_dim=self.action_dim,
             critic_dim=self.critic_obs_dim,
             ingress_depth=DEFAULT_REPLAY_INGRESS_DEPTH,
+            inference_ring_bytes=0 if gpu_centric_collector else inference_ring_bytes,
         )
         warn_if_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
         raise_if_shared_memory_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
 
         # --- bounded collector ingress (the complete ring lives on device) ---
         buffer_capacity = self.replay_buffer_n * self.num_envs
-        gpu_centric_collector = self.collector_tensor_native
         replay_buffer = ReplayBuffer(
             capacity=buffer_capacity,
             obs_dim=self.obs_dim,
@@ -1020,13 +1065,22 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             }
         )
 
-        actor_context_dim = int(getattr(self.learner, "priv_info_dim", 0))
-        inference_input_dim = self.obs_dim + actor_context_dim
-        inference_slot = SharedInferenceSlot(
+        if gpu_centric_collector:
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(self.device)
+            if inference_ring_bytes > free_bytes * 0.8:
+                raise MemoryError(
+                    f"Off-policy ({self.algo_type}): CUDA inference ring needs "
+                    f"{inference_ring_bytes / 1024**2:.1f} MB but only "
+                    f"{free_bytes / 1024**2:.1f} MB is free. Reduce "
+                    "training.inference_slot_capacity."
+                )
+        inference_slot = SharedInferenceRing(
             self.num_envs,
             inference_input_dim,
             self.action_dim,
             device=self.device if gpu_centric_collector else "cpu",
+            capacity=self.inference_slot_capacity,
+            epoch=self.inference_epoch,
         )
         self._shared_resources.append(inference_slot)
         inference_obs_device = torch.empty(
@@ -1039,7 +1093,15 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             dtype=torch.float32,
             device=self.device,
         )
-        self.runtime_manifest["inference_slot_bytes"] = inference_slot.nbytes
+        self.runtime_manifest.update(
+            {
+                "inference_slot_bytes": inference_slot.nbytes,
+                "inference_publication_sync": (
+                    "cuda_ipc_events" if inference_slot.device.type == "cuda" else "cpu_synchronous"
+                ),
+                "collector_metrics_interval": self.collector_metrics_interval,
+            }
+        )
 
         # --- logger ---
         logger = OffPolicyLogger(
@@ -1118,6 +1180,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "backend_device": self.collector_backend_device,
                 "env_cfg_override": self._collector_env_cfg_override(),
                 "inference_slot": inference_slot,
+                "inference_epoch": self.inference_epoch,
+                "collector_metrics_interval": self.collector_metrics_interval,
                 "seed": derive_worker_seed(self.seed, worker_index=0),
                 "trace_enabled": self.trace_enabled,
                 "trace_thread_time": self.trace_thread_time,

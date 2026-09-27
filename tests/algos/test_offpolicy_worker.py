@@ -10,12 +10,11 @@ import torch
 
 import uni_rl.offpolicy.worker as worker_module
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
+from uni_rl.offpolicy.tensor_metrics import TensorCollectorMetrics
 from uni_rl.offpolicy.worker import (
     _collector_action_numpy,
-    _finished_episode_values_to_cpu,
     _publish_collector_ready,
     _publish_inference_tick,
-    _tensor_count_pair_to_cpu,
     _wait_for_inference_tick,
     resolve_offpolicy_actor_priv_info,
     sample_offpolicy_actions,
@@ -40,9 +39,10 @@ def test_cpu_collector_action_conversion_preserves_legacy_contract(
     np.testing.assert_array_equal(converted, values)
 
 
-def test_tensor_count_pair_uses_one_host_transfer(
+def test_tensor_collector_metrics_resets_done_episodes_and_flushes_one_transfer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    metrics = TensorCollectorMetrics(num_envs=3, interval=4, device="cpu")
     calls = 0
     original_cpu = torch.Tensor.cpu
 
@@ -53,35 +53,166 @@ def test_tensor_count_pair_uses_one_host_transfer(
 
     monkeypatch.setattr(torch.Tensor, "cpu", counting_cpu)
 
-    assert _tensor_count_pair_to_cpu(
-        torch.tensor(3, dtype=torch.int64),
-        torch.tensor(2, dtype=torch.int64),
-    ) == (3, 2)
-    assert calls == 1
-
-
-def test_finished_episode_values_use_one_host_transfer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls = 0
-    original_cpu = torch.Tensor.cpu
-
-    def counting_cpu(tensor: torch.Tensor) -> torch.Tensor:
-        nonlocal calls
-        calls += 1
-        return original_cpu(tensor)
-
-    monkeypatch.setattr(torch.Tensor, "cpu", counting_cpu)
-
-    rewards, lengths = _finished_episode_values_to_cpu(
-        rewards=torch.tensor([1.0, -2.5, 7.0], dtype=torch.float32),
-        lengths=torch.tensor([10, 20, 30], dtype=torch.int32),
-        rows=torch.tensor([2, 0]),
+    metrics.update(
+        rewards=torch.tensor([1.0, 2.0, 3.0]),
+        done=torch.tensor([False, True, False]),
+        timeout=torch.tensor([False, False, False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([4.0, 5.0, 6.0]),
+        done=torch.tensor([True, False, True]),
+        timeout=torch.tensor([False, False, False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([7.0, 8.0, 9.0]),
+        done=torch.tensor([False, False, False]),
+        timeout=torch.tensor([False, False, False]),
+    )
+    assert calls == 0
+    metrics.update(
+        rewards=torch.tensor([10.0, 11.0, 12.0]),
+        done=torch.tensor([True, True, True]),
+        timeout=torch.tensor([True, False, True]),
     )
 
-    assert rewards == [7.0, 1.0]
-    assert lengths == [30, 10]
+    flushed = metrics.flush()
+
+    assert flushed.rewards == [2.0, 5.0, 9.0, 17.0, 24.0, 21.0]
+    assert flushed.lengths == [1, 2, 2, 2, 3, 2]
+    assert flushed.done_count == 6
+    assert flushed.timeout_count == 2
     assert calls == 1
+    assert metrics.ready is False
+    assert torch.count_nonzero(metrics.current_rewards) == 0
+    assert torch.count_nonzero(metrics.current_lengths) == 0
+
+
+def test_tensor_collector_metrics_supports_no_done_window() -> None:
+    metrics = TensorCollectorMetrics(num_envs=2, interval=2, device="cpu")
+    metrics.update(
+        rewards=torch.tensor([1.0, 2.0]),
+        done=torch.tensor([False, False]),
+        timeout=torch.tensor([False, False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([3.0, 4.0]),
+        done=torch.tensor([False, False]),
+        timeout=torch.tensor([False, False]),
+    )
+
+    flushed = metrics.flush()
+
+    assert flushed.rewards == []
+    assert flushed.lengths == []
+    assert flushed.done_count == 0
+    assert flushed.timeout_count == 0
+    assert metrics.current_rewards.tolist() == [4.0, 6.0]
+    assert metrics.current_lengths.tolist() == [2, 2]
+
+
+def test_tensor_collector_metrics_preserves_new_episode_after_done() -> None:
+    metrics = TensorCollectorMetrics(num_envs=1, interval=3, device="cpu")
+    metrics.update(
+        rewards=torch.tensor([1.0]),
+        done=torch.tensor([True]),
+        timeout=torch.tensor([False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([2.0]),
+        done=torch.tensor([False]),
+        timeout=torch.tensor([False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([3.0]),
+        done=torch.tensor([False]),
+        timeout=torch.tensor([False]),
+    )
+
+    first_flush = metrics.flush()
+
+    assert first_flush.rewards == [1.0]
+    assert first_flush.lengths == [1]
+    assert metrics.current_rewards.tolist() == [5.0]
+    assert metrics.current_lengths.tolist() == [2]
+
+    metrics.update(
+        rewards=torch.tensor([4.0]),
+        done=torch.tensor([True]),
+        timeout=torch.tensor([True]),
+    )
+    metrics.update(
+        rewards=torch.tensor([0.0]),
+        done=torch.tensor([False]),
+        timeout=torch.tensor([False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([0.0]),
+        done=torch.tensor([False]),
+        timeout=torch.tensor([False]),
+    )
+    second_flush = metrics.flush()
+
+    assert second_flush.rewards == [9.0]
+    assert second_flush.lengths == [3]
+
+
+def test_tensor_collector_metrics_enforces_window_and_input_contract() -> None:
+    metrics = TensorCollectorMetrics(num_envs=2, interval=1, device="cpu")
+
+    with pytest.raises(RuntimeError, match="window is not ready"):
+        metrics.flush()
+    with pytest.raises(ValueError, match="positive environment count"):
+        TensorCollectorMetrics(num_envs=0, interval=1, device="cpu")
+    with pytest.raises(ValueError, match="positive interval"):
+        TensorCollectorMetrics(num_envs=1, interval=True, device="cpu")
+    with pytest.raises(TypeError, match="rewards must be Torch tensors"):
+        metrics.update(
+            rewards=np.asarray([1.0, 2.0]),
+            done=torch.tensor([False, False]),
+            timeout=torch.tensor([False, False]),
+        )
+    with pytest.raises(TypeError, match="rewards must have a floating dtype"):
+        metrics.update(
+            rewards=torch.tensor([1, 2]),
+            done=torch.tensor([False, False]),
+            timeout=torch.tensor([False, False]),
+        )
+    with pytest.raises(TypeError, match="done and timeout values must be Torch tensors"):
+        metrics.update(
+            rewards=torch.tensor([1.0, 2.0]),
+            done=np.asarray([False, False]),
+            timeout=torch.tensor([False, False]),
+        )
+    with pytest.raises(ValueError, match="environment shape"):
+        metrics.update(
+            rewards=torch.tensor([1.0]),
+            done=torch.tensor([False, False]),
+            timeout=torch.tensor([False, False]),
+        )
+    with pytest.raises(ValueError, match="timeout values must have environment shape"):
+        metrics.update(
+            rewards=torch.tensor([1.0, 2.0]),
+            done=torch.tensor([False, False]),
+            timeout=torch.tensor([False]),
+        )
+    with pytest.raises(TypeError, match="boolean tensors"):
+        metrics.update(
+            rewards=torch.tensor([1.0, 2.0]),
+            done=torch.tensor([0, 0]),
+            timeout=torch.tensor([False, False]),
+        )
+
+    metrics.update(
+        rewards=torch.tensor([1.0, 2.0]),
+        done=torch.tensor([False, False]),
+        timeout=torch.tensor([False, False]),
+    )
+    with pytest.raises(RuntimeError, match="window was not flushed"):
+        metrics.update(
+            rewards=torch.tensor([3.0, 4.0]),
+            done=torch.tensor([False, False]),
+            timeout=torch.tensor([False, False]),
+        )
 
 
 def test_collector_publishes_ready_after_initialization(
