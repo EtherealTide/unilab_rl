@@ -569,6 +569,7 @@ def _run_collector(
         return
 
     inference_tick = 0
+    replay_add = replay_buffer.add_batch
     # Collection loop
     try:
         while not stop_event.is_set():
@@ -787,7 +788,7 @@ def _run_collector(
                 assert combined_dones_t is not None
                 assert truncated_t is not None
                 assert done_mask_t is not None
-                replay_buffer.add(
+                published = replay_add(
                     obs_t,
                     actions.to(dtype=torch.float32),
                     rewards_t,
@@ -800,6 +801,8 @@ def _run_collector(
                     next_critic=next_critic_t,
                     terminal_next_critic=terminal_critic_t,
                 )
+                if not published and not stop_event.is_set():
+                    raise RuntimeError("replay ingress closed before collector shutdown")
             else:
                 assert obs_np is not None
                 assert critic_np is not None
@@ -810,7 +813,7 @@ def _run_collector(
                 assert combined_dones is not None
                 assert truncated_np is not None
                 assert terminal_contract is not None
-                replay_buffer.add(
+                published = replay_add(
                     torch.from_numpy(obs_np),
                     torch.from_numpy(actions_np),
                     torch.from_numpy(rewards_np),
@@ -831,6 +834,8 @@ def _run_collector(
                         else None
                     ),
                 )
+                if not published and not stop_event.is_set():
+                    raise RuntimeError("replay ingress closed before collector shutdown")
             if trace_recorder:
                 trace_recorder.add_slice(
                     "collector/replay_add",

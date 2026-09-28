@@ -19,8 +19,7 @@ from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
 from uni_rl.utils.seed import apply_training_seed
 from uni_rl.utils.tensor_runtime import (
-    resolve_collector_metrics_interval,
-    resolve_inference_slot_capacity,
+    resolve_tensor_runtime_settings,
 )
 
 if TYPE_CHECKING:
@@ -58,10 +57,10 @@ def build_warpsac_double_buffer_runner(
     if replay_prefetch_mode != "one_tick":
         raise ValueError("WarpSAC device replay requires replay_prefetch_mode='one_tick'")
     _validate_warpsac_runtime(cfg)
-    inference_slot_capacity = resolve_inference_slot_capacity(cfg, algo_name="WarpSAC")
-    collector_metrics_interval = resolve_collector_metrics_interval(
+    tensor_runtime_settings = resolve_tensor_runtime_settings(
         cfg,
         algo_name="WarpSAC",
+        num_envs=cfg.algo.num_envs,
     )
 
     if "inference_request_timeout_sec" in cfg.training:
@@ -126,9 +125,9 @@ def build_warpsac_double_buffer_runner(
         env_factory=env_factory,
         num_envs=cfg.algo.num_envs,
         replay_buffer_n=cfg.algo.replay_buffer_n,
-        batch_size=cfg.algo.batch_size,
+        batch_size=tensor_runtime_settings.batch_size,
         learning_starts=cfg.algo.learning_starts,
-        updates_per_step=cfg.algo.updates_per_step,
+        updates_per_step=tensor_runtime_settings.updates_per_step,
         policy_frequency=cfg.algo.policy_frequency,
         target_frequency=int(_param(cfg.algo, "target_frequency", 1)),
         policy_before_critic=True,
@@ -148,8 +147,7 @@ def build_warpsac_double_buffer_runner(
         collector_cpu_ids=collector_cpu_ids,
         dp_sync=dp_sync,
         backend_device_binder=backend_device_binder,
-        inference_slot_capacity=inference_slot_capacity,
-        collector_metrics_interval=collector_metrics_interval,
+        tensor_runtime_settings=tensor_runtime_settings,
         log_interval=int(cfg.training.log_interval),
         replay_pipeline_factory=partial(
             WarpSACReplayPipeline,

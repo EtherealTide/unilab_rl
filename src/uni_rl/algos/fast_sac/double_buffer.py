@@ -16,9 +16,8 @@ from uni_rl.offpolicy.runtime import resolve_actor_adapter_modules, resolve_cust
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
 from uni_rl.utils.tensor_runtime import (
-    resolve_collector_metrics_interval,
     resolve_collector_tensor_native,
-    resolve_inference_slot_capacity,
+    resolve_tensor_runtime_settings,
 )
 
 if TYPE_CHECKING:
@@ -49,8 +48,11 @@ def build_sac_double_buffer_runner(
     collector_tensor_native = resolve_collector_tensor_native(
         cfg, device=device, algo_name="FastSAC"
     )
-    inference_slot_capacity = resolve_inference_slot_capacity(cfg, algo_name="FastSAC")
-    collector_metrics_interval = resolve_collector_metrics_interval(cfg, algo_name="FastSAC")
+    tensor_runtime_settings = resolve_tensor_runtime_settings(
+        cfg,
+        algo_name="FastSAC",
+        num_envs=cfg.algo.num_envs,
+    )
 
     if "inference_request_timeout_sec" in cfg.training:
         warnings.warn(
@@ -67,8 +69,6 @@ def build_sac_double_buffer_runner(
         action_dim = int(action_shape[0])
     finally:
         env.close()
-
-    batch_size = cfg.algo.batch_size
 
     learner_cls: type[Any] = FastSACLearner
     algo_type = "sac"
@@ -118,9 +118,9 @@ def build_sac_double_buffer_runner(
         env_factory=env_factory,
         num_envs=cfg.algo.num_envs,
         replay_buffer_n=cfg.algo.replay_buffer_n,
-        batch_size=batch_size,
+        batch_size=tensor_runtime_settings.batch_size,
         learning_starts=cfg.algo.learning_starts,
-        updates_per_step=cfg.algo.updates_per_step,
+        updates_per_step=tensor_runtime_settings.updates_per_step,
         policy_frequency=cfg.algo.policy_frequency,
         env_steps_per_sync=cfg.training.env_steps_per_sync,
         device=device,
@@ -143,7 +143,6 @@ def build_sac_double_buffer_runner(
         backend_device_binder=backend_device_binder,
         actor_adapter_modules=actor_adapter_modules,
         collector_tensor_native=collector_tensor_native,
-        inference_slot_capacity=inference_slot_capacity,
-        collector_metrics_interval=collector_metrics_interval,
+        tensor_runtime_settings=tensor_runtime_settings,
         log_interval=int(cfg.training.log_interval),
     )

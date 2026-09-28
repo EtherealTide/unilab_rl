@@ -33,6 +33,7 @@ from uni_rl.offpolicy.runner import (
     replay_buffer_ready_for_learning,
     update_reward_stats_from_replay,
 )
+from uni_rl.utils.tensor_runtime import TensorRuntimeSettings
 
 
 @pytest.mark.parametrize(
@@ -413,6 +414,10 @@ def _make_device_runner(
     inference_slot_capacity: int = 1,
     inference_epoch: int = 0,
     collector_metrics_interval: int = 1,
+    tensor_runtime_settings: TensorRuntimeSettings | None = None,
+    num_envs: int = 2,
+    batch_size: int = 4,
+    updates_per_step: int = 2,
 ):
     monkeypatch.setattr(
         device_runner_module, "require_offpolicy_replay_device", lambda value: value
@@ -423,11 +428,11 @@ def _make_device_runner(
         env_name=env_name,
         algo_type=algo_type,
         env_factory=_unused_env_factory,
-        num_envs=2,
+        num_envs=num_envs,
         replay_buffer_n=8,
-        batch_size=4,
+        batch_size=batch_size,
         learning_starts=0,
-        updates_per_step=2,
+        updates_per_step=updates_per_step,
         policy_frequency=1,
         env_steps_per_sync=1,
         device=device,
@@ -436,6 +441,7 @@ def _make_device_runner(
         inference_slot_capacity=inference_slot_capacity,
         inference_epoch=inference_epoch,
         collector_metrics_interval=collector_metrics_interval,
+        tensor_runtime_settings=tensor_runtime_settings,
     )
 
 
@@ -1091,7 +1097,6 @@ def test_runner_constructs_only_bounded_device_replay(
     assert _FakePipeline.close_calls == 1
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_cuda_inference_budget_fails_before_resource_allocation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -1114,10 +1119,12 @@ def test_cuda_inference_budget_fails_before_resource_allocation(
         runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
 
     message = str(excinfo.value)
-    assert "conservative CUDA inference IPC budget" in message
+    assert "conservative CUDA tensor runtime (inference + replay) budget" in message
     assert "80% limit" in message
     assert "device free" in message
     assert "training.inference_slot_capacity" in message
+    assert "training.replay_ingress_depth" in message
+    assert "algo.updates_per_step" in message
     assert not runner._shared_resources
 
 
@@ -1141,7 +1148,19 @@ def test_runner_collector_resources_follow_tensor_runtime_capability(
     monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
     monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
     monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
 
+    settings = TensorRuntimeSettings(
+        inference_slot_capacity=1,
+        collector_metrics_interval=1,
+        replay_ingress_depth=3,
+        replay_ingress_slot_rows=1,
+        batch_size=4,
+        updates_per_step=2,
+        num_envs=2,
+    )
     runner = _make_device_runner(
         monkeypatch,
         env_name="G1MotionTrackingSAC",
@@ -1149,6 +1168,7 @@ def test_runner_collector_resources_follow_tensor_runtime_capability(
         device="cuda",
         sim_backend="mjwarp",
         collector_tensor_native=collector_tensor_native,
+        tensor_runtime_settings=settings,
     )
     collector_kwargs = {}
 
@@ -1162,6 +1182,8 @@ def test_runner_collector_resources_follow_tensor_runtime_capability(
     runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
 
     assert _FakeReplayBuffer.last_kwargs["ingress_device"] == expected_device
+    assert _FakeReplayBuffer.last_kwargs["ingress_slot_rows"] == 1
+    assert _FakeReplayBuffer.last_kwargs["ingress_depth"] == 3
     assert collector_kwargs["inference_slot"].device.type == expected_device
     manifest = runner.runtime_manifest
     assert manifest["collector_tensor_native"] is collector_tensor_native
@@ -1176,7 +1198,15 @@ def test_runner_collector_resources_follow_tensor_runtime_capability(
     assert budget["ipc_event_count"] == (1 if collector_tensor_native else 0) * 3
     assert budget["timing_event_count"] == 2
     assert budget["cuda_event_count"] == budget["ipc_event_count"] + 2
+    tensor_budget = manifest["tensor_memory_budget"]
+    assert tensor_budget["total"] > 0
+    assert tensor_budget["available_bytes"] == 1 << 30
+    assert tensor_budget["threshold"] == 0.8
+    assert tensor_budget["allowed_bytes"] == int((1 << 30) * 0.8)
+    assert tensor_budget["replay_ingress_depth"] == 3
+    assert tensor_budget["replay_ingress_slot_rows"] == 1
     assert manifest["collector_metrics_interval"] == 1
+    assert manifest["runtime_limits"]["replay_ingress_slot_rows"]["effective"] == 1
     assert collector_kwargs["inference_epoch"] == 0
     assert collector_kwargs["collector_metrics_interval"] == 1
 
@@ -1199,8 +1229,77 @@ def test_runner_rejects_invalid_tensor_runtime_intervals(
     field: str,
     value,
 ) -> None:
-    with pytest.raises(ValueError, match=f"{field} must be a positive integer"):
+    expected = TypeError if type(value) is not int else ValueError
+    with pytest.raises(expected, match=f"{field} must be a positive integer"):
         _make_device_runner(monkeypatch, **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("inference_slot_capacity", 17),
+        ("collector_metrics_interval", 10_001),
+    ],
+)
+def test_runner_rejects_tensor_runtime_intervals_above_maxima(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: int,
+) -> None:
+    with pytest.raises(ValueError, match="no greater than"):
+        _make_device_runner(monkeypatch, **{field: value})
+
+
+def test_runner_rejects_conflicting_tensor_runtime_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = TensorRuntimeSettings(
+        inference_slot_capacity=2,
+        collector_metrics_interval=3,
+        replay_ingress_depth=2,
+        replay_ingress_slot_rows=2,
+        batch_size=4,
+        updates_per_step=2,
+        num_envs=2,
+    )
+    with pytest.raises(ValueError, match="conflict with tensor_runtime_settings"):
+        _make_device_runner(
+            monkeypatch,
+            device="cpu",
+            inference_slot_capacity=1,
+            tensor_runtime_settings=settings,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("num_envs", True),
+        ("batch_size", 4.0),
+        ("updates_per_step", "2"),
+    ],
+)
+def test_runner_rejects_non_integer_settings_overlaps(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    settings = TensorRuntimeSettings(
+        inference_slot_capacity=1,
+        collector_metrics_interval=1,
+        replay_ingress_depth=2,
+        replay_ingress_slot_rows=2,
+        batch_size=4,
+        updates_per_step=2,
+        num_envs=2,
+    )
+    with pytest.raises(TypeError, match=f"{field} must be a positive integer"):
+        _make_device_runner(
+            monkeypatch,
+            device="cpu",
+            tensor_runtime_settings=settings,
+            **{field: value},
+        )
 
 
 @pytest.mark.parametrize("value", [-1, True, "0"])

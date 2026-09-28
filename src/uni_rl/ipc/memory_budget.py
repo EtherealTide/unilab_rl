@@ -20,6 +20,8 @@ CUDA_INFERENCE_EVENT_RESERVE_BYTES = 64 * 1024
 CUDA_INFERENCE_OVERHEAD_FRACTION = 0.10
 CUDA_INFERENCE_MIN_OVERHEAD_BYTES = 32 * 1024 * 1024
 CUDA_INFERENCE_TIMING_EVENT_COUNT = 2
+CUDA_TENSOR_RUNTIME_OVERHEAD_FRACTION = 0.10
+CUDA_TENSOR_RUNTIME_MIN_OVERHEAD_BYTES = 32 * 1024 * 1024
 
 
 def estimate_cuda_inference_ipc_bytes(
@@ -120,6 +122,7 @@ def raise_if_cuda_memory_over_budget(
     available_bytes: int,
     threshold: float = 0.8,
     user_knob: str = "training.inference_slot_capacity",
+    budget_kind: str = "CUDA inference IPC",
 ) -> None:
     """Fail closed before CUDA inference IPC resources are materialized."""
     if isinstance(available_bytes, bool) or not isinstance(available_bytes, int):
@@ -137,7 +140,7 @@ def raise_if_cuda_memory_over_budget(
         return
     ratio = total / max(available_bytes, 1)
     raise MemoryError(
-        f"{label}: conservative CUDA inference IPC budget "
+        f"{label}: conservative {budget_kind} budget "
         f"{total / 1024**2:.1f} MB exceeds the {float(threshold):.0%} limit "
         f"of {allowed / 1024**2:.1f} MB (device free {available_bytes / 1024**2:.1f} MB, "
         f"{ratio:.0%} requested). Reduce {user_knob}, algo.num_envs, or model/input "
@@ -152,15 +155,43 @@ def estimate_offpolicy_bytes(
     action_dim: int,
     critic_dim: int,
     ingress_depth: int = 2,
+    ingress_slot_rows: int | None = None,
     inference_ring_bytes: int = 0,
     ingress_on_device: bool = False,
 ) -> dict[str, int | str]:
     """Estimate host shared memory for bounded off-policy replay ingress."""
     if not isinstance(ingress_on_device, bool):
         raise TypeError("ingress_on_device must be boolean")
+    integer_values = (num_envs, replay_buffer_n, obs_dim, action_dim, critic_dim, ingress_depth)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in integer_values):
+        raise TypeError("off-policy host memory dimensions must be integers")
+    if min(integer_values) <= 0:
+        raise ValueError("off-policy host memory dimensions must be positive")
+    if ingress_slot_rows is None:
+        effective_ingress_slot_rows = num_envs
+    elif (
+        isinstance(ingress_slot_rows, bool)
+        or not isinstance(ingress_slot_rows, int)
+        or ingress_slot_rows <= 0
+        or ingress_slot_rows > num_envs
+    ):
+        raise ValueError(
+            "ingress_slot_rows must be a positive integer no greater than num_envs, "
+            f"got {ingress_slot_rows!r} (num_envs={num_envs})"
+        )
+    else:
+        effective_ingress_slot_rows = ingress_slot_rows
+    if (
+        isinstance(inference_ring_bytes, bool)
+        or not isinstance(inference_ring_bytes, int)
+        or inference_ring_bytes < 0
+    ):
+        raise ValueError("inference_ring_bytes must be a non-negative integer")
     row_width = 2 * obs_dim + action_dim + 3 + 2 * critic_dim
     capacity = replay_buffer_n * num_envs
-    ingress_bytes = 0 if ingress_on_device else int(ingress_depth) * num_envs * row_width * 4
+    ingress_bytes = (
+        0 if ingress_on_device else ingress_depth * effective_ingress_slot_rows * row_width * 4
+    )
     inference_ring_line = (
         f"  Inference ring: {inference_ring_bytes / 1024**2:.0f} MB\n"
         if inference_ring_bytes
@@ -169,6 +200,8 @@ def estimate_offpolicy_bytes(
     return {
         "replay_buffer": 0,
         "bounded_ingress_slots": ingress_bytes,
+        "ingress_slot_rows": effective_ingress_slot_rows,
+        "row_width": row_width,
         "inference_ring": int(inference_ring_bytes),
         "total": ingress_bytes + int(inference_ring_bytes),
         "breakdown": (
@@ -180,12 +213,110 @@ def estimate_offpolicy_bytes(
                 if ingress_on_device
                 else (
                     f"{ingress_bytes / 1024**2:.0f} MB "
-                    f"({int(ingress_depth)} slots × {num_envs} rows × {row_width} cols × 4B)\n"
+                    f"({int(ingress_depth)} slots × {effective_ingress_slot_rows} rows × "
+                    f"{row_width} cols × 4B)\n"
                 )
             )
             + inference_ring_line
             + "  Excludes MuJoCo BatchEnvPool/native allocations, CUDA pinned/shared "
             "registration, and driver memory."
+        ),
+    }
+
+
+def estimate_cuda_tensor_runtime_bytes(
+    *,
+    num_envs: int,
+    replay_buffer_n: int,
+    obs_dim: int,
+    action_dim: int,
+    critic_dim: int,
+    inference_obs_dim: int,
+    sample_count: int,
+    inference_slot_capacity: int,
+    replay_ingress_depth: int,
+    replay_ingress_slot_rows: int,
+    collector_tensor_native: bool,
+    persistent_exploration_scratch: int = 0,
+) -> dict[str, int | str]:
+    """Conservatively pre-flight all startup CUDA tensor-runtime allocations.
+
+    The replay pipeline retains a second allocation guard after construction. This
+    estimate deliberately runs before ingress, ring, replay storage, and batch
+    tensors exist so an impossible combination cannot strand CUDA IPC resources.
+    """
+    replay_values = (
+        num_envs,
+        replay_buffer_n,
+        obs_dim,
+        action_dim,
+        critic_dim,
+        sample_count,
+        replay_ingress_depth,
+        replay_ingress_slot_rows,
+    )
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in replay_values):
+        raise TypeError("CUDA tensor-runtime dimensions must be integers")
+    if min(replay_values) <= 0:
+        raise ValueError("CUDA tensor-runtime dimensions must be positive")
+    if replay_ingress_slot_rows > num_envs:
+        raise ValueError(
+            "replay_ingress_slot_rows must be no greater than num_envs "
+            f"({replay_ingress_slot_rows} > {num_envs})"
+        )
+    if not isinstance(collector_tensor_native, bool):
+        raise TypeError("collector_tensor_native must be boolean")
+
+    inference = estimate_cuda_inference_ipc_bytes(
+        num_envs,
+        inference_obs_dim,
+        action_dim,
+        capacity=inference_slot_capacity,
+        ring_on_device=collector_tensor_native,
+        persistent_exploration_scratch=persistent_exploration_scratch,
+    )
+    row_width = 2 * obs_dim + action_dim + 3 + 2 * critic_dim
+    replay_capacity = replay_buffer_n * num_envs
+    replay_storage = replay_capacity * row_width * 4
+    learner_batch_slots = 2 * sample_count * row_width * 4
+    replay_ingress = (
+        replay_ingress_depth * replay_ingress_slot_rows * row_width * 4
+        if collector_tensor_native
+        else 0
+    )
+    replay_exact = replay_storage + learner_batch_slots + replay_ingress
+    replay_overhead = max(
+        int(replay_exact * CUDA_TENSOR_RUNTIME_OVERHEAD_FRACTION),
+        CUDA_TENSOR_RUNTIME_MIN_OVERHEAD_BYTES,
+    )
+    total = int(inference["total"]) + replay_exact + replay_overhead
+    lines = (
+        "CUDA tensor-runtime budget (conservative pre-flight):\n"
+        f"  Replay storage: {replay_storage / 1024**2:.1f} MB "
+        f"({replay_capacity} rows × {row_width} cols × 4B)\n"
+        f"  Learner double-buffer batches: {learner_batch_slots / 1024**2:.1f} MB "
+        f"(2 slots × {sample_count} rows × {row_width} cols × 4B)\n"
+        f"  CUDA replay ingress: {replay_ingress / 1024**2:.1f} MB "
+        f"({replay_ingress_depth} × {replay_ingress_slot_rows} rows; "
+        f"collector_tensor_native={collector_tensor_native})\n"
+        f"  Inference/IPC subtotal: {int(inference['total']) / 1024**2:.1f} MB\n"
+        f"  Conservative replay workspace/allocator slack: "
+        f"{replay_overhead / 1024**2:.1f} MB\n"
+    )
+    return {
+        "replay_storage": replay_storage,
+        "learner_batch_slots": learner_batch_slots,
+        "replay_ingress": replay_ingress,
+        "replay_ingress_depth": replay_ingress_depth,
+        "replay_ingress_slot_rows": replay_ingress_slot_rows,
+        "replay_row_width": row_width,
+        "inference_total": int(inference["total"]),
+        "conservative_replay_overhead": replay_overhead,
+        "total": total,
+        "breakdown": (
+            lines
+            + str(inference["breakdown"])
+            + "\nThe estimate intentionally runs before any tensor-runtime allocation."
         ),
     }
 

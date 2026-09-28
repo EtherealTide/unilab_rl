@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Reviewed tensor-runtime defaults and deterministic bounds for inference-ring
+  capacity, collector metric intervals, replay ingress depth, replay ingress
+  slot rows, and learner sampling. FastSAC, FlashSAC, and WarpSAC resolve one
+  validated settings object before environment probing, and runtime manifests
+  record configured, default, effective, and maximum values.
+- Configurable bounded replay-ingress slots that may contain fewer rows than a
+  collector vector. The collector publishes vectors in bounded chunks with
+  contiguous commit order, per-chunk terminal observation patching, backpressure,
+  and explicit partial-prefix semantics during shutdown.
+- Conservative combined CUDA pre-flight accounting for inference IPC, replay
+  storage, learner double-buffer batches, replay ingress, and allocator
+  workspace reserve. Impossible combinations fail before collector or replay
+  resource allocation.
 - Bounded inference scheduling diagnostics for tensor-native collectors, including
   queue depth, action backlog, in-flight depth, publication lag, wait time, and
   the legal sequential dependency graph in runtime manifests.

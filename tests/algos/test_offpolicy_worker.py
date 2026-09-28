@@ -370,6 +370,10 @@ def test_collector_publishes_ready_after_initialization(
         def attach_stop_event(self, stop) -> None:
             del stop
 
+        def add_batch(self, *args, **kwargs) -> bool:
+            del args, kwargs
+            return True
+
     def publish_ready(coordination_queue, event) -> bool:
         assert not metrics_queue.empty()
         events.append("ready")
@@ -407,6 +411,48 @@ def test_collector_publishes_ready_after_initialization(
     assert events == ["env_init", "ready"]
     assert metrics_queue.get_nowait()["runtime_manifest"]["inference_owner"] == "learner"
     assert inference_request_queue.get_nowait() == worker_module.COLLECTOR_READY_TICK
+
+
+def test_collector_requires_batched_replay_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = threading.Event()
+
+    class _Env:
+        state = None
+
+        def init_state(self) -> None:
+            self.state = SimpleNamespace(obs={"obs": torch.zeros((1, 2))}, info={})
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *args, **kwargs: None)
+
+    with pytest.raises(AttributeError, match="add_batch"):
+        worker_module._run_collector(
+            stop_event=stop_event,
+            env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+            num_envs=1,
+            replay_buffer=_ReplayBuffer(),
+            inference_slot=None,
+            inference_request_queue=queue.Queue(),
+            inference_response_queue=queue.Queue(),
+            algo_type="sac",
+            actor_adapter_modules=None,
+            metrics_queue=queue.Queue(),
+            sim_backend="mujoco",
+            backend_device=None,
+            env_cfg_override=None,
+            seed=None,
+            trace_enabled=False,
+            trace_thread_time=False,
+        )
 
 
 def test_collector_binds_backend_device_before_env_materialization(
@@ -466,6 +512,7 @@ def test_tensor_collector_reports_bounded_inference_scheduling_diagnostics(
     inference_response_queue: queue.Queue[int] = queue.Queue()
     metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=4)
     events: list[str] = []
+    replay_calls: list[tuple[tuple[torch.Tensor, ...], dict[str, object]]] = []
 
     initial_obs = {"obs": torch.zeros((2, 2), dtype=torch.float32)}
     next_obs = {"obs": torch.ones((2, 2), dtype=torch.float32)}
@@ -509,6 +556,12 @@ def test_tensor_collector_reports_bounded_inference_scheduling_diagnostics(
         def add(self, *args, **kwargs) -> None:
             del args, kwargs
             events.append("replay_add")
+
+        def add_batch(self, *args, **kwargs) -> bool:
+            replay_calls.append((args, kwargs))
+            del args, kwargs
+            events.append("replay_add_batch")
+            return True
 
         def release_ipc(self) -> None:
             events.append("replay_release")
@@ -591,7 +644,29 @@ def test_tensor_collector_reports_bounded_inference_scheduling_diagnostics(
     assert report["max_publication_lag"] == 1
     manifest_flight = report_message["runtime_manifest"]["inference_flight"]
     assert manifest_flight == report
-    assert events == ["step", "replay_add", "close", "replay_release"]
+    assert events == ["step", "replay_add_batch", "close", "replay_release"]
+    assert len(replay_calls) == 1
+    replay_args, replay_kwargs = replay_calls[0]
+    assert len(replay_args) == 6
+    assert tuple(tensor.shape[0] for tensor in replay_args) == (2, 2, 2, 2, 2, 2)
+    assert replay_args[1].dtype == torch.float32
+    for key in (
+        "terminal_mask",
+        "terminal_next_obs",
+        "critic",
+        "next_critic",
+        "terminal_next_critic",
+    ):
+        assert key in replay_kwargs
+    terminal_mask = replay_kwargs["terminal_mask"]
+    critic = replay_kwargs["critic"]
+    next_critic = replay_kwargs["next_critic"]
+    assert isinstance(terminal_mask, torch.Tensor)
+    assert isinstance(critic, torch.Tensor)
+    assert isinstance(next_critic, torch.Tensor)
+    assert terminal_mask.shape == (2,)
+    assert critic.shape == (2, 2)
+    assert next_critic.shape == (2, 2)
     assert inference_request_queue.get_nowait() == worker_module.COLLECTOR_READY_TICK
     assert inference_request_queue.get_nowait() == 0
 
@@ -645,6 +720,11 @@ def test_worker_shutdown_flushes_partial_metrics_before_abnormal_cleanup(
         def add(self, *args, **kwargs) -> None:
             del args, kwargs
             events.append("replay_add")
+
+        def add_batch(self, *args, **kwargs) -> bool:
+            del args, kwargs
+            events.append("replay_add")
+            return True
 
         def release_ipc(self) -> None:
             events.append("replay_release")
