@@ -269,6 +269,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         self.replay_pack_executor = "collector_thread"
         self.replay_h2d_submitter = "auto"
         self.replay_transfer_backend: dict[str, object] = {}
+        self.last_run_summary: dict[str, object] | None = None
         self.runtime_manifest = {
             "inference_owner": "learner",
             "collector_actor": False,
@@ -522,8 +523,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         logger_runtime_manifest = getattr(logger, "_runtime_manifest", None)
         if isinstance(logger_runtime_manifest, dict):
             logger_runtime_manifest["replay_ingress"] = diagnostics
-        if isinstance(self.last_run_summary, dict):
-            summary_manifest = self.last_run_summary.get("runtime_manifest")
+        last_run_summary = getattr(self, "last_run_summary", None)
+        if isinstance(last_run_summary, dict):
+            summary_manifest = last_run_summary.get("runtime_manifest")
             if isinstance(summary_manifest, dict):
                 summary_manifest["replay_ingress"] = diagnostics
 

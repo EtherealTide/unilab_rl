@@ -255,6 +255,21 @@ def test_runner_records_final_replay_ingress_diagnostics_in_summary() -> None:
     assert runner.last_run_summary["runtime_manifest"]["replay_ingress"] == diagnostics
 
 
+def test_runner_final_replay_ingress_diagnostics_tolerate_missing_summary() -> None:
+    diagnostics = {"occupancy": 0, "dropped_batches": 0}
+    replay_buffer = SimpleNamespace(ingress_diagnostics=lambda: diagnostics)
+    logger = SimpleNamespace(_runtime_manifest={})
+    runner = object.__new__(device_runner_module.DoubleBufferOffPolicyRunner)
+    runner.runtime_manifest = {}
+    assert "last_run_summary" not in vars(runner)
+
+    runner._record_final_replay_ingress_diagnostics(logger, replay_buffer)
+
+    assert runner.runtime_manifest["replay_ingress"] == diagnostics
+    assert logger._runtime_manifest["replay_ingress"] == diagnostics
+    assert "last_run_summary" not in vars(runner)
+
+
 class _Actor:
     def state_dict(self):
         return {"weight": torch.zeros(1)}
@@ -271,6 +286,7 @@ class _Learner:
 
 class _FakeReplayBuffer:
     last_kwargs = None
+    diagnostics_calls = 0
 
     def __init__(self, **kwargs):
         type(self).last_kwargs = kwargs
@@ -280,6 +296,23 @@ class _FakeReplayBuffer:
         self.trace_recorder = None
         self.trace_thread_time = False
         self.trace_cuda_events = False
+
+    def ingress_diagnostics(self):
+        type(self).diagnostics_calls += 1
+        return {
+            "ingress_depth": 2,
+            "ingress_slot_rows": 2,
+            "published_sequence": 1,
+            "release_sequence": 1,
+            "occupancy": 0,
+            "high_water_occupancy": 1,
+            "backpressure_waits": 0,
+            "backpressure_wait_s": 0.0,
+            "early_returns": 0,
+            "dropped_batches": 0,
+            "closed_returns": 0,
+            "stop_returns": 0,
+        }
 
     def close(self):
         return None
@@ -413,6 +446,7 @@ def test_mjwarp_collector_backend_device_follows_learner_device(
 
     assert runner.device == "cuda:3"
     assert runner.collector_backend_device == "cuda:3"
+    assert runner.last_run_summary is None
     assert runner.runtime_manifest["collector_accelerator_context"] is True
     assert runner.runtime_manifest["collector_backend_device"] == "cuda:3"
 
@@ -422,6 +456,7 @@ def test_mjwarp_collector_start_forwards_learner_device(
     tmp_path,
 ) -> None:
     _FakePipeline.close_calls = 0
+    _FakeReplayBuffer.diagnostics_calls = 0
     monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
     monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
     monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
@@ -470,6 +505,16 @@ def test_mjwarp_collector_start_forwards_learner_device(
 
     monkeypatch.setattr(runner, "_start_collector", capture_collector)
     runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    assert _FakeReplayBuffer.diagnostics_calls == 2
+    assert runner.last_run_summary["status"] == "completed"
+    diagnostics = runner.last_run_summary["runtime_manifest"]["replay_ingress"]
+    assert diagnostics["occupancy"] == 0
+    assert diagnostics["published_sequence"] == diagnostics["release_sequence"]
+    assert diagnostics["early_returns"] == 0
+    assert diagnostics["dropped_batches"] == 0
+    assert diagnostics["closed_returns"] == 0
+    assert diagnostics["stop_returns"] == 0
 
     assert lifecycle == ["dp_init", "prepare", "collector_start"]
     assert collector_kwargs["sim_backend"] == "mjwarp"
