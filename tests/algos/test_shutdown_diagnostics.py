@@ -89,3 +89,28 @@ def test_shutdown_recorder_snapshots_are_best_effort() -> None:
     assert snapshot["inference_ring"] is None
     assert snapshot["replay_ingress"] is None
     assert snapshot["collector"] is None
+
+
+def test_shutdown_recorder_reset_clears_previous_run_and_keeps_epoch() -> None:
+    recorder = ShutdownDiagnosticsRecorder(inference_epoch=3)
+    recorder.set_phase(owner="learner", phase="training/learner_update", iteration=4)
+    recorder.record_failure(RuntimeError("previous run"))
+    recorder.record_cleanup_error(OSError("previous cleanup"))
+
+    recorder.reset(inference_epoch=5)
+
+    assert recorder.owner == "learner"
+    assert recorder.phase == "startup/begin"
+    assert recorder.iteration is None
+    assert recorder.coordination_tick is None
+    assert recorder.inference_epoch == 5
+    assert recorder.classification == "unknown_failure"
+    assert recorder.exception_type is None
+    assert recorder.exception_message is None
+    assert recorder.cleanup_errors == []
+
+
+def test_shutdown_recorder_contains_no_nested_schema_version() -> None:
+    snapshot = ShutdownDiagnosticsRecorder().snapshot()
+
+    assert "schema_version" not in snapshot

@@ -6,7 +6,6 @@ import signal
 from collections.abc import Callable
 from typing import Any
 
-_SHUTDOWN_SCHEMA_VERSION = 1
 _TRACEBACK_MAX_CHARS = 16_000
 
 
@@ -17,12 +16,15 @@ class ShutdownDiagnosticsRecorder:
     best-effort because diagnostics must never replace the training exception.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, inference_epoch: int | None = None) -> None:
+        self.reset(inference_epoch=inference_epoch)
+
+    def reset(self, inference_epoch: int | None = None) -> None:
         self.owner = "learner"
-        self.phase = "startup"
+        self.phase = "startup/begin"
         self.iteration: int | None = None
         self.coordination_tick: int | None = None
-        self.inference_epoch: int | None = None
+        self.inference_epoch = None if inference_epoch is None else int(inference_epoch)
         self.classification: str = "unknown_failure"
         self.exception_type: str | None = None
         self.exception_message: str | None = None
@@ -84,7 +86,6 @@ class ShutdownDiagnosticsRecorder:
         collector = _collector_snapshot(collector_process)
         phase, progress = coordination if isinstance(coordination, tuple) else (None, None)
         return {
-            "schema_version": _SHUTDOWN_SCHEMA_VERSION,
             "classification": self.classification,
             "owner": self.owner,
             "phase": self.phase,
@@ -114,7 +115,7 @@ def _safe_snapshot(source: Any, method_name: str) -> Any:
         return None
     try:
         return method()
-    except Exception:
+    except BaseException:
         return None
 
 
@@ -124,7 +125,7 @@ def _collector_snapshot(process: Any) -> dict[str, object] | None:
     try:
         alive = bool(process.is_alive())
         exitcode = getattr(process, "exitcode", None)
-    except Exception:
+    except BaseException:
         return None
     signal_number = -exitcode if isinstance(exitcode, int) and exitcode < 0 else None
     signal_name = None
