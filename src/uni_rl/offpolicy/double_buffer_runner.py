@@ -523,9 +523,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         logger_runtime_manifest = getattr(logger, "_runtime_manifest", None)
         if isinstance(logger_runtime_manifest, dict):
             logger_runtime_manifest["replay_ingress"] = diagnostics
-        last_run_summary = getattr(self, "last_run_summary", None)
-        if isinstance(last_run_summary, dict):
-            summary_manifest = last_run_summary.get("runtime_manifest")
+        if isinstance(self.last_run_summary, dict):
+            summary_manifest = self.last_run_summary.get("runtime_manifest")
             if isinstance(summary_manifest, dict):
                 summary_manifest["replay_ingress"] = diagnostics
 
