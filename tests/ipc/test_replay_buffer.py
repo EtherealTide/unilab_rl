@@ -64,6 +64,21 @@ def test_host_allocation_is_capacity_independent_and_commit_is_device_owned():
     torch.testing.assert_close(packed[:, small._act_sl], act)
     assert int(small.ptr[0]) == 4
     assert int(small.size[0]) == 4
+    diagnostics = small.ingress_diagnostics()
+    assert diagnostics == {
+        "ingress_depth": 2,
+        "ingress_slot_rows": 4,
+        "published_sequence": 1,
+        "release_sequence": 1,
+        "occupancy": 0,
+        "high_water_occupancy": 1,
+        "backpressure_waits": 0,
+        "backpressure_wait_s": 0.0,
+        "early_returns": 0,
+        "dropped_batches": 0,
+        "closed_returns": 0,
+        "stop_returns": 0,
+    }
     small.close()
     large.close()
 
@@ -124,6 +139,12 @@ def test_cuda_ingress_publication_uses_current_stream_barrier(
     monkeypatch.setattr(torch.cuda, "synchronize", fail_device_sync)
     monkeypatch.setattr(torch.cuda, "current_stream", tracking_current_stream)
 
+    def fail_ingress_read(*args, **kwargs) -> None:
+        del args, kwargs
+        raise AssertionError("diagnostics must not read CUDA ingress tensors")
+
+    protected_ingress_slots = []
+
     buf = ReplayBuffer(
         capacity=16,
         obs_dim=_OBS_DIM,
@@ -133,9 +154,15 @@ def test_cuda_ingress_publication_uses_current_stream_barrier(
         ingress_device="cuda",
     )
     try:
+        for slot in buf._ingress_slots:
+            monkeypatch.setattr(slot, "cpu", fail_ingress_read)
+            monkeypatch.setattr(slot, "item", fail_ingress_read)
+            protected_ingress_slots.append(slot)
         batch = tuple(tensor.to("cuda") for tensor in _random_batch(4))
         buf.add(*batch)
 
+        assert protected_ingress_slots
+        assert buf.ingress_diagnostics()["high_water_occupancy"] == 1
         assert buf.published_ptr == 4
         ingress = buf.take_published_ingress()
         assert ingress is not None
@@ -215,6 +242,8 @@ def test_ingress_rejects_collection_chunk_larger_than_slot():
 def test_ingress_backpressures_until_committed_slot_is_released():
     buf = _make_buf(capacity=16, slot_rows=4, depth=1)
     buf.add(*_random_batch(4))
+    assert buf.ingress_diagnostics()["occupancy"] == 1
+    assert buf.ingress_diagnostics()["high_water_occupancy"] == 1
     add_started = threading.Event()
     add_finished = threading.Event()
 
@@ -227,11 +256,50 @@ def test_ingress_backpressures_until_committed_slot_is_released():
     thread.start()
     assert add_started.wait(timeout=1.0)
     assert not add_finished.wait(timeout=0.05)
+    # The producer's semaphore acquire has a 50 ms timeout. Hold the full slot
+    # beyond that boundary so this test exercises a completed backpressure retry
+    # rather than the release/acquire race at the timeout edge.
+    time.sleep(0.02)
     _take_and_commit(buf)
     assert add_finished.wait(timeout=1.0)
     thread.join(timeout=1.0)
     _take_and_commit(buf)
+    diagnostics = buf.ingress_diagnostics()
+    assert diagnostics["published_sequence"] == 2
+    assert diagnostics["release_sequence"] == 2
+    assert diagnostics["occupancy"] == 0
+    assert diagnostics["high_water_occupancy"] == 1
+    assert diagnostics["backpressure_waits"] == 1
+    assert diagnostics["backpressure_wait_s"] >= 0.04
+    assert diagnostics["dropped_batches"] == 0
     buf.close()
+
+
+def test_ingress_shutdown_and_abnormal_stop_count_dropped_batches():
+    stop_event = _SPAWN_CTX.Event()
+    stopping = _make_buf(capacity=16, slot_rows=4, depth=1)
+    stopping.attach_stop_event(stop_event)
+    stopping.add(*_random_batch(4))
+    stop_event.set()
+    stopping.add(*_random_batch(4))
+
+    stopped = stopping.ingress_diagnostics()
+    assert stopped["stop_returns"] == 1
+    assert stopped["early_returns"] == 1
+    assert stopped["dropped_batches"] == 1
+    assert stopped["published_sequence"] == 1
+    assert stopped["release_sequence"] == 0
+    stopping.close()
+
+    closed = _make_buf(capacity=16, slot_rows=4, depth=1)
+    closed.add(*_random_batch(4))
+    closed.close()
+    closed.add(*_random_batch(4))
+    diagnostics = closed.ingress_diagnostics()
+    assert diagnostics["closed_returns"] == 1
+    assert diagnostics["early_returns"] == 1
+    assert diagnostics["dropped_batches"] == 1
+    assert diagnostics["published_sequence"] == 1
 
 
 def _collector_add(buf: ReplayBuffer, chunks: int) -> None:
@@ -260,4 +328,9 @@ def test_spawned_collector_publishes_bounded_chunks():
     assert committed == 32
     assert int(buf.ptr[0]) == 32
     assert int(buf.size[0]) == 32
+    diagnostics = buf.ingress_diagnostics()
+    assert diagnostics["published_sequence"] == 4
+    assert diagnostics["release_sequence"] == 4
+    assert 1 <= diagnostics["high_water_occupancy"] <= 2
+    assert diagnostics["dropped_batches"] == 0
     buf.close()

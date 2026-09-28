@@ -201,6 +201,60 @@ def test_reward_stats_reject_missing_device_replay_source():
         )
 
 
+def test_runner_publishes_replay_ingress_metrics_and_manifest() -> None:
+    diagnostics = {
+        "ingress_depth": 2,
+        "ingress_slot_rows": 4,
+        "published_sequence": 7,
+        "release_sequence": 5,
+        "occupancy": 2,
+        "high_water_occupancy": 2,
+        "backpressure_waits": 1,
+        "backpressure_wait_s": 0.25,
+        "early_returns": 1,
+        "dropped_batches": 1,
+        "closed_returns": 0,
+        "stop_returns": 1,
+    }
+    pipeline = SimpleNamespace(ingress_diagnostics=lambda: diagnostics)
+    updates: list[dict] = []
+    logger = SimpleNamespace(
+        update_runtime_manifest=lambda manifest: updates.append(manifest),
+        _runtime_manifest={},
+    )
+    runner = object.__new__(device_runner_module.DoubleBufferOffPolicyRunner)
+    runner.runtime_manifest = {}
+    runner.last_run_summary = None
+
+    metrics = runner._replay_ingress_metrics(pipeline)
+    assert normalize_metric_map(metrics) == {
+        "Train/replay_ingress_depth": 2.0,
+        "Train/replay_ingress_occupancy": 2.0,
+        "Train/replay_ingress_high_water": 2.0,
+        "Train/replay_ingress_backpressure_wait_ms": 250.0,
+        "Train/replay_ingress_dropped_batches": 1.0,
+    }
+    runner._update_replay_ingress_manifest(logger, pipeline)
+
+    assert runner.runtime_manifest["replay_ingress"] == diagnostics
+    assert updates == [{"replay_ingress": diagnostics}]
+
+
+def test_runner_records_final_replay_ingress_diagnostics_in_summary() -> None:
+    diagnostics = {"occupancy": 0, "dropped_batches": 2}
+    replay_buffer = SimpleNamespace(ingress_diagnostics=lambda: diagnostics)
+    logger = SimpleNamespace(_runtime_manifest={})
+    runner = object.__new__(device_runner_module.DoubleBufferOffPolicyRunner)
+    runner.runtime_manifest = {"existing": True}
+    runner.last_run_summary = {"runtime_manifest": {"existing": True}}
+
+    runner._record_final_replay_ingress_diagnostics(logger, replay_buffer)
+
+    assert runner.runtime_manifest["replay_ingress"] == diagnostics
+    assert logger._runtime_manifest["replay_ingress"] == diagnostics
+    assert runner.last_run_summary["runtime_manifest"]["replay_ingress"] == diagnostics
+
+
 class _Actor:
     def state_dict(self):
         return {"weight": torch.zeros(1)}
