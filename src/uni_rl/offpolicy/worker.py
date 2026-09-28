@@ -16,7 +16,7 @@ from uni_rl.offpolicy.coordination import (
     LearnerPhase,
     learner_pid_is_alive,
 )
-from uni_rl.offpolicy.tensor_metrics import TensorCollectorMetrics
+from uni_rl.offpolicy.tensor_metrics import TensorCollectorMetrics, TensorMetricFlush
 from uni_rl.offpolicy.thread_budget import apply_torch_thread_runtime
 from uni_rl.utils.device import configure_backend_process_device
 from uni_rl.utils.final_observation import resolve_terminal_observation_contract
@@ -371,6 +371,137 @@ def _run_collector(
     max_action_backlog_since_metric = 0
     max_in_flight_since_metric = 0
     max_publication_lag_since_metric = 0
+    final_tensor_metrics_flushed = False
+    pending_tensor_metric_flush: TensorMetricFlush | None = None
+
+    def enqueue_collector_metrics(
+        *,
+        final: bool = False,
+        reward_history: deque[float] | None = None,
+        length_history: deque[int] | None = None,
+    ) -> bool:
+        """Publish one collector metric snapshot without losing window state."""
+
+        nonlocal done_count_window, timeout_count_window, max_action_backlog_since_metric
+        nonlocal max_in_flight_since_metric, max_publication_lag_since_metric
+        assert metrics_queue is not None
+        assert replay_buffer is not None
+        import statistics
+
+        msg: dict[str, Any] = {
+            "total_steps": total_steps,
+            "buffer_size": int(replay_buffer.size[0]),
+        }
+        if final:
+            msg["metric_flush"] = "final"
+        rewards_for_report = reward_history if reward_history is not None else ep_rewards
+        lengths_for_report = length_history if length_history is not None else ep_lengths
+        if rewards_for_report:
+            msg["return_mean_ep100"] = statistics.mean(rewards_for_report)
+            msg["mean_episode_length"] = (
+                statistics.mean(lengths_for_report) if lengths_for_report else 0.0
+            )
+        components_mean = {
+            key: statistics.mean(values) for key, values in ep_reward_components.items() if values
+        }
+        if components_mean:
+            msg["reward_components"] = components_mean
+        if timing_counts:
+            msg["collector_timing_ms"] = {
+                key: total / timing_counts[key]
+                for key, total in timing_accum_ms.items()
+                if timing_counts[key] > 0
+            }
+        inference_diagnostics = {
+            "queue_depth": int(inference_queue_depth),
+            "action_backlog": int(inference_action_backlog),
+            "max_action_backlog": int(max_action_backlog_since_metric),
+            "in_flight": int(inference_in_flight),
+            "max_in_flight": int(max_in_flight_since_metric),
+            "wait_time_ms": float(cycle_timing_ms["learner_action_wait_ms"]),
+            "publication_lag": int(inference_in_flight),
+            "max_publication_lag": int(max_publication_lag_since_metric),
+        }
+        msg["collector_inference"] = inference_diagnostics
+        # Keep the latest bounded-flight snapshot alongside the canonical scalar
+        # stream so run summaries do not need to infer it from configured ring
+        # capacity.
+        msg["runtime_manifest"] = {"inference_flight": dict(inference_diagnostics)}
+        timeout_rate = timeout_count_window / done_count_window if done_count_window > 0 else None
+        if timeout_rate is not None:
+            msg["timeout_rate"] = timeout_rate
+        if trace_recorder:
+            msg["trace_events"] = trace_recorder.drain_events()
+
+        try:
+            if final:
+                # Shutdown can wait briefly for a healthy learner to drain a
+                # full bounded queue; normal collection remains non-blocking.
+                metrics_queue.put(msg, timeout=5.0)
+            else:
+                metrics_queue.put_nowait(msg)
+        except Exception as exc:
+            label = "final metrics enqueue" if final else "metrics enqueue"
+            print(f"[OffPolicyWorker] {label} error: {exc}", file=sys.stderr)
+            return False
+
+        # Mutable source windows are consumed only after the queue accepts the
+        # message, so a full queue cannot silently discard a completed window.
+        ep_reward_components.clear()
+        if timeout_rate is not None:
+            done_count_window = 0
+            timeout_count_window = 0
+        max_action_backlog_since_metric = 0
+        max_in_flight_since_metric = 0
+        max_publication_lag_since_metric = 0
+        if "collector_timing_ms" in msg:
+            timing_accum_ms.clear()
+            timing_counts.clear()
+        return True
+
+    def flush_final_tensor_metrics() -> None:
+        """Flush a partial device metric window once during worker shutdown."""
+
+        nonlocal final_tensor_metrics_flushed
+        nonlocal done_count_window, timeout_count_window, ep_rewards, ep_lengths
+        if final_tensor_metrics_flushed or tensor_metrics is None or metrics_queue is None:
+            return
+        final_tensor_metrics_flushed = True
+        try:
+            pending_flush = pending_tensor_metric_flush
+            metric_flush = tensor_metrics.final_flush()
+            if pending_flush is not None:
+                completed_flush = TensorMetricFlush(
+                    pending_flush.rewards + metric_flush.rewards,
+                    pending_flush.lengths + metric_flush.lengths,
+                    pending_flush.done_count + metric_flush.done_count,
+                    pending_flush.timeout_count + metric_flush.timeout_count,
+                )
+            else:
+                completed_flush = metric_flush
+            if pending_flush is None and not (
+                completed_flush.rewards
+                or completed_flush.lengths
+                or completed_flush.done_count
+                or completed_flush.timeout_count
+            ):
+                return
+            publication_rewards = deque(ep_rewards, maxlen=ep_rewards.maxlen)
+            publication_lengths = deque(ep_lengths, maxlen=ep_lengths.maxlen)
+            publication_rewards.extend(completed_flush.rewards)
+            publication_lengths.extend(completed_flush.lengths)
+            done_count_window += metric_flush.done_count
+            timeout_count_window += metric_flush.timeout_count
+            published = enqueue_collector_metrics(
+                final=True,
+                reward_history=publication_rewards,
+                length_history=publication_lengths,
+            )
+            if published:
+                ep_rewards = publication_rewards
+                ep_lengths = publication_lengths
+        except Exception as exc:
+            print(f"[OffPolicyWorker] final tensor metric flush error: {exc}", file=sys.stderr)
 
     obs_t: torch.Tensor | None = None
     critic_t: torch.Tensor | None = None
@@ -744,77 +875,41 @@ def _run_collector(
             # Send metrics every collector cycle so learner-side reward and
             # throughput displays track the current policy without extra lag.
             if metrics_queue is not None and (tensor_metrics is None or tensor_metrics.ready):
-                import statistics
-
                 if tensor_collector:
                     assert tensor_metrics is not None
                     metric_flush = tensor_metrics.flush()
-                    ep_rewards.extend(metric_flush.rewards)
-                    ep_lengths.extend(metric_flush.lengths)
+                    pending_flush = pending_tensor_metric_flush
+                    completed_flush = metric_flush
+                    if pending_flush is not None:
+                        completed_flush = TensorMetricFlush(
+                            pending_flush.rewards + metric_flush.rewards,
+                            pending_flush.lengths + metric_flush.lengths,
+                            pending_flush.done_count + metric_flush.done_count,
+                            pending_flush.timeout_count + metric_flush.timeout_count,
+                        )
+                    publication_rewards = deque(ep_rewards, maxlen=ep_rewards.maxlen)
+                    publication_lengths = deque(ep_lengths, maxlen=ep_lengths.maxlen)
+                    publication_rewards.extend(completed_flush.rewards)
+                    publication_lengths.extend(completed_flush.lengths)
                     done_count_window += metric_flush.done_count
                     timeout_count_window += metric_flush.timeout_count
-
-                try:
-                    msg = {
-                        "total_steps": total_steps,
-                        "buffer_size": int(replay_buffer.size[0]),
-                    }
-                    if ep_rewards:
-                        msg["return_mean_ep100"] = statistics.mean(ep_rewards)
-                        msg["mean_episode_length"] = (
-                            statistics.mean(ep_lengths) if ep_lengths else 0.0
-                        )
-                    # Add mean reward components
-                    if ep_reward_components:
-                        components_mean = {}
-                        for k, vals in ep_reward_components.items():
-                            if vals:
-                                components_mean[k] = statistics.mean(vals)
-                        msg["reward_components"] = components_mean
-                        ep_reward_components.clear()  # reset after sending
-
-                    if timing_counts:
-                        msg["collector_timing_ms"] = {
-                            k: (v / timing_counts[k])
-                            for k, v in timing_accum_ms.items()
-                            if timing_counts[k] > 0
-                        }
-                    inference_diagnostics = {
-                        "queue_depth": int(inference_queue_depth),
-                        "action_backlog": int(inference_action_backlog),
-                        "max_action_backlog": int(max_action_backlog_since_metric),
-                        "in_flight": int(inference_in_flight),
-                        "max_in_flight": int(max_in_flight_since_metric),
-                        "wait_time_ms": float(cycle_timing_ms["learner_action_wait_ms"]),
-                        "publication_lag": int(inference_in_flight),
-                        "max_publication_lag": int(max_publication_lag_since_metric),
-                    }
-                    msg["collector_inference"] = inference_diagnostics
-                    # Keep the latest bounded-flight snapshot alongside the
-                    # canonical scalar stream so run summaries do not need to
-                    # infer it from configured ring capacity.
-                    msg["runtime_manifest"] = {"inference_flight": dict(inference_diagnostics)}
-                    if done_count_window > 0:
-                        msg["timeout_rate"] = timeout_count_window / done_count_window
-                        done_count_window = 0
-                        timeout_count_window = 0
-
-                    if trace_recorder:
-                        msg["trace_events"] = trace_recorder.drain_events()
-
-                    metrics_queue.put_nowait(msg)
-                    max_action_backlog_since_metric = 0
-                    max_in_flight_since_metric = 0
-                    max_publication_lag_since_metric = 0
-                    if "collector_timing_ms" in msg:
-                        timing_accum_ms.clear()
-                        timing_counts.clear()
-                except Exception as e:
-                    print(f"[OffPolicyWorker] metrics enqueue error: {e}", file=sys.stderr)
+                    published = enqueue_collector_metrics(
+                        reward_history=publication_rewards,
+                        length_history=publication_lengths,
+                    )
+                    if published:
+                        ep_rewards = publication_rewards
+                        ep_lengths = publication_lengths
+                        pending_tensor_metric_flush = None
+                    else:
+                        pending_tensor_metric_flush = completed_flush
+                else:
+                    enqueue_collector_metrics()
             for key, value in cycle_timing_ms.items():
                 _record_timing_ms(timing_accum_ms, timing_counts, key, value)
 
     finally:
+        flush_final_tensor_metrics()
         cleanup = getattr(env, "cleanup", None)
         if callable(cleanup):
             cleanup()

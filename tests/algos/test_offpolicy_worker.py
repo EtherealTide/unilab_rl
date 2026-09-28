@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import queue
+import statistics
 import threading
+from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,6 +13,8 @@ import torch
 import uni_rl.offpolicy.worker as worker_module
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
 from uni_rl.ipc.inference_ring import SharedInferenceRing
+from uni_rl.logging.metrics_drain import RewardComponentWindow, drain_collector_metrics
+from uni_rl.logging.offpolicy import OffPolicyLogger
 from uni_rl.offpolicy.tensor_metrics import TensorCollectorMetrics
 from uni_rl.offpolicy.worker import (
     _collector_action_numpy,
@@ -109,6 +113,134 @@ def test_tensor_collector_metrics_supports_no_done_window() -> None:
     assert flushed.timeout_count == 0
     assert metrics.current_rewards.tolist() == [4.0, 6.0]
     assert metrics.current_lengths.tolist() == [2, 2]
+
+
+def test_tensor_collector_final_flush_handles_empty_and_partial_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = TensorCollectorMetrics(num_envs=2, interval=3, device="cpu")
+    calls = 0
+    original_cpu = torch.Tensor.cpu
+
+    def counting_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return original_cpu(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", counting_cpu)
+
+    empty_before_updates = metrics.final_flush()
+    empty_after_finalize = metrics.final_flush()
+
+    assert empty_before_updates == empty_after_finalize
+    assert calls == 0
+
+    metrics = TensorCollectorMetrics(num_envs=2, interval=3, device="cpu")
+    metrics.update(
+        rewards=torch.tensor([1.0, 10.0]),
+        done=torch.tensor([False, False]),
+        timeout=torch.tensor([False, False]),
+    )
+    no_completed = metrics.final_flush()
+
+    assert no_completed.rewards == []
+    assert no_completed.lengths == []
+    assert no_completed.done_count == 0
+    assert no_completed.timeout_count == 0
+    assert calls == 1
+    assert metrics.current_rewards.tolist() == [1.0, 10.0]
+    assert metrics.current_lengths.tolist() == [1, 1]
+
+
+def test_tensor_collector_final_flush_emits_only_completed_episodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = TensorCollectorMetrics(num_envs=2, interval=3, device="cpu")
+    calls = 0
+    original_cpu = torch.Tensor.cpu
+
+    def counting_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return original_cpu(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", counting_cpu)
+    metrics.update(
+        rewards=torch.tensor([1.0, 10.0]),
+        done=torch.tensor([True, False]),
+        timeout=torch.tensor([False, False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([2.0, 20.0]),
+        done=torch.tensor([False, False]),
+        timeout=torch.tensor([False, False]),
+    )
+
+    flushed = metrics.final_flush()
+
+    assert flushed.rewards == [1.0]
+    assert flushed.lengths == [1]
+    assert flushed.done_count == 1
+    assert flushed.timeout_count == 0
+    assert calls == 1
+    assert metrics.current_rewards.tolist() == [2.0, 30.0]
+    assert metrics.current_lengths.tolist() == [1, 2]
+
+
+def test_tensor_collector_final_flush_emits_multiple_completed_episodes() -> None:
+    metrics = TensorCollectorMetrics(num_envs=2, interval=4, device="cpu")
+    metrics.update(
+        rewards=torch.tensor([1.0, 10.0]),
+        done=torch.tensor([True, False]),
+        timeout=torch.tensor([False, False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([2.0, 20.0]),
+        done=torch.tensor([True, True]),
+        timeout=torch.tensor([False, True]),
+    )
+
+    flushed = metrics.final_flush()
+
+    assert flushed.rewards == [1.0, 2.0, 30.0]
+    assert flushed.lengths == [1, 1, 2]
+    assert flushed.done_count == 3
+    assert flushed.timeout_count == 1
+
+
+def test_tensor_collector_final_flush_after_normal_flush_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = TensorCollectorMetrics(num_envs=1, interval=2, device="cpu")
+    calls = 0
+    original_cpu = torch.Tensor.cpu
+
+    def counting_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return original_cpu(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", counting_cpu)
+    metrics.update(
+        rewards=torch.tensor([1.0]),
+        done=torch.tensor([True]),
+        timeout=torch.tensor([False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([2.0]),
+        done=torch.tensor([True]),
+        timeout=torch.tensor([True]),
+    )
+    normal_flush = metrics.flush()
+    final_flush = metrics.final_flush()
+
+    assert normal_flush.rewards == [1.0, 2.0]
+    assert normal_flush.lengths == [1, 1]
+    assert final_flush.rewards == []
+    assert final_flush.lengths == []
+    assert final_flush.done_count == 0
+    assert final_flush.timeout_count == 0
+    assert calls == 1
 
 
 def test_tensor_collector_metrics_preserves_new_episode_after_done() -> None:
@@ -462,6 +594,156 @@ def test_tensor_collector_reports_bounded_inference_scheduling_diagnostics(
     assert events == ["step", "replay_add", "close", "replay_release"]
     assert inference_request_queue.get_nowait() == worker_module.COLLECTOR_READY_TICK
     assert inference_request_queue.get_nowait() == 0
+
+
+def test_worker_shutdown_flushes_partial_metrics_before_abnormal_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = threading.Event()
+    inference_request_queue: queue.Queue[int] = queue.Queue()
+    inference_response_queue: queue.Queue[dict] = queue.Queue()
+    metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=4)
+    events: list[str] = []
+
+    class _State:
+        obs = {"obs": torch.zeros((2, 2), dtype=torch.float32)}
+        reward = torch.tensor([4.0, 2.0])
+        terminated = torch.tensor([True, False])
+        truncated = torch.tensor([False, False])
+        final_observation = None
+        info = {"timing": {}}
+
+    class _Env:
+        state = _State()
+
+        def step(self, actions):
+            torch.testing.assert_close(actions, torch.zeros((2, 2)))
+            events.append("step")
+            stop_event.set()
+            self.state = SimpleNamespace(
+                obs={"obs": torch.ones((2, 2), dtype=torch.float32)},
+                reward=torch.tensor([4.0, 2.0]),
+                terminated=torch.tensor([True, False]),
+                truncated=torch.tensor([False, False]),
+                final_observation=None,
+                info={"timing": {}},
+            )
+            return self.state
+
+        def cleanup(self):
+            events.append("cleanup")
+            raise RuntimeError("abnormal shutdown after partial window")
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+        size = torch.tensor([2], dtype=torch.int64)
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+        def add(self, *args, **kwargs) -> None:
+            del args, kwargs
+            events.append("replay_add")
+
+        def release_ipc(self) -> None:
+            events.append("replay_release")
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *a, **kw: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *a, **kw: None)
+    ring = SharedInferenceRing(2, 2, 2, capacity=4)
+
+    def serve_learner_action(
+        coordination_queue,
+        tick_id,
+        stop,
+        **kwargs,
+    ):
+        del coordination_queue, stop, kwargs
+        ring.copy_observation_to(
+            tick_id=tick_id,
+            observations=torch.empty((2, 2)),
+            dones=torch.empty(2),
+            epoch=0,
+        )
+        ring.publish_action(
+            tick_id=tick_id,
+            policy_version=0,
+            actions=torch.zeros((2, 2)),
+            epoch=0,
+        )
+        return True
+
+    monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
+    original_consume_action = ring.consume_action
+
+    def consume_tensor_action(**kwargs):
+        actions, policy_version = original_consume_action(**kwargs)
+        if isinstance(actions, np.ndarray):
+            actions = torch.from_numpy(actions)
+        return actions, policy_version
+
+    ring.consume_action = consume_tensor_action
+
+    with pytest.raises(RuntimeError, match="abnormal shutdown after partial window"):
+        worker_module._run_collector(
+            stop_event=stop_event,
+            env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+            num_envs=2,
+            replay_buffer=_ReplayBuffer(),
+            inference_slot=ring,
+            inference_request_queue=inference_request_queue,
+            inference_response_queue=inference_response_queue,
+            algo_type="sac",
+            actor_adapter_modules=None,
+            metrics_queue=metrics_queue,
+            sim_backend="mujoco",
+            backend_device=None,
+            env_cfg_override=None,
+            inference_epoch=0,
+            collector_metrics_interval=3,
+            seed=1,
+            trace_enabled=False,
+            trace_thread_time=False,
+        )
+
+    assert metrics_queue.get_nowait()["runtime_manifest"]["tensor_native_env"] is True
+    final_message = metrics_queue.get_nowait()
+    assert final_message["metric_flush"] == "final"
+    assert final_message["total_steps"] == 2
+    assert final_message["return_mean_ep100"] == 4.0
+    assert final_message["mean_episode_length"] == 1.0
+    assert final_message["timeout_rate"] == 0.0
+    assert metrics_queue.empty()
+
+    reward_history: deque[float] = deque(maxlen=100)
+    logger = OffPolicyLogger(log_backend="none")
+    # Requeue the captured messages so the shared drain under test sees the
+    # exact worker publication sequence.
+    metrics_queue.put_nowait({"runtime_manifest": {"tensor_native_env": True}})
+    metrics_queue.put_nowait(final_message)
+    drain_collector_metrics(
+        metrics_queue,
+        reward_history,
+        RewardComponentWindow(),
+        logger,
+        runner_label="test",
+        raise_on_collector_error=True,
+        require_buffer_size=True,
+    )
+
+    scalars = logger._build_backend_scalars(
+        iteration=1,
+        metrics=None,
+        return_mean_ep100=statistics.mean(reward_history),
+        reward_components={},
+    )
+    assert list(reward_history) == [4.0]
+    assert logger._total_steps == 2
+    assert scalars["Train/mean_reward"] == 4.0
+    assert scalars["Train/mean_episode_length"] == 1.0
+    assert scalars["Episode/timeout_rate"] == 0.0
+    assert events == ["step", "replay_add", "cleanup"]
 
 
 def test_inference_request_publish_timeout_is_explicit() -> None:

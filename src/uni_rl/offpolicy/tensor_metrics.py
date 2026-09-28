@@ -54,6 +54,7 @@ class TensorCollectorMetrics:
         self.timeout_count = torch.zeros((), dtype=torch.int64, device=self.device)
         self._cursor = 0
         self._updates = 0
+        self._finalized = False
 
     @property
     def ready(self) -> bool:
@@ -100,8 +101,29 @@ class TensorCollectorMetrics:
         self._updates += 1
 
     def flush(self) -> TensorMetricFlush:
+        if self._finalized:
+            raise RuntimeError("tensor metric window was already finalized")
         if not self.ready:
             raise RuntimeError("tensor metric window is not ready")
+        return self._flush()
+
+    def final_flush(self) -> TensorMetricFlush:
+        """Flush completed episodes once at collector shutdown.
+
+        A partial shutdown flush uses the same device-side compaction and single
+        packed host transfer as the periodic path.  Unfinished episode
+        accumulators remain in ``current_rewards`` and ``current_lengths`` and
+        are therefore never published as completed episodes.  Calling this
+        method again is idempotent and performs no additional device transfer.
+        """
+        if self._finalized:
+            return TensorMetricFlush([], [], 0, 0)
+        self._finalized = True
+        if self._updates == 0:
+            return TensorMetricFlush([], [], 0, 0)
+        return self._flush()
+
+    def _flush(self) -> TensorMetricFlush:
         valid = self.finished_valid.reshape(-1)
         rewards = self.finished_rewards.reshape(-1)[valid]
         lengths = self.finished_lengths.reshape(-1)[valid]
