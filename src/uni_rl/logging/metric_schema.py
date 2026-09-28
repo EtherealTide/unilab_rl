@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
+METRIC_SCHEMA_VERSION = 1
+
 
 @dataclass(frozen=True)
 class MetricSpec:

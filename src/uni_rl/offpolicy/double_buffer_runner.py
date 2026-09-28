@@ -30,8 +30,12 @@ from uni_rl.ipc.replay_pipelines.gpu_resident import (
     require_offpolicy_replay_device,
 )
 from uni_rl.logging import OffPolicyLogger, TraceRecorder
-from uni_rl.logging.metric_schema import metric_spec, normalize_metric_map
+from uni_rl.logging.metric_schema import METRIC_SCHEMA_VERSION, metric_spec, normalize_metric_map
 from uni_rl.logging.metrics_drain import RewardComponentWindow
+from uni_rl.logging.runtime_manifest_schema import (
+    RUNTIME_MANIFEST_SCHEMA_VERSION,
+    validate_runtime_manifest,
+)
 from uni_rl.offpolicy.actor_adapter import get_offpolicy_actor_adapter
 from uni_rl.offpolicy.coordination import LearnerCoordinationState
 from uni_rl.offpolicy.runner import (
@@ -275,6 +279,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         self._active_inference_ring: Any = None
         self._active_replay_buffer: ReplayBuffer | None = None
         self.runtime_manifest = {
+            "schema_version": RUNTIME_MANIFEST_SCHEMA_VERSION,
             "inference_owner": "learner",
             "collector_actor": False,
             "collector_accelerator_context": self.collector_backend_device is not None,
@@ -282,6 +287,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "collector_torch_inference": False,
             "collector_tensor_native": self.collector_tensor_native,
             "inference_ring_capacity": self.inference_slot_capacity,
+            "inference_flight": {
+                "queue_depth": 0,
+                "publication_lag": 0,
+                "max_in_flight": 0,
+                "max_publication_lag": 0,
+            },
             "inference_publication_ordering": "contiguous_ticks",
             "inference_epoch": self.inference_epoch,
             "learner_actor_reused": True,
@@ -531,6 +542,15 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             summary_manifest = self.last_run_summary.get("runtime_manifest")
             if isinstance(summary_manifest, dict):
                 summary_manifest["replay_ingress"] = diagnostics
+
+    def _minimal_failed_summary(self, status: str) -> dict[str, object]:
+        """Build a schema-stamped summary when normal summary assembly fails."""
+
+        return {
+            "status": status,
+            "metric_schema_version": METRIC_SCHEMA_VERSION,
+            "runtime_manifest": dict(self.runtime_manifest),
+        }
 
     def _record_shutdown_diagnostics(self, logger: OffPolicyLogger) -> dict[str, object]:
         try:
@@ -983,10 +1003,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         except BaseException as cleanup_exc:
             self._shutdown_recorder.record_cleanup_error(cleanup_exc)
             if not isinstance(self.last_run_summary, dict):
-                self.last_run_summary = {
-                    "status": "collector_died",
-                    "runtime_manifest": dict(self.runtime_manifest),
-                }
+                self.last_run_summary = self._minimal_failed_summary("collector_died")
         try:
             replay_pipeline.close()
         except BaseException as cleanup_exc:
@@ -1115,10 +1132,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 self._shutdown_recorder.record_failure(exc)
                 self._record_startup_shutdown_diagnostics()
             if not isinstance(self.last_run_summary, dict):
-                self.last_run_summary = {
-                    "status": "failed",
-                    "runtime_manifest": dict(self.runtime_manifest),
-                }
+                self.last_run_summary = self._minimal_failed_summary("failed")
             raise
 
     def _record_startup_shutdown_diagnostics(self) -> None:
@@ -1974,10 +1988,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 )
             except BaseException as summary_exc:
                 self._shutdown_recorder.record_cleanup_error(summary_exc)
-                self.last_run_summary = {
-                    "status": "failed",
-                    "runtime_manifest": dict(self.runtime_manifest),
-                }
+                self.last_run_summary = self._minimal_failed_summary("failed")
             raise
         finally:
             # Learner stop/death must release the collector even when the active
@@ -2003,7 +2014,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         train_start_wall,
         trace_path,
     ) -> dict:
-        return {
+        summary = {
             "status": status,
             "completed_iterations": iteration,
             "total_env_steps": int(logger._total_steps),
@@ -2013,6 +2024,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "last_checkpoint": ckpt_path,
             "trace_path": trace_path,
             "training_wall_time_sec": time.time() - train_start_wall,
+            "metric_schema_version": METRIC_SCHEMA_VERSION,
             "runtime_manifest": dict(getattr(logger, "_runtime_manifest", {})),
             "final_env_steps_per_sec": logger._get_iter_env_steps_per_sec(),
             "final_learner_replay_rows_per_sec": (logger._get_learner_replay_rows_per_sec()),
@@ -2022,3 +2034,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "final_inference_forward_ms": getattr(logger, "_inference_forward_time", 0.0) * 1000.0,
             "final_inference_d2h_ms": getattr(logger, "_inference_d2h_time", 0.0) * 1000.0,
         }
+        validate_runtime_manifest(
+            summary["runtime_manifest"],
+            completed=status == "completed",
+        )
+        return summary

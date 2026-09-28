@@ -16,7 +16,11 @@ import uni_rl.offpolicy.double_buffer_runner as device_runner_module
 import uni_rl.offpolicy.runner as runner_module
 from uni_rl.ipc.async_runner import AsyncRunner
 from uni_rl.ipc.inference_ring import SharedInferenceRing
-from uni_rl.logging.metric_schema import normalize_metric_map
+from uni_rl.logging.metric_schema import METRIC_SCHEMA_VERSION, normalize_metric_map
+from uni_rl.logging.runtime_manifest_schema import (
+    RUNTIME_MANIFEST_SCHEMA_VERSION,
+    validate_runtime_manifest,
+)
 from uni_rl.offpolicy.coordination import LearnerPhase
 from uni_rl.offpolicy.double_buffer_runner import (
     _LearnerInferenceScheduler,
@@ -508,6 +512,11 @@ def test_mjwarp_collector_start_forwards_learner_device(
 
     assert _FakeReplayBuffer.diagnostics_calls == 4
     assert runner.last_run_summary["status"] == "completed"
+    assert runner.last_run_summary["metric_schema_version"] == METRIC_SCHEMA_VERSION
+    assert (
+        runner.last_run_summary["runtime_manifest"]["schema_version"]
+        == RUNTIME_MANIFEST_SCHEMA_VERSION
+    )
     diagnostics = runner.last_run_summary["runtime_manifest"]["replay_ingress"]
     assert diagnostics["occupancy"] == 0
     assert diagnostics["published_sequence"] == diagnostics["release_sequence"]
@@ -761,6 +770,11 @@ def test_learn_startup_failure_records_shutdown_and_replaces_stale_state(
 
     assert runner.last_run_summary["status"] == "failed"
     assert "stale" not in runner.last_run_summary
+    assert runner.last_run_summary["metric_schema_version"] == METRIC_SCHEMA_VERSION
+    assert (
+        runner.last_run_summary["runtime_manifest"]["schema_version"]
+        == device_runner_module.RUNTIME_MANIFEST_SCHEMA_VERSION
+    )
     shutdown = runner.last_run_summary["runtime_manifest"]["shutdown"]
     assert shutdown["classification"] == "learner_failure"
     assert shutdown["owner"] == "learner"
@@ -771,6 +785,20 @@ def test_learn_startup_failure_records_shutdown_and_replaces_stale_state(
     }
     assert "schema_version" not in shutdown
     runner.close()
+
+
+def test_minimal_failed_summary_is_schema_valid(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _make_device_runner(monkeypatch)
+    summary = runner._minimal_failed_summary("failed")
+
+    assert summary["metric_schema_version"] == METRIC_SCHEMA_VERSION
+    assert summary["runtime_manifest"]["schema_version"] == (
+        device_runner_module.RUNTIME_MANIFEST_SCHEMA_VERSION
+    )
+    validate_runtime_manifest(
+        summary["runtime_manifest"],
+        completed=False,
+    )
 
 
 def test_shutdown_diagnostics_cleanup_does_not_replace_original_error(
@@ -907,6 +935,11 @@ def test_collector_failure_cleanup_does_not_replace_original_error(
         runner.learn(max_iterations=1, save_interval=0, log_dir=str(tmp_path))
 
     assert runner.last_run_summary["status"] == "collector_died"
+    assert runner.last_run_summary["metric_schema_version"] == METRIC_SCHEMA_VERSION
+    assert (
+        runner.last_run_summary["runtime_manifest"]["schema_version"]
+        == device_runner_module.RUNTIME_MANIFEST_SCHEMA_VERSION
+    )
     cleanup_errors = runner.last_run_summary["runtime_manifest"]["shutdown"]["cleanup"]["errors"]
     assert {"type": "KeyboardInterrupt", "message": "logger status failed"} in cleanup_errors
     assert {"type": "SystemExit", "message": "pipeline close failed"} in cleanup_errors
