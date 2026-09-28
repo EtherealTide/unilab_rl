@@ -523,6 +523,134 @@ def test_mjwarp_collector_start_forwards_learner_device(
     assert collector_kwargs["learner_coordination"] is runner._learner_coordination
 
 
+def test_normal_completion_quiesces_collector_before_replay_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """The final collector transition must be published before ingress close."""
+
+    lifecycle: list[str] = []
+
+    class _CloseAfterCollectorQuiescePipeline(_FakePipeline):
+        last_incremental_h2d_time_s = 0.0
+
+        def progress(self, *, wait=False):
+            del wait
+            return True
+
+        def start_prepare(self, tick_id, sample_count, min_snapshot_ptr=None):
+            del tick_id, sample_count, min_snapshot_ptr
+            return True
+
+        def batch_ready(self, tick_id, sample_count):
+            del tick_id, sample_count
+            return True
+
+        def sample_large_batch(self, tick_id, sample_count):
+            del tick_id, sample_count
+            return {}
+
+        def after_tick(self):
+            return None
+
+        def close(self):
+            assert runner._collector_quiesced, "replay pipeline closed before collector exit"
+            lifecycle.append("replay_close")
+            super().close()
+
+    class _ReadyReplayBuffer(_FakeReplayBuffer):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.ptr[0] = 4
+            self.size[0] = 4
+            self.published_ptr = 4
+
+    class _UpdateLearner(_Learner):
+        supports_deferred_update_metrics = True
+
+        def update_critic(self, batch, *, read_metrics: bool = True):
+            del batch
+            return {"Loss/critic": 7.0} if read_metrics else {}
+
+        def update_actor(self, batch, *, read_metrics: bool = True):
+            del batch
+            return {}
+
+        def read_deferred_actor_metrics(self):
+            return {"Loss/actor": 3.0}
+
+        def soft_update_target(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _ReadyReplayBuffer)
+    monkeypatch.setattr(
+        device_runner_module, "GPUResidentReplayPipeline", _CloseAfterCollectorQuiescePipeline
+    )
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
+    real_empty = torch.empty
+
+    def empty_without_cuda(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(device_runner_module.torch, "empty", empty_without_cuda)
+    runner = _make_device_runner(
+        monkeypatch,
+        _UpdateLearner(),
+        device="cuda:3",
+        sim_backend="mjwarp",
+    )
+    runner.device = "cpu"
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_start_collector", lambda *, target_fn, kwargs: None)
+    monkeypatch.setattr(runner, "_check_collector_alive", lambda: True)
+    monkeypatch.setattr(runner, "_wait_for_inference_request", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        runner,
+        "_serve_learner_inference",
+        lambda *args, **kwargs: {
+            "inference_h2d_time": 0.0,
+            "inference_forward_time": 0.0,
+            "inference_d2h_time": 0.0,
+            "inference_time": 0.0,
+        },
+    )
+    monkeypatch.setattr(runner, "_publish_inference_response", lambda *args, **kwargs: None)
+    runner._collector_quiesced = False
+
+    def quiesce_collector():
+        if not runner._collector_quiesced:
+            runner._collector_quiesced = True
+            lifecycle.append("collector_quiesce")
+
+    monkeypatch.setattr(runner, "_shutdown_collector", quiesce_collector)
+
+    runner.learn(max_iterations=1, save_interval=0, log_dir=str(tmp_path))
+
+    assert runner.last_run_summary["status"] == "completed"
+    assert lifecycle == ["collector_quiesce", "replay_close"]
+
+
 def test_learn_failure_before_summary_preserves_original_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
