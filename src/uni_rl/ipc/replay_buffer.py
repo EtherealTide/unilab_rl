@@ -126,6 +126,10 @@ class ReplayBuffer(SharedBufferBase):
         return self._storage_width
 
     @property
+    def ingress_slot_rows(self) -> int:
+        return self._ingress_slot_rows
+
+    @property
     def host_storage_bytes(self) -> int:
         if self._ingress_device.type == "cuda":
             return 0
@@ -166,6 +170,9 @@ class ReplayBuffer(SharedBufferBase):
         Every value comes from process-shared host metadata. In particular, a
         CUDA-resident ingress slot is never read, copied to host, or synchronized
         to produce this snapshot.
+        Sequence and drop counters describe ingress publication chunks. A
+        collector vector larger than ``ingress_slot_rows`` is split into
+        multiple independently publishable chunks by ``add_batch()``.
         """
         published_sequence = int(self._ingress_publish_seq[0])
         release_sequence = int(self._ingress_release_seq_tensor[0])
@@ -228,9 +235,9 @@ class ReplayBuffer(SharedBufferBase):
     def __getstate__(self) -> dict:
         """Custom pickle support.
 
-        The collector subprocess only calls ``add()``. Trace and stop-event
-        handles are process-local; replay storage, ingress metadata, and
-        semaphores remain shared.
+        The collector subprocess only publishes transitions through
+        ``add_batch()``. Trace and stop-event handles are process-local; replay
+        storage, ingress metadata, and semaphores remain shared.
         """
         state = self.__dict__.copy()
         state["trace_recorder"] = None
@@ -250,7 +257,7 @@ class ReplayBuffer(SharedBufferBase):
         critic=None,
         next_critic=None,
         terminal_next_critic=None,
-    ):
+    ) -> bool:
         """Add batch (called by collector).
 
         `dones` follows the UniLab env lifecycle contract:
@@ -258,7 +265,7 @@ class ReplayBuffer(SharedBufferBase):
         `truncated` when computing bootstrap masks.
         """
         _trace_ns = time.perf_counter_ns() if self.trace_recorder is not None else 0
-        self._add_to_ingress(
+        return self._add_to_ingress(
             obs,
             actions,
             rewards,
@@ -272,6 +279,65 @@ class ReplayBuffer(SharedBufferBase):
             terminal_next_critic,
             trace_start_ns=_trace_ns,
         )
+
+    def add_batch(
+        self,
+        obs,
+        actions,
+        rewards,
+        next_obs,
+        dones,
+        truncated,
+        terminal_mask=None,
+        terminal_next_obs=None,
+        critic=None,
+        next_critic=None,
+        terminal_next_critic=None,
+    ) -> bool:
+        """Publish a collector vector in bounded ingress-sized chunks.
+
+        Each chunk is an independently publishable transition batch. Shutdown can
+        retain a valid prefix of a vector, but never an invalid transition row.
+        """
+        count = int(obs.shape[0])
+        if count <= self._ingress_slot_rows:
+            return self.add(
+                obs,
+                actions,
+                rewards,
+                next_obs,
+                dones,
+                truncated,
+                terminal_mask=terminal_mask,
+                terminal_next_obs=terminal_next_obs,
+                critic=critic,
+                next_critic=next_critic,
+                terminal_next_critic=terminal_next_critic,
+            )
+
+        def optional_slice(
+            tensor: torch.Tensor | None, start: int, end: int
+        ) -> torch.Tensor | None:
+            return None if tensor is None else tensor[start:end]
+
+        for start in range(0, count, self._ingress_slot_rows):
+            end = min(start + self._ingress_slot_rows, count)
+            published = self.add(
+                obs[start:end],
+                actions[start:end],
+                rewards[start:end],
+                next_obs[start:end],
+                dones[start:end],
+                truncated[start:end],
+                terminal_mask=optional_slice(terminal_mask, start, end),
+                terminal_next_obs=optional_slice(terminal_next_obs, start, end),
+                critic=optional_slice(critic, start, end),
+                next_critic=optional_slice(next_critic, start, end),
+                terminal_next_critic=optional_slice(terminal_next_critic, start, end),
+            )
+            if not published:
+                return False
+        return True
 
     def _add_to_ingress(
         self,
@@ -288,7 +354,7 @@ class ReplayBuffer(SharedBufferBase):
         terminal_next_critic,
         *,
         trace_start_ns: int,
-    ) -> None:
+    ) -> bool:
         count = int(obs.shape[0])
         if count > self._ingress_slot_rows:
             raise ValueError(
@@ -309,14 +375,14 @@ class ReplayBuffer(SharedBufferBase):
                     wait_start_ns=wait_start_ns,
                     waited=waited_for_free_slot,
                 )
-                return
+                return False
             if self._stop_event is not None and self._stop_event.is_set():
                 self._record_ingress_drop(
                     reason="stop",
                     wait_start_ns=wait_start_ns,
                     waited=waited_for_free_slot,
                 )
-                return
+                return False
         wait_end_ns = time.perf_counter_ns()
         if bool(self._ingress_closed[0]):
             self._record_ingress_drop(
@@ -324,7 +390,7 @@ class ReplayBuffer(SharedBufferBase):
                 wait_start_ns=wait_start_ns,
                 waited=waited_for_free_slot,
             )
-            return
+            return False
         if waited_for_free_slot:
             self._record_ingress_backpressure(start_ns=wait_start_ns)
 
@@ -393,6 +459,7 @@ class ReplayBuffer(SharedBufferBase):
                     "published_ptr": start + count,
                 },
             )
+        return True
 
     def _write_transition_rows(
         self,

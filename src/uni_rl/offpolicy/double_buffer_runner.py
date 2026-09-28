@@ -24,7 +24,7 @@ from uni_rl.ipc.inference_ring import (
     SharedInferenceRing,
     estimate_inference_ring_bytes,
 )
-from uni_rl.ipc.replay_buffer import DEFAULT_REPLAY_INGRESS_DEPTH, ReplayBuffer
+from uni_rl.ipc.replay_buffer import ReplayBuffer
 from uni_rl.ipc.replay_pipelines.gpu_resident import (
     GPUResidentReplayPipeline,
     require_offpolicy_replay_device,
@@ -60,6 +60,12 @@ from uni_rl.offpolicy.worker import (
 )
 from uni_rl.utils.device import resolve_backend_process_device
 from uni_rl.utils.seed import derive_worker_seed
+from uni_rl.utils.tensor_runtime import (
+    DEFAULT_COLLECTOR_METRICS_INTERVAL,
+    DEFAULT_INFERENCE_SLOT_CAPACITY,
+    DEFAULT_REPLAY_INGRESS_DEPTH,
+    TensorRuntimeSettings,
+)
 
 # Terminal/W&B display names for the off-policy algo types. Keep these
 # user-facing (no internal "Fast*" implementation prefixes).
@@ -182,9 +188,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         target_frequency: int = 1,
         policy_before_critic: bool = False,
         collector_tensor_native: bool = False,
-        inference_slot_capacity: int = 1,
+        tensor_runtime_settings: TensorRuntimeSettings | None = None,
+        inference_slot_capacity: int | None = None,
         inference_epoch: int = 0,
-        collector_metrics_interval: int = 1,
+        collector_metrics_interval: int | None = None,
         **kwargs,
     ):
         kwargs["device"] = require_offpolicy_replay_device(kwargs.get("device"))
@@ -192,6 +199,62 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             str(kwargs.get("sim_backend", "mujoco")),
             kwargs["device"],
         )
+        if tensor_runtime_settings is None:
+            effective_inference_capacity = (
+                DEFAULT_INFERENCE_SLOT_CAPACITY
+                if inference_slot_capacity is None
+                else inference_slot_capacity
+            )
+            effective_metrics_interval = (
+                DEFAULT_COLLECTOR_METRICS_INTERVAL
+                if collector_metrics_interval is None
+                else collector_metrics_interval
+            )
+            tensor_runtime_settings = TensorRuntimeSettings(
+                inference_slot_capacity=effective_inference_capacity,
+                collector_metrics_interval=effective_metrics_interval,
+                replay_ingress_depth=DEFAULT_REPLAY_INGRESS_DEPTH,
+                replay_ingress_slot_rows=kwargs.get("num_envs", 4096),
+                batch_size=kwargs.get("batch_size", 8192),
+                updates_per_step=kwargs.get("updates_per_step", 8),
+                num_envs=kwargs.get("num_envs", 4096),
+            )
+        else:
+            explicit_values = {
+                "inference_slot_capacity": (
+                    inference_slot_capacity,
+                    tensor_runtime_settings.inference_slot_capacity,
+                ),
+                "collector_metrics_interval": (
+                    collector_metrics_interval,
+                    tensor_runtime_settings.collector_metrics_interval,
+                ),
+                "batch_size": (
+                    kwargs.get("batch_size"),
+                    tensor_runtime_settings.batch_size,
+                ),
+                "updates_per_step": (
+                    kwargs.get("updates_per_step"),
+                    tensor_runtime_settings.updates_per_step,
+                ),
+                "num_envs": (kwargs.get("num_envs"), tensor_runtime_settings.num_envs),
+            }
+            for name, (value, _) in explicit_values.items():
+                if value is not None and type(value) is not int:
+                    raise TypeError(f"{name} must be a positive integer, got {value!r}")
+            mismatches = {
+                name: (value, expected)
+                for name, (value, expected) in explicit_values.items()
+                if value is not None and value != expected
+            }
+            if mismatches:
+                details = ", ".join(
+                    f"{name}={value!r} (settings={expected!r})"
+                    for name, (value, expected) in mismatches.items()
+                )
+                raise ValueError(
+                    f"Direct runner arguments conflict with tensor_runtime_settings: {details}"
+                )
         super().__init__(**kwargs)
         if replay_prefetch_mode != "one_tick":
             raise ValueError(
@@ -234,31 +297,16 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 f"got {kwargs['device']!r}"
             )
         self.collector_tensor_native = collector_tensor_native
-        if (
-            isinstance(inference_slot_capacity, bool)
-            or not isinstance(inference_slot_capacity, int)
-            or inference_slot_capacity <= 0
-        ):
-            raise ValueError(
-                "inference_slot_capacity must be a positive integer, "
-                f"got {inference_slot_capacity!r}"
-            )
-        self.inference_slot_capacity = int(inference_slot_capacity)
+        self.tensor_runtime_settings = tensor_runtime_settings
+        self.inference_slot_capacity = tensor_runtime_settings.inference_slot_capacity
         if isinstance(inference_epoch, bool) or not isinstance(inference_epoch, int):
             raise TypeError(f"inference_epoch must be an integer, got {inference_epoch!r}")
         if inference_epoch < 0:
             raise ValueError("inference_epoch must be non-negative")
         self.inference_epoch = int(inference_epoch)
-        if (
-            isinstance(collector_metrics_interval, bool)
-            or not isinstance(collector_metrics_interval, int)
-            or collector_metrics_interval <= 0
-        ):
-            raise ValueError(
-                "collector_metrics_interval must be a positive integer, "
-                f"got {collector_metrics_interval!r}"
-            )
-        self.collector_metrics_interval = int(collector_metrics_interval)
+        self.collector_metrics_interval = tensor_runtime_settings.collector_metrics_interval
+        self.replay_ingress_depth = tensor_runtime_settings.replay_ingress_depth
+        self.replay_ingress_slot_rows = tensor_runtime_settings.replay_ingress_slot_rows
         # Backend-owned process-device binder forwarded to the collector
         # subprocess (e.g. mjwarp); None for backends that need no binding.
         self.backend_device_binder = backend_device_binder
@@ -287,6 +335,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "collector_torch_inference": False,
             "collector_tensor_native": self.collector_tensor_native,
             "inference_ring_capacity": self.inference_slot_capacity,
+            "runtime_limits": self.tensor_runtime_settings.manifest(),
             "inference_flight": {
                 "queue_depth": 0,
                 "publication_lag": 0,
@@ -1172,6 +1221,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         # --- memory budget check ---
         from uni_rl.ipc.memory_budget import (
             estimate_cuda_inference_ipc_bytes,
+            estimate_cuda_tensor_runtime_bytes,
             estimate_offpolicy_bytes,
             raise_if_cuda_memory_over_budget,
             raise_if_shared_memory_over_budget,
@@ -1193,7 +1243,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             obs_dim=self.obs_dim,
             action_dim=self.action_dim,
             critic_dim=self.critic_obs_dim,
-            ingress_depth=DEFAULT_REPLAY_INGRESS_DEPTH,
+            ingress_depth=self.replay_ingress_depth,
+            ingress_slot_rows=self.replay_ingress_slot_rows,
             inference_ring_bytes=0 if gpu_centric_collector else inference_ring_bytes,
             ingress_on_device=gpu_centric_collector,
         )
@@ -1215,13 +1266,39 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 ring_on_device=gpu_centric_collector,
                 persistent_exploration_scratch=self._persistent_inference_scratch_bytes(),
             )
+            cuda_tensor_budget = estimate_cuda_tensor_runtime_bytes(
+                num_envs=self.num_envs,
+                replay_buffer_n=self.replay_buffer_n,
+                obs_dim=self.obs_dim,
+                action_dim=self.action_dim,
+                critic_dim=self.critic_obs_dim,
+                inference_obs_dim=inference_input_dim,
+                sample_count=self.tensor_runtime_settings.learner_sample_count,
+                inference_slot_capacity=self.inference_slot_capacity,
+                replay_ingress_depth=self.replay_ingress_depth,
+                replay_ingress_slot_rows=self.replay_ingress_slot_rows,
+                collector_tensor_native=gpu_centric_collector,
+                persistent_exploration_scratch=self._persistent_inference_scratch_bytes(),
+            )
             raise_if_cuda_memory_over_budget(
-                cuda_inference_budget,
+                cuda_tensor_budget,
                 label=f"Off-policy ({self.algo_type})",
                 available_bytes=cuda_free_bytes,
+                user_knob=(
+                    "training.inference_slot_capacity, training.replay_ingress_depth, "
+                    "training.replay_ingress_slot_rows, algo.batch_size, "
+                    "algo.updates_per_step, algo.replay_buffer_n, or algo.num_envs"
+                ),
+                budget_kind="CUDA tensor runtime (inference + replay)",
             )
             self.runtime_manifest["inference_memory_budget"] = {
                 **cuda_inference_budget,
+                "available_bytes": cuda_free_bytes,
+                "threshold": 0.8,
+                "allowed_bytes": int(cuda_free_bytes * 0.8),
+            }
+            self.runtime_manifest["tensor_memory_budget"] = {
+                **cuda_tensor_budget,
                 "available_bytes": cuda_free_bytes,
                 "threshold": 0.8,
                 "allowed_bytes": int(cuda_free_bytes * 0.8),
@@ -1237,8 +1314,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             action_dim=self.action_dim,
             device=self.device,
             critic_dim=self.critic_obs_dim,
-            ingress_slot_rows=self.num_envs,
-            ingress_depth=DEFAULT_REPLAY_INGRESS_DEPTH,
+            ingress_slot_rows=self.replay_ingress_slot_rows,
+            ingress_depth=self.replay_ingress_depth,
             ingress_device=self.device if gpu_centric_collector else "cpu",
         )
         self._active_replay_buffer = replay_buffer
@@ -1248,7 +1325,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         replay_buffer.trace_cuda_events = self.trace_cuda_events
 
         # --- authoritative device ring and hot/cold learner batches ---
-        sample_count = self.batch_size * self.updates_per_step
+        sample_count = self.tensor_runtime_settings.learner_sample_count
         replay_pipeline_factory = self.replay_pipeline_factory or GPUResidentReplayPipeline
         replay_pipeline = replay_pipeline_factory(
             replay_buffer,
@@ -1916,9 +1993,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             )
             # Stop the collector before closing the replay pipeline. The
             # collector may already be inside its final vectorized transition
-            # when the learner reaches max_iterations; quiescing it first lets
-            # that in-flight publication finish, after which pipeline.close()
-            # can drain and release every published replay-ingress slot.
+            # when the learner reaches max_iterations. Ingress publication is
+            # chunk-granular: shutdown may retain a valid prefix of that vector,
+            # but quiescing first prevents an unpublished suffix from racing
+            # pipeline.close(), which drains and releases every published chunk.
             self._shutdown_collector()
             self._shutdown_recorder.set_phase(
                 owner="learner", phase="finalize/replay_pipeline_close", iteration=iteration

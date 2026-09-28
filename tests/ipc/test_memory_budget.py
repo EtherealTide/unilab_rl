@@ -10,10 +10,27 @@ from uni_rl.ipc.memory_budget import (
     CUDA_INFERENCE_MIN_OVERHEAD_BYTES,
     CUDA_INFERENCE_TIMING_EVENT_COUNT,
     estimate_cuda_inference_ipc_bytes,
+    estimate_cuda_tensor_runtime_bytes,
     estimate_offpolicy_bytes,
     raise_if_cuda_memory_over_budget,
     raise_if_shared_memory_over_budget,
 )
+
+
+def _tensor_runtime_budget(*, collector_tensor_native: bool) -> dict[str, int | str]:
+    return estimate_cuda_tensor_runtime_bytes(
+        num_envs=2,
+        replay_buffer_n=4,
+        obs_dim=4,
+        action_dim=2,
+        critic_dim=5,
+        inference_obs_dim=4,
+        sample_count=8,
+        inference_slot_capacity=1,
+        replay_ingress_depth=2,
+        replay_ingress_slot_rows=2,
+        collector_tensor_native=collector_tensor_native,
+    )
 
 
 def test_offpolicy_memory_budget_notes_native_exclusions() -> None:
@@ -64,6 +81,44 @@ def test_device_replay_host_budget_excludes_gpu_collector_ingress() -> None:
     assert estimate["bounded_ingress_slots"] == 0
     assert estimate["total"] == 0
     assert "device-resident" in str(estimate["breakdown"])
+
+
+def test_host_replay_budget_uses_effective_ingress_slot_rows() -> None:
+    default_rows = estimate_offpolicy_bytes(
+        num_envs=4,
+        replay_buffer_n=8,
+        obs_dim=4,
+        action_dim=2,
+        critic_dim=5,
+        ingress_depth=2,
+    )
+    custom_rows = estimate_offpolicy_bytes(
+        num_envs=4,
+        replay_buffer_n=8,
+        obs_dim=4,
+        action_dim=2,
+        critic_dim=5,
+        ingress_depth=2,
+        ingress_slot_rows=1,
+    )
+
+    assert default_rows["ingress_slot_rows"] == 4
+    assert custom_rows["ingress_slot_rows"] == 1
+    assert custom_rows["bounded_ingress_slots"] * 4 == default_rows["bounded_ingress_slots"]
+    assert "1 rows" in str(custom_rows["breakdown"])
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "1", 1.0, 5])
+def test_host_replay_budget_rejects_invalid_ingress_slot_rows(value: object) -> None:
+    with pytest.raises(ValueError, match="ingress_slot_rows"):
+        estimate_offpolicy_bytes(
+            num_envs=4,
+            replay_buffer_n=8,
+            obs_dim=4,
+            action_dim=2,
+            critic_dim=5,
+            ingress_slot_rows=value,
+        )
 
 
 def test_host_budget_includes_cpu_inference_ring_storage() -> None:
@@ -147,6 +202,84 @@ def test_cuda_budget_threshold_and_actionable_error() -> None:
     assert "device free" in message
     assert "training.inference_slot_capacity" in message
     assert "Inference ring storage" in message
+
+
+def test_cuda_tensor_runtime_budget_combines_inference_and_replay() -> None:
+    native = _tensor_runtime_budget(collector_tensor_native=True)
+    host_bridge = _tensor_runtime_budget(collector_tensor_native=False)
+    row_width = 23
+    replay_storage = 4 * 2 * row_width * 4
+    learner_batches = 2 * 8 * row_width * 4
+    native_ingress = 2 * 2 * row_width * 4
+
+    assert native["replay_storage"] == replay_storage
+    assert native["learner_batch_slots"] == learner_batches
+    assert native["replay_ingress"] == native_ingress
+    assert host_bridge["replay_ingress"] == 0
+    assert native["total"] > int(native["inference_total"])
+    assert "CUDA tensor-runtime budget" in str(native["breakdown"])
+    assert "before any tensor-runtime allocation" in str(native["breakdown"])
+
+
+def test_cuda_tensor_runtime_budget_scales_with_dimensions() -> None:
+    baseline = _tensor_runtime_budget(collector_tensor_native=True)
+    changed = estimate_cuda_tensor_runtime_bytes(
+        num_envs=2,
+        replay_buffer_n=4,
+        obs_dim=5,
+        action_dim=2,
+        critic_dim=6,
+        inference_obs_dim=6,
+        sample_count=16,
+        inference_slot_capacity=1,
+        replay_ingress_depth=2,
+        replay_ingress_slot_rows=2,
+        collector_tensor_native=True,
+    )
+
+    assert changed["replay_row_width"] == 27
+    assert changed["replay_storage"] == 4 * 2 * 27 * 4
+    assert changed["learner_batch_slots"] == 2 * 16 * 27 * 4
+    assert changed["replay_ingress"] == 2 * 2 * 27 * 4
+    assert changed["replay_storage"] > baseline["replay_storage"]
+    assert changed["learner_batch_slots"] > baseline["learner_batch_slots"]
+    assert changed["replay_ingress"] > baseline["replay_ingress"]
+    assert changed["inference_total"] > baseline["inference_total"]
+
+
+def test_cuda_tensor_runtime_budget_rejects_invalid_dimensions() -> None:
+    with pytest.raises(ValueError, match="no greater than num_envs"):
+        estimate_cuda_tensor_runtime_bytes(
+            num_envs=2,
+            replay_buffer_n=4,
+            obs_dim=4,
+            action_dim=2,
+            critic_dim=5,
+            inference_obs_dim=4,
+            sample_count=8,
+            inference_slot_capacity=1,
+            replay_ingress_depth=2,
+            replay_ingress_slot_rows=3,
+            collector_tensor_native=True,
+        )
+
+
+@pytest.mark.parametrize("depth", [0, -1, True, "2", 1.0])
+def test_cuda_tensor_runtime_budget_rejects_invalid_ingress_depth(depth: object) -> None:
+    with pytest.raises((TypeError, ValueError), match="dimensions must be"):
+        estimate_cuda_tensor_runtime_bytes(
+            num_envs=2,
+            replay_buffer_n=4,
+            obs_dim=4,
+            action_dim=2,
+            critic_dim=5,
+            inference_obs_dim=4,
+            sample_count=8,
+            inference_slot_capacity=1,
+            replay_ingress_depth=depth,
+            replay_ingress_slot_rows=2,
+            collector_tensor_native=True,
+        )
 
 
 def test_shared_memory_budget_unknown_available_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:

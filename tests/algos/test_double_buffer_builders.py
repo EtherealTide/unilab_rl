@@ -47,6 +47,10 @@ def _binder(backend: str) -> str | None:
     return None
 
 
+def _learner_name(algo: str) -> str:
+    return "FastSACLearner" if algo == "sac" else "FlashSACLearner"
+
+
 def _training_cfg() -> dict[str, Any]:
     return {
         "task_name": "FakeTask",
@@ -163,8 +167,11 @@ def test_sac_builder_forwards_backend_device_binder(
     assert runner.kwargs["backend_device_binder"] is (_binder if with_binder else None)
     assert runner.kwargs["log_interval"] == 3
     assert runner.kwargs["collector_tensor_native"] is False
-    assert runner.kwargs["inference_slot_capacity"] == 1
-    assert runner.kwargs["collector_metrics_interval"] == 1
+    settings = runner.kwargs["tensor_runtime_settings"]
+    assert settings.inference_slot_capacity == 1
+    assert settings.collector_metrics_interval == 1
+    assert settings.replay_ingress_depth == 2
+    assert settings.replay_ingress_slot_rows == 4
 
 
 @pytest.mark.parametrize("with_binder", [False, True])
@@ -199,13 +206,16 @@ def test_flashsac_builder_forwards_backend_device_binder(
     assert runner.kwargs["backend_device_binder"] is (_binder if with_binder else None)
     assert runner.kwargs["log_interval"] == 3
     assert runner.kwargs["collector_tensor_native"] is False
-    assert runner.kwargs["inference_slot_capacity"] == 1
-    assert runner.kwargs["collector_metrics_interval"] == 1
+    settings = runner.kwargs["tensor_runtime_settings"]
+    assert settings.inference_slot_capacity == 1
+    assert settings.collector_metrics_interval == 1
+    assert settings.replay_ingress_depth == 2
+    assert settings.replay_ingress_slot_rows == 4
     assert _FakeLearner.last_kwargs["compile_full_objectives"] is True
 
 
 @pytest.mark.parametrize("algo", ["sac", "flashsac"])
-def test_double_buffer_builders_forward_tensor_runtime_intervals(
+def test_double_buffer_builders_forward_tensor_runtime_settings(
     monkeypatch: pytest.MonkeyPatch, algo: str
 ) -> None:
     if algo == "sac":
@@ -228,6 +238,8 @@ def test_double_buffer_builders_forward_tensor_runtime_intervals(
     cfg.env = {"tensor_runtime": False}
     cfg.training.inference_slot_capacity = 3
     cfg.training.collector_metrics_interval = 7
+    cfg.training.replay_ingress_depth = 4
+    cfg.training.replay_ingress_slot_rows = 2
 
     if algo == "sac":
         runner = module.build_sac_double_buffer_runner(
@@ -246,8 +258,47 @@ def test_double_buffer_builders_forward_tensor_runtime_intervals(
             device="cpu",
         )
 
-    assert runner.kwargs["inference_slot_capacity"] == 3
-    assert runner.kwargs["collector_metrics_interval"] == 7
+    settings = runner.kwargs["tensor_runtime_settings"]
+    assert settings.inference_slot_capacity == 3
+    assert settings.collector_metrics_interval == 7
+    assert settings.replay_ingress_depth == 4
+    assert settings.replay_ingress_slot_rows == 2
+    assert settings.batch_size == 4
+    assert settings.updates_per_step == 1
+    assert settings.learner_sample_count == 4
+
+
+@pytest.mark.parametrize("algo", ["sac", "flashsac"])
+def test_double_buffer_builders_reject_runtime_bounds_before_env_probe(
+    monkeypatch: pytest.MonkeyPatch, algo: str
+) -> None:
+    if algo == "sac":
+        import uni_rl.algos.fast_sac.double_buffer as module
+
+        cfg = _sac_cfg()
+        build = module.build_sac_double_buffer_runner
+    else:
+        import uni_rl.algos.flash_sac.double_buffer as module
+
+        cfg = _flashsac_cfg()
+        build = module.build_flashsac_double_buffer_runner
+        monkeypatch.setattr(module, "require_offpolicy_replay_device", lambda device: device)
+        monkeypatch.setattr(module, "apply_training_seed", lambda *args, **kwargs: None)
+    cfg.env = {"tensor_runtime": False}
+    cfg.training.replay_ingress_depth = 17
+
+    def _fail_factory(*args, **kwargs):
+        raise AssertionError("invalid bounds must fail before env probing")
+
+    monkeypatch.setattr(module, _learner_name(algo), _FakeLearner)
+    with pytest.raises(ValueError, match="replay_ingress_depth.*17"):
+        build(
+            cfg,
+            env_factory=_fail_factory,
+            env_cfg_override=None,
+            replay_prefetch_mode="one_tick",
+            device="cpu",
+        )
 
 
 def test_flashsac_builder_resolves_tensor_runtime_before_collector_spawn(
