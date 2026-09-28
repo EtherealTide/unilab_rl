@@ -271,9 +271,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         self.replay_h2d_submitter = "auto"
         self.replay_transfer_backend: dict[str, object] = {}
         self.last_run_summary: dict[str, object] | None = None
-        self._shutdown_recorder = ShutdownDiagnosticsRecorder()
-        self._shutdown_recorder.record_inference_epoch(self.inference_epoch)
+        self._shutdown_recorder = ShutdownDiagnosticsRecorder(inference_epoch=self.inference_epoch)
         self._active_inference_ring: Any = None
+        self._active_replay_buffer: ReplayBuffer | None = None
         self.runtime_manifest = {
             "inference_owner": "learner",
             "collector_actor": False,
@@ -540,7 +540,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 replay_buffer=getattr(self, "_active_replay_buffer", None),
                 collector_process=getattr(self, "_collector_process", None),
             )
-        except Exception as exc:
+        except BaseException as exc:
             self._shutdown_recorder.record_cleanup_error(exc)
             return {}
         self.runtime_manifest["shutdown"] = diagnostics
@@ -963,25 +963,35 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         ckpt_path: str | None,
         train_start_wall: float,
     ) -> None:
-        self._shutdown_recorder.record_collector_failure(
-            RuntimeError("Collector process died during off-policy training")
-        )
-        logger.log_status("[red]ERROR: Collector died[/]")
-        self._record_shutdown_diagnostics(logger)
-        self._sync_logger_replay_counters(logger, replay_buffer)
-        logger.close()
-        self.last_run_summary = self._make_summary(
-            "collector_died",
-            iteration,
-            logger,
-            None,
-            None,
-            ckpt_path,
-            train_start_wall,
-            None,
-        )
-        replay_pipeline.close()
-        raise RuntimeError("Collector process died during off-policy training")
+        failure = RuntimeError("Collector process died during off-policy training")
+        self._shutdown_recorder.record_collector_failure(failure)
+        try:
+            logger.log_status("[red]ERROR: Collector died[/]")
+            self._record_shutdown_diagnostics(logger)
+            self._sync_logger_replay_counters(logger, replay_buffer)
+            logger.close()
+            self.last_run_summary = self._make_summary(
+                "collector_died",
+                iteration,
+                logger,
+                None,
+                None,
+                ckpt_path,
+                train_start_wall,
+                None,
+            )
+        except BaseException as cleanup_exc:
+            self._shutdown_recorder.record_cleanup_error(cleanup_exc)
+            if not isinstance(self.last_run_summary, dict):
+                self.last_run_summary = {
+                    "status": "collector_died",
+                    "runtime_manifest": dict(self.runtime_manifest),
+                }
+        try:
+            replay_pipeline.close()
+        except BaseException as cleanup_exc:
+            self._shutdown_recorder.record_cleanup_error(cleanup_exc)
+        raise failure
 
     def _publish_inference_response(
         self,
@@ -1087,6 +1097,48 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         log_dir: str = "logs",
         logger_type: str = "tensorboard",
     ) -> None:
+        self._shutdown_recorder.reset(inference_epoch=self.inference_epoch)
+        self.runtime_manifest.pop("shutdown", None)
+        self.last_run_summary = None
+        self._active_logger = None
+        self._active_replay_buffer = None
+        self._active_inference_ring = None
+        try:
+            self._learn_impl(
+                max_iterations=max_iterations,
+                save_interval=save_interval,
+                log_dir=log_dir,
+                logger_type=logger_type,
+            )
+        except BaseException as exc:
+            if "shutdown" not in self.runtime_manifest:
+                self._shutdown_recorder.record_failure(exc)
+                self._record_startup_shutdown_diagnostics()
+            if not isinstance(self.last_run_summary, dict):
+                self.last_run_summary = {
+                    "status": "failed",
+                    "runtime_manifest": dict(self.runtime_manifest),
+                }
+            raise
+
+    def _record_startup_shutdown_diagnostics(self) -> None:
+        try:
+            self.runtime_manifest["shutdown"] = self._shutdown_recorder.snapshot(
+                learner_coordination=self._learner_coordination,
+                inference_ring=self._active_inference_ring,
+                replay_buffer=getattr(self, "_active_replay_buffer", None),
+                collector_process=getattr(self, "_collector_process", None),
+            )
+        except BaseException as diagnostics_exc:
+            self._shutdown_recorder.record_cleanup_error(diagnostics_exc)
+
+    def _learn_impl(
+        self,
+        max_iterations: int = 1500,
+        save_interval: int = 50,
+        log_dir: str = "logs",
+        logger_type: str = "tensorboard",
+    ) -> None:
         self._collector_ready = False
         if self._is_primary_rank():
             os.makedirs(log_dir, exist_ok=True)
@@ -1102,6 +1154,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         ckpt_path: str | None = None
         iteration = 0
 
+        self._shutdown_recorder.set_phase(owner="learner", phase="startup/memory_budget")
         # --- memory budget check ---
         from uni_rl.ipc.memory_budget import (
             estimate_cuda_inference_ipc_bytes,
@@ -1133,6 +1186,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         warn_if_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
         raise_if_shared_memory_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
 
+        self._shutdown_recorder.set_phase(owner="learner", phase="startup/cuda_preflight")
         # This guard runs before replay ingress, the inference ring, IPC events,
         # or learner inference scratch is materialized. It intentionally uses a
         # conservative reserve rather than claiming exact allocator accounting.
@@ -1160,6 +1214,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             }
             self._prepare_inference_timing_events()
 
+        self._shutdown_recorder.set_phase(owner="learner", phase="startup/replay_resources")
         # --- bounded collector ingress (the complete ring lives on device) ---
         buffer_capacity = self.replay_buffer_n * self.num_envs
         replay_buffer = ReplayBuffer(
@@ -1217,6 +1272,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             }
         )
 
+        self._shutdown_recorder.set_phase(owner="learner", phase="startup/inference_resources")
         inference_slot = SharedInferenceRing(
             self.num_envs,
             inference_input_dim,
@@ -1247,6 +1303,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             }
         )
 
+        self._shutdown_recorder.set_phase(owner="learner", phase="startup/logger")
         # --- logger ---
         logger = OffPolicyLogger(
             algo_name=algo_display_name(self.algo_type),
@@ -1847,7 +1904,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             self._shutdown_recorder.set_phase(
                 owner="learner", phase="finalize/replay_ingress_snapshot", iteration=iteration
             )
-            self._record_final_replay_ingress_diagnostics(logger, replay_buffer)
+            try:
+                self._record_final_replay_ingress_diagnostics(logger, replay_buffer)
+            except BaseException as diagnostics_exc:
+                self._shutdown_recorder.record_cleanup_error(diagnostics_exc)
             final_ckpt_path = os.path.join(log_dir, f"model_{max_iterations}.pt")
             if ckpt_path != final_ckpt_path:
                 saved_path = self._save_checkpoint(
@@ -1892,25 +1952,35 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         except BaseException as exc:
             self._shutdown_recorder.record_failure(exc)
             self._record_shutdown_diagnostics(logger)
-            self.last_run_summary = self._make_summary(
-                "failed",
-                iteration,
-                logger,
-                None,
-                None,
-                ckpt_path,
-                train_start_wall,
-                None,
-            )
+            try:
+                self.last_run_summary = self._make_summary(
+                    "failed",
+                    iteration,
+                    logger,
+                    None,
+                    None,
+                    ckpt_path,
+                    train_start_wall,
+                    None,
+                )
+            except BaseException as summary_exc:
+                self._shutdown_recorder.record_cleanup_error(summary_exc)
+                self.last_run_summary = {
+                    "status": "failed",
+                    "runtime_manifest": dict(self.runtime_manifest),
+                }
             raise
         finally:
             # Learner stop/death must release the collector even when the active
             # exception is unrelated to collector liveness.
             try:
                 self._shutdown_collector()
-            except Exception as cleanup_exc:
+            except BaseException as cleanup_exc:
                 self._shutdown_recorder.record_cleanup_error(cleanup_exc)
-            self._record_final_replay_ingress_diagnostics(logger, replay_buffer)
+            try:
+                self._record_final_replay_ingress_diagnostics(logger, replay_buffer)
+            except BaseException as cleanup_exc:
+                self._shutdown_recorder.record_cleanup_error(cleanup_exc)
             self._record_shutdown_diagnostics(logger)
 
     @staticmethod

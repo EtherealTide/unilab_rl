@@ -584,6 +584,208 @@ def test_learn_failure_before_summary_preserves_original_error(
     assert _FakePipeline.close_calls == 1
 
 
+def test_learn_startup_failure_records_shutdown_and_replaces_stale_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class _StartupFailureLogger:
+        def __init__(self, **kwargs):
+            del kwargs
+            raise RuntimeError("logger construction failed")
+
+    _FakePipeline.close_calls = 0
+    _FakeReplayBuffer.diagnostics_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _StartupFailureLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
+    real_empty = torch.empty
+
+    def empty_without_cuda(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(device_runner_module.torch, "empty", empty_without_cuda)
+    runner = _make_device_runner(monkeypatch, device="cuda:3", sim_backend="mjwarp")
+    runner.runtime_manifest["shutdown"] = {"classification": "normal_completion"}
+    runner.last_run_summary = {"status": "completed", "stale": True}
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
+
+    with pytest.raises(RuntimeError, match="logger construction failed"):
+        runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    assert runner.last_run_summary["status"] == "failed"
+    assert "stale" not in runner.last_run_summary
+    shutdown = runner.last_run_summary["runtime_manifest"]["shutdown"]
+    assert shutdown["classification"] == "learner_failure"
+    assert shutdown["owner"] == "learner"
+    assert shutdown["phase"] == "startup/logger"
+    assert shutdown["exception"] == {
+        "type": "RuntimeError",
+        "message": "logger construction failed",
+    }
+    assert "schema_version" not in shutdown
+    runner.close()
+
+
+def test_shutdown_diagnostics_cleanup_does_not_replace_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class _FinishFailureLogger(_FakeLogger):
+        def finish(self):
+            raise RuntimeError("finish failed")
+
+    class _FailingDiagnosticsReplayBuffer(_FakeReplayBuffer):
+        def ingress_diagnostics(self):
+            raise KeyboardInterrupt("replay diagnostics unavailable")
+
+    _FakePipeline.close_calls = 0
+    _FakeReplayBuffer.diagnostics_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FailingDiagnosticsReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FinishFailureLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
+    real_empty = torch.empty
+
+    def empty_without_cuda(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(device_runner_module.torch, "empty", empty_without_cuda)
+    runner = _make_device_runner(monkeypatch, device="cuda:3", sim_backend="mjwarp")
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_start_collector", lambda *, target_fn, kwargs: None)
+
+    with pytest.raises(RuntimeError, match="finish failed"):
+        runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    shutdown = runner.last_run_summary["runtime_manifest"]["shutdown"]
+    assert shutdown["classification"] == "learner_failure"
+    cleanup_errors = shutdown["cleanup"]["errors"]
+    assert {
+        "type": "KeyboardInterrupt",
+        "message": "replay diagnostics unavailable",
+    } in cleanup_errors
+    runner.close()
+
+
+def test_collector_failure_cleanup_does_not_replace_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class _CleanupFailureLogger(_FakeLogger):
+        def log_status(self, value):
+            if "Collector died" not in value:
+                return
+            raise KeyboardInterrupt("logger status failed")
+
+    class _CleanupFailurePipeline(_FakePipeline):
+        _close_failed = False
+        cleanup_close_calls = 0
+
+        def close(self):
+            if self._closed:
+                return
+            self._closed = True
+            type(self).cleanup_close_calls += 1
+            if not type(self)._close_failed:
+                type(self)._close_failed = True
+                raise SystemExit("pipeline close failed")
+
+    _FakePipeline.close_calls = 0
+    _FakeReplayBuffer.diagnostics_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _CleanupFailurePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _CleanupFailureLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
+    real_empty = torch.empty
+
+    def empty_without_cuda(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(device_runner_module.torch, "empty", empty_without_cuda)
+    runner = _make_device_runner(monkeypatch, device="cuda:3", sim_backend="mjwarp")
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_start_collector", lambda *, target_fn, kwargs: None)
+
+    def collector_died(*args, **kwargs):
+        del args, kwargs
+        raise device_runner_module._CollectorDiedError("collector dead test")
+
+    def shutdown_collector():
+        raise KeyboardInterrupt("collector shutdown failed")
+
+    monkeypatch.setattr(runner, "_wait_for_inference_request", collector_died)
+    monkeypatch.setattr(runner, "_shutdown_collector", shutdown_collector)
+
+    with pytest.raises(RuntimeError, match="Collector process died"):
+        runner.learn(max_iterations=1, save_interval=0, log_dir=str(tmp_path))
+
+    assert runner.last_run_summary["status"] == "collector_died"
+    cleanup_errors = runner.last_run_summary["runtime_manifest"]["shutdown"]["cleanup"]["errors"]
+    assert {"type": "KeyboardInterrupt", "message": "logger status failed"} in cleanup_errors
+    assert {"type": "SystemExit", "message": "pipeline close failed"} in cleanup_errors
+    assert {"type": "KeyboardInterrupt", "message": "collector shutdown failed"} in cleanup_errors
+    runner.close()
+
+
 def test_collector_died_learn_refreshes_ingress_after_shutdown(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
