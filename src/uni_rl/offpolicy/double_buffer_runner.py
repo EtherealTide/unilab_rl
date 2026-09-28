@@ -269,6 +269,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         self.replay_pack_executor = "collector_thread"
         self.replay_h2d_submitter = "auto"
         self.replay_transfer_backend: dict[str, object] = {}
+        self.last_run_summary: dict[str, object] | None = None
         self.runtime_manifest = {
             "inference_owner": "learner",
             "collector_actor": False,
