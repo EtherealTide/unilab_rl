@@ -772,6 +772,28 @@ def test_tensorboard_and_wandb_use_the_same_canonical_payload(
     assert wandb_calls[0]["payload"]["Loss/actor"] == pytest.approx(2.0)
 
 
+def test_offpolicy_replay_ingress_diagnostics_use_canonical_backend_payload() -> None:
+    logger = OffPolicyLogger(log_backend="none")
+    writer = _BatchedWriter()
+    logger._tb_writer = writer
+
+    logger.log_step(
+        iteration=1,
+        metrics={
+            "Train/replay_ingress_depth": 2.0,
+            "Train/replay_ingress_occupancy": 2.0,
+            "Train/replay_ingress_high_water": 2.0,
+            "Train/replay_ingress_backpressure_wait_ms": 250.0,
+            "Train/replay_ingress_dropped_batches": 1.0,
+        },
+    )
+
+    backend_scalars = _batched_scalar_map(writer)
+    assert backend_scalars["Train/replay_ingress_depth"] == pytest.approx(2.0)
+    assert backend_scalars["Train/replay_ingress_backpressure_wait_ms"] == pytest.approx(250.0)
+    assert backend_scalars["Train/replay_ingress_dropped_batches"] == pytest.approx(1.0)
+
+
 def test_onpolicy_tensorboard_and_wandb_use_the_same_canonical_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

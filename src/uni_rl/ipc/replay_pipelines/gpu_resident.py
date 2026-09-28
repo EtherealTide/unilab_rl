@@ -200,6 +200,7 @@ class GPUResidentReplayPipeline:
         self._submission_lock = threading.Lock()
         self._submitted_ptr = 0
         self._visible_ptr = 0
+        self._ingress_high_water = replay_buffer.ingress_diagnostics()["high_water_occupancy"]
 
         self._hot = 0
         self._cold = 1
@@ -230,6 +231,7 @@ class GPUResidentReplayPipeline:
 
     @property
     def transfer_manifest(self) -> dict[str, object]:
+        ingress_diagnostics = self.ingress_diagnostics()
         return {
             "backend": type(self._transfer_backend).__name__,
             "device": str(self._device),
@@ -245,10 +247,23 @@ class GPUResidentReplayPipeline:
             "storage_bytes": int(self._gpu_storage.numel() * self._gpu_storage.element_size()),
             "host_storage_bytes": self._replay_buffer.host_storage_bytes,
             "ingress_depth": self._replay_buffer._ingress_depth,
+            "ingress_slot_rows": self._replay_buffer._ingress_slot_rows,
+            "ingress_diagnostics": ingress_diagnostics,
             "h2d_submitter": self.h2d_submitter,
             "device_submission_thread": "learner" if self._main_thread_submission else "daemon",
             "ring_depth": 2,
         }
+
+    def ingress_diagnostics(self) -> dict[str, int | float]:
+        """Return host-metadata replay ingress diagnostics and pipeline high-water."""
+        diagnostics = self._replay_buffer.ingress_diagnostics()
+        self._ingress_high_water = max(
+            int(self._ingress_high_water),
+            int(diagnostics["high_water_occupancy"]),
+            int(diagnostics["occupancy"]),
+        )
+        diagnostics["high_water_occupancy"] = self._ingress_high_water
+        return diagnostics
 
     # -- batch views ----------------------------------------------------------
 
@@ -345,6 +360,7 @@ class GPUResidentReplayPipeline:
                     source=source,
                     ingress_slot=slot,
                 )
+                self.ingress_diagnostics()
                 submitted = True
 
     def _submit_span_copy(

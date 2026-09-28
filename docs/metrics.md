@@ -88,6 +88,10 @@ metrics.
   `observation[t] -> action[t] -> transition[t] -> observation[t+1]` dependency
   can legally use only one outstanding request even when the configured ring
   capacity is greater.
+- GPU-resident replay reports configured ingress depth, live/high-water
+  occupancy, cumulative producer backpressure wait, and early-return drops under
+  `Train/replay_ingress_*`. These snapshots use host-shared sequence and counter
+  metadata only and never synchronize or copy a device ingress tensor.
 
 Learner main-thread phases are mutually exclusive. Nested inference and
 env-step diagnostics are descriptions, not additional slices of the parent

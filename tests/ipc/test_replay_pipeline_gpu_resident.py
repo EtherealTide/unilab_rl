@@ -220,6 +220,14 @@ class TestGPUResidentPipeline:
         assert pipeline.transfer_manifest["storage_owner"] == "device"
         assert pipeline.transfer_manifest["host_storage_bytes"] == rb.host_storage_bytes
         assert pipeline.transfer_manifest["ingress_depth"] == 2
+        assert pipeline.transfer_manifest["ingress_slot_rows"] == 16
+        diagnostics = pipeline.transfer_manifest["ingress_diagnostics"]
+        assert diagnostics["ingress_depth"] == 2
+        assert diagnostics["ingress_slot_rows"] == 16
+        assert diagnostics["published_sequence"] == 1
+        assert diagnostics["release_sequence"] == 1
+        assert diagnostics["occupancy"] == 0
+        assert diagnostics["high_water_occupancy"] == 1
 
     def test_bounded_ingress_ring_wrap_and_committed_field_order(self, pipeline_factory):
         rb = _make_bounded_replay(capacity=32, slot_rows=8)

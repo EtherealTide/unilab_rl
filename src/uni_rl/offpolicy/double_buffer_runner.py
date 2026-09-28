@@ -8,7 +8,7 @@ import statistics
 import time
 import warnings
 from collections import defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -480,6 +480,52 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         if sync_calls > 0:
             iter_metrics["Perf/dp_gradient_sync_ms_per_rank"].append(sync_time * 1000.0)
             iter_metrics["Perf/dp_gradient_sync_calls_per_rank"].append(float(sync_calls))
+
+    @staticmethod
+    def _replay_ingress_metrics(replay_pipeline) -> dict[str, float]:
+        """Snapshot host-only bounded ingress gauges/counters for one log step."""
+        diagnostics_method = getattr(replay_pipeline, "ingress_diagnostics", None)
+        if not callable(diagnostics_method):
+            return {}
+        diagnostics = cast(Mapping[str, int | float], diagnostics_method())
+        return {
+            "Train/replay_ingress_depth": float(diagnostics["ingress_depth"]),
+            "Train/replay_ingress_occupancy": float(diagnostics["occupancy"]),
+            "Train/replay_ingress_high_water": float(diagnostics["high_water_occupancy"]),
+            "Train/replay_ingress_backpressure_wait_ms": float(diagnostics["backpressure_wait_s"])
+            * 1000.0,
+            "Train/replay_ingress_dropped_batches": float(diagnostics["dropped_batches"]),
+        }
+
+    def _update_replay_ingress_manifest(
+        self,
+        logger: OffPolicyLogger,
+        replay_pipeline,
+    ) -> None:
+        diagnostics_method = getattr(replay_pipeline, "ingress_diagnostics", None)
+        if not callable(diagnostics_method):
+            return
+        diagnostics = diagnostics_method()
+        self.runtime_manifest["replay_ingress"] = diagnostics
+        logger.update_runtime_manifest({"replay_ingress": diagnostics})
+
+    def _record_final_replay_ingress_diagnostics(
+        self,
+        logger: OffPolicyLogger,
+        replay_buffer,
+    ) -> None:
+        diagnostics_method = getattr(replay_buffer, "ingress_diagnostics", None)
+        if not callable(diagnostics_method):
+            return
+        diagnostics = diagnostics_method()
+        self.runtime_manifest["replay_ingress"] = diagnostics
+        logger_runtime_manifest = getattr(logger, "_runtime_manifest", None)
+        if isinstance(logger_runtime_manifest, dict):
+            logger_runtime_manifest["replay_ingress"] = diagnostics
+        if isinstance(self.last_run_summary, dict):
+            summary_manifest = self.last_run_summary.get("runtime_manifest")
+            if isinstance(summary_manifest, dict):
+                summary_manifest["replay_ingress"] = diagnostics
 
     def _aggregate_log_statistics(
         self,
@@ -1123,11 +1169,19 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "transfer_manifest",
             {},
         )
+        ingress_diagnostics_method = getattr(
+            replay_pipeline,
+            "ingress_diagnostics",
+            None,
+        )
         self.runtime_manifest.update(
             {
                 "replay_h2d_submitter": self.replay_h2d_submitter,
                 "replay_device_submission_thread": self.replay_transfer_backend.get(
                     "device_submission_thread"
+                ),
+                "replay_ingress": (
+                    ingress_diagnostics_method() if callable(ingress_diagnostics_method) else {}
                 ),
             }
         )
@@ -1641,6 +1695,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 logger.update_buffer_utilization(write_read_ema)
 
                 avg_metrics = {k: statistics.mean(v) for k, v in iter_metrics.items() if v}
+                avg_metrics.update(self._replay_ingress_metrics(replay_pipeline))
+                self._update_replay_ingress_manifest(logger, replay_pipeline)
                 mean_return_reports10 = statistics.mean(reward_history) if reward_history else None
 
                 self._sync_logger_replay_counters(logger, replay_buffer)
@@ -1719,6 +1775,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
             # -- finalize --
             replay_pipeline.close()
+            self._record_final_replay_ingress_diagnostics(logger, replay_buffer)
             final_ckpt_path = os.path.join(log_dir, f"model_{max_iterations}.pt")
             if ckpt_path != final_ckpt_path:
                 saved_path = self._save_checkpoint(
@@ -1759,6 +1816,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             # Learner stop/death must release the collector even when the active
             # exception is unrelated to collector liveness.
             self._shutdown_collector()
+            self._record_final_replay_ingress_diagnostics(logger, replay_buffer)
 
     @staticmethod
     def _make_summary(
