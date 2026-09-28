@@ -18,6 +18,10 @@ from uni_rl.utils.device import get_default_device
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
 from uni_rl.utils.seed import apply_training_seed
+from uni_rl.utils.tensor_runtime import (
+    resolve_collector_metrics_interval,
+    resolve_inference_slot_capacity,
+)
 
 if TYPE_CHECKING:
     from uni_rl.ipc.dp_sync import DpParameterSync
@@ -54,6 +58,11 @@ def build_warpsac_double_buffer_runner(
     if replay_prefetch_mode != "one_tick":
         raise ValueError("WarpSAC device replay requires replay_prefetch_mode='one_tick'")
     _validate_warpsac_runtime(cfg)
+    inference_slot_capacity = resolve_inference_slot_capacity(cfg, algo_name="WarpSAC")
+    collector_metrics_interval = resolve_collector_metrics_interval(
+        cfg,
+        algo_name="WarpSAC",
+    )
 
     if "inference_request_timeout_sec" in cfg.training:
         warnings.warn(
@@ -139,6 +148,8 @@ def build_warpsac_double_buffer_runner(
         collector_cpu_ids=collector_cpu_ids,
         dp_sync=dp_sync,
         backend_device_binder=backend_device_binder,
+        inference_slot_capacity=inference_slot_capacity,
+        collector_metrics_interval=collector_metrics_interval,
         log_interval=int(cfg.training.log_interval),
         replay_pipeline_factory=partial(
             WarpSACReplayPipeline,

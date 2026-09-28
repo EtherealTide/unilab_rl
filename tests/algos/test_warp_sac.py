@@ -209,6 +209,8 @@ def test_warpsac_builder_uses_regime_aware_replay_factory(
                 "trace_thread_time": False,
                 "trace_cuda_events": False,
                 "log_interval": 2,
+                "inference_slot_capacity": 3,
+                "collector_metrics_interval": 7,
             },
             "algo": {
                 "num_envs": 4,
@@ -272,6 +274,8 @@ def test_warpsac_builder_uses_regime_aware_replay_factory(
     assert runner.kwargs["algo_type"] == "warpsac"
     assert runner.kwargs["policy_before_critic"] is True
     assert runner.kwargs["target_frequency"] == 1
+    assert runner.kwargs["inference_slot_capacity"] == 3
+    assert runner.kwargs["collector_metrics_interval"] == 7
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only inherited whole-cycle graph")
