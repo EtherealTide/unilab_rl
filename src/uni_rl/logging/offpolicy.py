@@ -20,6 +20,7 @@ from uni_rl.logging.metric_schema import (
     reward_term_key,
     validate_metric_tags,
 )
+from uni_rl.logging.runtime_manifest_schema import RUNTIME_MANIFEST_SCHEMA_VERSION
 
 _COLLECTOR_WAIT_TIMING_SPEC = (
     "Perf/learner_collector_wait_ms",
@@ -496,6 +497,19 @@ class OffPolicyLogger(BaseTrainingLogger):
         self._buffer_utilization = float(utilization)
 
     def update_runtime_manifest(self, manifest: dict[str, Any]) -> None:
+        schema_version = manifest.get("schema_version")
+        if schema_version is not None and schema_version != RUNTIME_MANIFEST_SCHEMA_VERSION:
+            raise ValueError(
+                "unsupported runtime_manifest.schema_version "
+                f"{schema_version}; expected {RUNTIME_MANIFEST_SCHEMA_VERSION}"
+            )
+        existing_version = self._runtime_manifest.get("schema_version")
+        if (
+            existing_version is not None
+            and schema_version is not None
+            and existing_version != schema_version
+        ):
+            raise ValueError("runtime_manifest.schema_version cannot change during a run")
         self._runtime_manifest.update(manifest)
 
     def log_collector(self, total_steps: int, buffer_size: int):
