@@ -1898,6 +1898,15 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
             # -- finalize --
             self._shutdown_recorder.set_phase(
+                owner="learner", phase="finalize/collector_quiesce", iteration=iteration
+            )
+            # Stop the collector before closing the replay pipeline. The
+            # collector may already be inside its final vectorized transition
+            # when the learner reaches max_iterations; quiescing it first lets
+            # that in-flight publication finish, after which pipeline.close()
+            # can drain and release every published replay-ingress slot.
+            self._shutdown_collector()
+            self._shutdown_recorder.set_phase(
                 owner="learner", phase="finalize/replay_pipeline_close", iteration=iteration
             )
             replay_pipeline.close()
