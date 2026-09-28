@@ -506,7 +506,7 @@ def test_mjwarp_collector_start_forwards_learner_device(
     monkeypatch.setattr(runner, "_start_collector", capture_collector)
     runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
 
-    assert _FakeReplayBuffer.diagnostics_calls == 2
+    assert _FakeReplayBuffer.diagnostics_calls == 4
     assert runner.last_run_summary["status"] == "completed"
     diagnostics = runner.last_run_summary["runtime_manifest"]["replay_ingress"]
     assert diagnostics["occupancy"] == 0
@@ -572,8 +572,13 @@ def test_learn_failure_before_summary_preserves_original_error(
         runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
 
     assert not isinstance(excinfo.value, AttributeError)
-    assert _FakeReplayBuffer.diagnostics_calls == 2
-    assert runner.last_run_summary is None
+    assert _FakeReplayBuffer.diagnostics_calls == 4
+    assert runner.last_run_summary["status"] == "failed"
+    shutdown = runner.last_run_summary["runtime_manifest"]["shutdown"]
+    assert shutdown["classification"] == "learner_failure"
+    assert shutdown["owner"] == "learner"
+    assert shutdown["phase"] == "finalize/logger_finish"
+    assert shutdown["exception"] == {"type": "RuntimeError", "message": "finish failed"}
     assert runner.runtime_manifest["replay_ingress"]["occupancy"] == 0
     assert _FinishFailureLogger.last_instance._runtime_manifest["replay_ingress"]["occupancy"] == 0
     assert _FakePipeline.close_calls == 1
@@ -647,13 +652,18 @@ def test_collector_died_learn_refreshes_ingress_after_shutdown(
         runner.learn(max_iterations=1, save_interval=0, log_dir=str(tmp_path))
 
     assert not isinstance(excinfo.value, AttributeError)
-    assert diagnostics_after_shutdown == [True]
+    assert diagnostics_after_shutdown == [True, True]
     assert runner._shutdown_seen is True
     assert runner.last_run_summary["status"] == "collector_died"
     diagnostics = runner.last_run_summary["runtime_manifest"]["replay_ingress"]
     assert diagnostics["occupancy"] == 0
     assert diagnostics["published_sequence"] == diagnostics["release_sequence"]
     assert diagnostics["stop_returns"] == 1
+    shutdown = runner.last_run_summary["runtime_manifest"]["shutdown"]
+    assert shutdown["classification"] == "collector_failure"
+    assert shutdown["owner"] == "collector"
+    assert shutdown["phase"] == "training/wait_for_inference_request"
+    assert shutdown["coordination_tick"] is None
     assert _FakePipeline.close_calls == 1
 
 
