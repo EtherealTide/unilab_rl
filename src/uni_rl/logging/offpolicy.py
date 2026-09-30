@@ -101,11 +101,15 @@ _COLLECTOR_TIMING_SPECS = {
     "inference_request_ms": (1.0, "Inference Request", "cycle_phase"),
     "learner_action_wait_ms": (1.1, "Learner Action Wait", "cycle_phase"),
     "env_step_ms": (2.0, "Env Step", "cycle_phase"),
+    "env_step_action_validate_ms": (2.05, "  Action Validate", "env_step_detail"),
+    "env_step_apply_action_ms": (2.08, "  Apply Action", "env_step_detail"),
     "env_step_action_backend_ms": (2.1, "  Action+Backend", "env_step_detail"),
     "env_step_backend_ms": (2.1, "  Backend Step", "env_step_detail"),
     "env_step_update_state_ms": (2.2, "  Update State", "env_step_detail"),
     "env_step_reset_done_ms": (2.3, "  Reset Done", "env_step_detail"),
+    "transition_extract_ms": (2.4, "Transition Extract", "cycle_phase"),
     "replay_write_ms": (3.0, "Replay Write", "cycle_phase"),
+    "metrics_publish_ms": (4.0, "Metrics Publish", "cycle_phase"),
     "rollout_ms": (9.0, "Rollout Wall", "rollout_total"),
 }
 
@@ -123,6 +127,8 @@ _COLLECTOR_INFERENCE_TAG_SPECS: dict[str, str | None] = {
 }
 
 OFFPOLICY_ENV_STEP_DETAIL_KEYS = (
+    "env_step_action_validate_ms",
+    "env_step_apply_action_ms",
     "env_step_action_backend_ms",
     "env_step_backend_ms",
     "env_step_update_state_ms",
