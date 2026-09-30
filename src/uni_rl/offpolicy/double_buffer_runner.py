@@ -416,15 +416,24 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
     ) -> None:
         """Fail closed before collector spawn on an incoherent topology."""
         expected_learner = str(learner_device)
-        if placement.learner_device != expected_learner:
+        placement_learner = placement.learner_device
+        expected_device = torch.device(expected_learner)
+        placement_device = torch.device(placement_learner)
+        same_device = placement_device == expected_device or (
+            expected_device.type == "cuda"
+            and expected_device.index is None
+            and placement_device.type == "cuda"
+            and placement_device.index == torch.cuda.current_device()
+        )
+        if not same_device:
             raise ValueError(
                 "inference_placement learner device must match the runner device: "
-                f"{placement.learner_device!r} != {expected_learner!r}"
+                f"{placement_learner!r} != {expected_learner!r}"
             )
         if placement.mode is InferenceTransport.CUDA:
             ring = torch.device(placement.ring_device)
             env = torch.device(placement.env_device)
-            learner = torch.device(expected_learner)
+            learner = placement_device
             if learner.type != "cuda":
                 raise ValueError(
                     "CUDA inference transport requires a CUDA runner device; "
@@ -1668,6 +1677,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "trace_enabled": self.trace_enabled,
                 "trace_thread_time": self.trace_thread_time,
                 "nan_guard_cfg": self.nan_guard_cfg,
+                "nan_guard_factory": self.nan_guard_factory,
                 "torch_thread_runtime": self.torch_thread_runtime,
                 "backend_device_binder": self.backend_device_binder,
                 "learner_coordination": self._learner_coordination,

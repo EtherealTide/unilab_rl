@@ -245,6 +245,7 @@ def off_policy_collector_fn(
     trace_enabled: bool = False,
     trace_thread_time: bool = False,
     nan_guard_cfg=None,
+    nan_guard_factory=None,
     torch_thread_runtime=None,
     backend_device_binder=None,
     learner_coordination: LearnerCoordinationState | None = None,
@@ -276,6 +277,7 @@ def off_policy_collector_fn(
         trace_enabled=trace_enabled,
         trace_thread_time=trace_thread_time,
         nan_guard_cfg=nan_guard_cfg,
+        nan_guard_factory=nan_guard_factory,
         torch_thread_runtime=torch_thread_runtime,
         backend_device_binder=backend_device_binder,
         learner_coordination=learner_coordination,
@@ -304,6 +306,7 @@ def _run_collector(
     inference_epoch=0,
     collector_metrics_interval=1,
     nan_guard_cfg=None,
+    nan_guard_factory=None,
     torch_thread_runtime=None,
     backend_device_binder=None,
     learner_coordination=None,
@@ -355,8 +358,9 @@ def _run_collector(
     if nan_guard_cfg is not None and nan_guard_cfg.enabled:
         from uni_rl.utils.nan_guard import NanGuard
 
+        guard_factory = NanGuard if nan_guard_factory is None else nan_guard_factory
         env.set_nan_guard(
-            NanGuard(
+            guard_factory(
                 nan_guard_cfg,
                 num_envs=env.num_envs,
                 supports_state_playback=env.play_capabilities.supports_physics_state_playback,
