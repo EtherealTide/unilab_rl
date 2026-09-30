@@ -156,5 +156,26 @@ class TraceRecorder:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             events = list(self._events)
-        path.write_text(json.dumps({"traceEvents": events}, ensure_ascii=False), encoding="utf-8")
+        path.write_text(
+            json.dumps(
+                {"traceEvents": events},
+                ensure_ascii=False,
+                default=self._json_default,
+            ),
+            encoding="utf-8",
+        )
         return path
+
+    @staticmethod
+    def _json_default(value: Any) -> Any:
+        """Render diagnostic-only Torch values without changing trace semantics."""
+
+        import torch
+
+        if isinstance(value, torch.device):
+            return str(value)
+        if isinstance(value, torch.dtype):
+            return str(value)
+        if isinstance(value, torch.Tensor):
+            return f"{value.dtype} {tuple(value.shape)} on {value.device}"
+        raise TypeError(f"Trace args contain non-serializable value {type(value).__name__}")
