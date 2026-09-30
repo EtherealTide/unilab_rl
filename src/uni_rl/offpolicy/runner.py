@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, Callable
 
 from uni_rl.algos.common.device import get_env_dims
 from uni_rl.env_contract import EnvFactory
@@ -120,6 +120,7 @@ class OffPolicyRunner(AsyncRunner):
         trace_thread_time: bool = False,
         trace_cuda_events: bool = True,
         nan_guard_cfg: NanGuardCfg | None = None,
+        nan_guard_factory: Callable[[NanGuardCfg, int, bool], Any] | None = None,
         torch_thread_runtime: dict[str, Any] | None = None,
         actor_adapter_modules: Iterable[str] | None = None,
         log_interval: int = 1,
@@ -159,6 +160,7 @@ class OffPolicyRunner(AsyncRunner):
         self.trace_thread_time = trace_thread_time
         self.trace_cuda_events = trace_cuda_events
         self.nan_guard_cfg = nan_guard_cfg
+        self.nan_guard_factory = nan_guard_factory
         self.torch_thread_runtime = torch_thread_runtime
         self.log_interval = max(1, int(log_interval))
         # Dotted modules whose import registers custom off-policy actor

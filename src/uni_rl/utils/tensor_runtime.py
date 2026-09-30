@@ -200,7 +200,10 @@ def _canonical_device(value: str, *, label: str, algo_name: str) -> str:
     except (RuntimeError, TypeError) as exc:
         raise ValueError(f"{algo_name} {label} is not a Torch device: {value!r}") from exc
     if device.type == "cuda" and device.index is None:
-        return "cuda"
+        try:
+            return f"cuda:{torch.cuda.current_device()}"
+        except RuntimeError:
+            return "cuda"
     return str(device)
 
 

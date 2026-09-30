@@ -1305,9 +1305,14 @@ def test_runner_collector_resources_follow_tensor_runtime_capability(
     assert tensor_budget["replay_ingress_slot_rows"] == 1
     assert manifest["collector_metrics_interval"] == 1
     assert manifest["runtime_limits"]["replay_ingress_slot_rows"]["effective"] == 1
+    if torch.device(expected_device).type == "cuda":
+        expected_device = "cuda:0"
+    expected_learner = expected_device
+    if not collector_tensor_native:
+        expected_learner = "cuda:0"
+    assert manifest["learner_device"] == expected_learner
     assert manifest["inference_ring_device"] == expected_device
     assert manifest["env_public_device"] == expected_device
-    assert manifest["learner_device"] == "cuda"
     assert manifest["inference_staging_policy"] == (
         "cuda_no_host_boundary"
         if collector_tensor_native
@@ -1317,7 +1322,7 @@ def test_runner_collector_resources_follow_tensor_runtime_capability(
         "mode": "cuda" if collector_tensor_native else "cpu",
         "env_device": expected_device,
         "ring_device": expected_device,
-        "learner_device": "cuda",
+        "learner_device": expected_learner,
         "staging_policy": (
             "cuda_no_host_boundary"
             if collector_tensor_native
@@ -1327,7 +1332,7 @@ def test_runner_collector_resources_follow_tensor_runtime_capability(
     env_override = collector_kwargs["env_cfg_override"]
     if collector_tensor_native:
         assert env_override["tensor_runtime"] is True
-        assert env_override["tensor_runtime_device"] == "cuda"
+        assert env_override["tensor_runtime_device"] == expected_device
     else:
         assert env_override is None or "tensor_runtime" not in env_override
     assert collector_kwargs["inference_epoch"] == 0
