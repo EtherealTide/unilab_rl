@@ -2320,6 +2320,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "metric_schema_version": METRIC_SCHEMA_VERSION,
             "runtime_manifest": dict(getattr(logger, "_runtime_manifest", {})),
             "final_env_steps_per_sec": logger._get_iter_env_steps_per_sec(),
+            "tail_env_steps_per_sec": logger._get_tail_env_steps_per_sec(),
+            "tail_iteration_count": len(getattr(logger, "_tail_iteration_times", ())),
             "final_learner_replay_rows_per_sec": (logger._get_learner_replay_rows_per_sec()),
             "final_cycle_wall_ms": logger._get_iter_wall_time() * 1000.0,
             "final_inference_ms": getattr(logger, "_inference_time", 0.0) * 1000.0,

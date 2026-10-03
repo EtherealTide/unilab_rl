@@ -243,6 +243,11 @@ class OffPolicyLogger(BaseTrainingLogger):
         self._inference_time: float = 0.0
         self._iteration_time: float | None = None
         self._throughput_env_steps: int = 0
+        # Keep a bounded tail window for a stable end-to-end throughput gate.
+        # The final single iteration is intentionally not authoritative: one
+        # iteration can absorb asynchronous collector/learner jitter.
+        self._tail_iteration_times: deque[float] = deque(maxlen=20)
+        self._tail_throughput_env_steps = 0
         self._env_steps_per_sec_override: float | None = None
         self._learner_replay_rows_per_sec_override: float | None = None
         self._batch_size_per_rank: int = 0
@@ -299,6 +304,18 @@ class OffPolicyLogger(BaseTrainingLogger):
         if iter_time is None or iter_time <= 0:
             return None
         return self._throughput_env_steps / iter_time
+
+    def _get_tail_env_steps_per_sec(self) -> float | None:
+        """Aggregate env throughput over the bounded recent-iteration window."""
+        if not self._tail_iteration_times:
+            return None
+        # The first queued sample predates this iteration's freshly assigned
+        # step count only when the queue was empty; use the current aggregate,
+        # which is exact after the per-iteration enqueue above.
+        elapsed = sum(self._tail_iteration_times)
+        if elapsed <= 0.0 or self._tail_throughput_env_steps <= 0:
+            return None
+        return self._tail_throughput_env_steps / elapsed
 
     def _get_learner_replay_rows_per_sec(self) -> float | None:
         if self._learner_replay_rows_per_sec_override is not None:
@@ -575,6 +592,9 @@ class OffPolicyLogger(BaseTrainingLogger):
         self._has_iteration_extra_info = extra_info is not None
         if extra_info:
             self._throughput_env_steps = int(extra_info.get("throughput_steps", 0))
+        else:
+            self._throughput_env_steps = 0
+        if extra_info:
             steps_per_sec = extra_info.get("env_steps_per_sec")
             self._env_steps_per_sec_override = (
                 float(steps_per_sec) if steps_per_sec is not None else None
@@ -595,12 +615,16 @@ class OffPolicyLogger(BaseTrainingLogger):
                 extra_info.get("learner_replay_rows_per_iter", 0)
             )
         else:
-            self._throughput_env_steps = 0
             self._env_steps_per_sec_override = None
             self._learner_replay_rows_per_sec_override = None
             self._batch_size_per_rank = 0
             self._effective_batch_size = 0
             self._learner_replay_rows_per_iter = 0
+        if iteration_time is not None and iteration_time > 0.0:
+            if len(self._tail_iteration_times) == self._tail_iteration_times.maxlen:
+                self._tail_throughput_env_steps -= self._throughput_env_steps
+            self._tail_iteration_times.append(float(iteration_time))
+            self._tail_throughput_env_steps += self._throughput_env_steps
         if metrics:
             self._latest_metrics.update(metrics)
         if reward_components:

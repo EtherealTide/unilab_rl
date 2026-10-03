@@ -423,6 +423,9 @@ class _FakeLogger:
     def _get_learner_replay_rows_per_sec(self):
         return None
 
+    def _get_tail_env_steps_per_sec(self):
+        return None
+
     def _get_iter_wall_time(self):
         return 0.0
 
