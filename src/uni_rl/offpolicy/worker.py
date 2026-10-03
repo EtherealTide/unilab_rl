@@ -338,23 +338,20 @@ def _run_collector(
         )
     if "inference_transport" in (env_cfg_override or {}):
         raise ValueError("Collector env override must not set inference_transport")
-    tensor_runtime_requested = bool((env_cfg_override or {}).get("tensor_runtime", False))
+    tensor_runtime_requested = requested_transport == "cuda"
     if tensor_runtime_requested:
-        public_device = (env_cfg_override or {}).get("tensor_runtime_device")
-        if not isinstance(public_device, str) or not public_device.strip():
-            raise ValueError(
-                "tensor_runtime collector env override must include tensor_runtime_device"
-            )
-        if torch.device(public_device).type != "cuda":
-            raise ValueError(
-                f"tensor_runtime collector env override must request CUDA; got {public_device!r}"
-            )
-        if inference_slot is None or inference_slot.device != torch.device(public_device):
+        if inference_slot is None or inference_slot.device.type != "cuda":
             ring_device = getattr(inference_slot, "device", None)
             raise ValueError(
-                "CUDA collector inference ring and env public device differ: "
-                f"ring={ring_device}, env={public_device}"
+                f"CUDA collector inference requires a CUDA inference ring; got ring={ring_device}"
             )
+    if "tensor_runtime" in (env_cfg_override or {}) or "tensor_runtime_device" in (
+        env_cfg_override or {}
+    ):
+        raise ValueError(
+            "Collector env override must not set removed tensor_runtime fields; "
+            "inference transport is an explicit worker argument"
+        )
     if nan_guard_cfg is not None and nan_guard_cfg.enabled:
         from uni_rl.utils.nan_guard import NanGuard
 

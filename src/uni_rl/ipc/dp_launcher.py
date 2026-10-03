@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
+import torch
+
 UNILAB_DP_RANK = "UNILAB_DP_RANK"
 UNILAB_DP_WORLD_SIZE = "UNILAB_DP_WORLD_SIZE"
 UNILAB_DP_LOG_DIR = "UNILAB_DP_LOG_DIR"
@@ -86,10 +88,26 @@ def rank_local_cuda_device(
     single entry can come either from an ordinary user launch or from
     :class:`DpRankSupervisor`; in both cases every in-process consumer must use
     the local index zero rather than a host-global index.
+
+    On a host with exactly one visible CUDA device, leaving the variable unset
+    is equivalent to a one-entry mask: the rank owns local ordinal zero. This
+    honors the documented single-GPU launch contract without guessing on a
+    multi-GPU host.
     """
     entries = visible_cuda_entries(current_visible_devices)
-    if len(entries) != 1:
-        return None
+    if entries:
+        if len(entries) != 1:
+            raise ValueError(
+                "A CUDA rank must own exactly one CUDA_VISIBLE_DEVICES entry; got "
+                f"{','.join(entries)!r}"
+            )
+    else:
+        try:
+            visible_to_torch = torch.cuda.is_available() and torch.cuda.device_count() == 1
+        except RuntimeError:
+            visible_to_torch = False
+        if not visible_to_torch:
+            return None
     if int(rank) < 0:
         raise ValueError(f"rank must be non-negative, got {rank}")
     return "cuda:0"
