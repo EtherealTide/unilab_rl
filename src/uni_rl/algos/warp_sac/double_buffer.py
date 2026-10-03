@@ -61,6 +61,13 @@ def build_warpsac_double_buffer_runner(
     if replay_prefetch_mode != "one_tick":
         raise ValueError("WarpSAC device replay requires replay_prefetch_mode='one_tick'")
     _validate_warpsac_runtime(cfg)
+    # Resolve public tensor-runtime bounds before constructing a one-env probe.
+    # Invalid training knobs must fail closed without materializing a backend.
+    tensor_runtime_settings = resolve_tensor_runtime_settings(
+        cfg,
+        algo_name="WarpSAC",
+        num_envs=cfg.algo.num_envs,
+    )
     probe_env = env_factory(1, env_cfg_override)
     try:
         probe_state = probe_env.init_state()
@@ -75,11 +82,6 @@ def build_warpsac_double_buffer_runner(
         device=device,
         algo_name="WarpSAC",
         env_tensor_native=env_tensor_native,
-    )
-    tensor_runtime_settings = resolve_tensor_runtime_settings(
-        cfg,
-        algo_name="WarpSAC",
-        num_envs=cfg.algo.num_envs,
     )
 
     if "inference_request_timeout_sec" in cfg.training:

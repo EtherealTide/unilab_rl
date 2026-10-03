@@ -12,12 +12,16 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import torch
 from omegaconf import OmegaConf
 
 
 class _FakeEnv:
     obs_groups_spec = {"obs": 4, "critic": 6}
     action_space = SimpleNamespace(shape=(2,))
+
+    def init_state(self):
+        return SimpleNamespace(obs={"obs": torch.zeros((1, 4)), "critic": torch.zeros((1, 6))})
 
     def close(self):
         return None
@@ -348,7 +352,7 @@ def test_sac_builder_resolves_tensor_runtime_before_collector_spawn(
     assert runner.kwargs["inference_placement"].mode.value == "cpu"
 
 
-def test_sac_builder_rejects_tensor_runtime_on_cpu(
+def test_sac_builder_resolves_transport_on_cpu_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import uni_rl.algos.fast_sac.double_buffer as module
@@ -356,18 +360,17 @@ def test_sac_builder_rejects_tensor_runtime_on_cpu(
     monkeypatch.setattr(module, "FastSACLearner", _FakeLearner)
     monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
     cfg = _sac_cfg()
-    cfg.env = {"tensor_runtime": True}
 
-    with pytest.raises(
-        ValueError, match="FastSAC CUDA inference transport requires CUDA env and learner devices"
-    ):
-        module.build_sac_double_buffer_runner(
-            cfg,
-            env_factory=_fake_env_factory,
-            env_cfg_override=None,
-            replay_prefetch_mode="one_tick",
-            device="cpu",
-        )
+    runner = module.build_sac_double_buffer_runner(
+        cfg,
+        env_factory=_fake_env_factory,
+        env_cfg_override=None,
+        replay_prefetch_mode="one_tick",
+        device="cpu",
+    )
+
+    assert runner.kwargs["inference_placement"].mode.value == "cpu"
+    assert runner.kwargs["inference_placement"].collector_tensor_native is False
 
 
 def test_flashsac_builder_rejects_tensor_runtime_on_cpu(
@@ -380,7 +383,8 @@ def test_flashsac_builder_rejects_tensor_runtime_on_cpu(
     cfg.env = {"tensor_runtime": True}
 
     with pytest.raises(
-        ValueError, match="CUDA inference transport requires CUDA env and learner devices"
+        ValueError,
+        match="Off-policy training requires a CUDA or MPS learner device",
     ):
         module.build_flashsac_double_buffer_runner(
             cfg,
