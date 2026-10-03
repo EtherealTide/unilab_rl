@@ -120,17 +120,7 @@ def resolve_dp_rank_device(rank: int = 0) -> str | None:
     rank-local ``cuda:0``; opaque parent UUID/MIG tokens never become in-process
     CUDA indices.
     """
-    if int(rank) < 0:
-        raise ValueError(f"rank must be non-negative, got {rank}")
-    entries = visible_cuda_entries()
-    if len(entries) == 1:
-        return "cuda:0"
-    if entries:
-        raise ValueError(
-            "A CUDA data-parallel rank must own exactly one CUDA_VISIBLE_DEVICES entry; "
-            f"got {','.join(entries)!r}"
-        )
-    return None
+    return rank_local_cuda_device(rank=rank)
 
 
 def current_dp_world_size() -> int:
