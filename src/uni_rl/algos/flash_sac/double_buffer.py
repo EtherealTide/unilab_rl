@@ -59,6 +59,13 @@ def build_flashsac_double_buffer_runner(
         cfg,
         replay_prefetch_mode=replay_prefetch_mode,
     )
+    # Resolve public tensor-runtime bounds before constructing a one-env probe.
+    # Invalid training knobs must fail closed without materializing a backend.
+    tensor_runtime_settings = resolve_tensor_runtime_settings(
+        cfg,
+        algo_name="FlashSAC",
+        num_envs=cfg.algo.num_envs,
+    )
     probe_env = env_factory(1, env_cfg_override)
     try:
         probe_state = probe_env.init_state()
@@ -73,11 +80,6 @@ def build_flashsac_double_buffer_runner(
         device=device,
         algo_name="FlashSAC",
         env_tensor_native=env_tensor_native,
-    )
-    tensor_runtime_settings = resolve_tensor_runtime_settings(
-        cfg,
-        algo_name="FlashSAC",
-        num_envs=cfg.algo.num_envs,
     )
 
     if "inference_request_timeout_sec" in cfg.training:

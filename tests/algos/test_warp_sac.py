@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -178,6 +179,9 @@ class _FakeEnv:
 
     class action_space:
         shape = (2,)
+
+    def init_state(self) -> SimpleNamespace:
+        return SimpleNamespace(obs={"obs": torch.zeros((1, 4)), "critic": torch.zeros((1, 6))})
 
     def close(self) -> None:
         pass
