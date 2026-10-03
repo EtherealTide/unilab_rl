@@ -1330,11 +1330,11 @@ def test_runner_collector_resources_follow_tensor_runtime_capability(
         ),
     }
     env_override = collector_kwargs["env_cfg_override"]
-    if collector_tensor_native:
-        assert env_override["tensor_runtime"] is True
-        assert env_override["tensor_runtime_device"] == expected_device
-    else:
-        assert env_override is None or "tensor_runtime" not in env_override
+    assert env_override is None or not {
+        "tensor_runtime",
+        "tensor_runtime_device",
+        "inference_transport",
+    } & set(env_override)
     assert collector_kwargs["inference_epoch"] == 0
     assert collector_kwargs["collector_metrics_interval"] == 1
 
@@ -2102,3 +2102,24 @@ def test_dp_metric_reduction_follows_the_metric_schema() -> None:
     assert dp_sync.total["metric::Train/rollouts_read"] == 3.0
     assert payload["metrics"]["Train/rollouts_read"] == pytest.approx(6.0)
     assert payload["checkpoint_return_mean_reports10"] == pytest.approx(5.0)
+
+
+def test_collector_override_never_carries_removed_tensor_runtime_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_device_runner(
+        monkeypatch,
+        env_name="G1MotionTrackingSAC",
+        algo_type="flashsac",
+        device="cuda:0",
+        sim_backend="mjwarp",
+        collector_tensor_native=True,
+    )
+
+    override = runner._collector_env_cfg_override()
+
+    assert override is None or not {
+        "tensor_runtime",
+        "tensor_runtime_device",
+        "inference_transport",
+    } & set(override)

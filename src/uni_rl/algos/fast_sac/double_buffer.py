@@ -6,6 +6,7 @@ import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
+import torch
 from omegaconf import DictConfig, OmegaConf
 
 from uni_rl.algos.fast_sac.learner import FastSACLearner
@@ -47,7 +48,21 @@ def build_sac_double_buffer_runner(
     # forwards the list to the spawn collector.
     actor_adapter_modules = resolve_actor_adapter_modules(rl_cfg, custom_runtime)
     import_actor_adapter_modules(actor_adapter_modules)
-    inference_placement = resolve_inference_transport(cfg, device=device, algo_name="FastSAC")
+    probe_env = env_factory(1, env_cfg_override)
+    try:
+        probe_state = probe_env.init_state()
+        probe_observation = probe_state.obs.get("obs")
+        env_tensor_native = (
+            isinstance(probe_observation, torch.Tensor) and probe_observation.device.type == "cuda"
+        )
+    finally:
+        probe_env.close()
+    inference_placement = resolve_inference_transport(
+        cfg,
+        device=device,
+        algo_name="FastSAC",
+        env_tensor_native=env_tensor_native,
+    )
     tensor_runtime_settings = resolve_tensor_runtime_settings(
         cfg,
         algo_name="FastSAC",

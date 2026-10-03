@@ -124,3 +124,23 @@ def test_supervisor_children_each_receive_one_visible_gpu(
 
     assert len(_FakePopen.calls) == 2
     assert [child.env["CUDA_VISIBLE_DEVICES"] for child in _FakePopen.calls] == ["GPU-b", "GPU-c"]
+
+
+def test_unset_mask_with_one_visible_cuda_device_is_rank_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(dp_launcher.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(dp_launcher.torch.cuda, "device_count", lambda: 1)
+
+    assert rank_local_cuda_device() == "cuda:0"
+
+
+def test_unset_mask_with_multiple_visible_cuda_devices_is_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(dp_launcher.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(dp_launcher.torch.cuda, "device_count", lambda: 2)
+
+    assert rank_local_cuda_device() is None

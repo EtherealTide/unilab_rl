@@ -6,6 +6,7 @@ import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+import torch
 from omegaconf import DictConfig, OmegaConf
 
 from uni_rl.algos.flash_sac.learner import FlashSACLearner
@@ -58,7 +59,21 @@ def build_flashsac_double_buffer_runner(
         cfg,
         replay_prefetch_mode=replay_prefetch_mode,
     )
-    inference_placement = resolve_inference_transport(cfg, device=device, algo_name="FlashSAC")
+    probe_env = env_factory(1, env_cfg_override)
+    try:
+        probe_state = probe_env.init_state()
+        probe_observation = probe_state.obs.get("obs")
+        env_tensor_native = (
+            isinstance(probe_observation, torch.Tensor) and probe_observation.device.type == "cuda"
+        )
+    finally:
+        probe_env.close()
+    inference_placement = resolve_inference_transport(
+        cfg,
+        device=device,
+        algo_name="FlashSAC",
+        env_tensor_native=env_tensor_native,
+    )
     tensor_runtime_settings = resolve_tensor_runtime_settings(
         cfg,
         algo_name="FlashSAC",

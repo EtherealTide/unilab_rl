@@ -1113,11 +1113,11 @@ def test_resolve_offpolicy_actor_priv_info_returns_none_without_adapter() -> Non
     assert resolved is None
 
 
-def test_collector_rejects_cuda_ring_without_tensor_runtime_override() -> None:
+def test_collector_rejects_transport_metadata_in_env_override() -> None:
     stop_event = threading.Event()
     ring = SharedInferenceRing(1, 2, 2, device="cpu")
 
-    with pytest.raises(ValueError, match="Collector env override must not set inference_transport"):
+    with pytest.raises(ValueError, match="Collector env override must not set"):
         worker_module._run_collector(
             stop_event=stop_event,
             env_factory=lambda num_envs, env_cfg_override=None: SimpleNamespace(),
@@ -1143,7 +1143,7 @@ def test_collector_rejects_cuda_transport_with_cpu_ring() -> None:
     stop_event = threading.Event()
     ring = SharedInferenceRing(1, 2, 2, device="cpu")
 
-    with pytest.raises(ValueError, match="ring and env public device differ"):
+    with pytest.raises(ValueError, match="CUDA collector inference requires a CUDA inference ring"):
         worker_module._run_collector(
             stop_event=stop_event,
             env_factory=lambda num_envs, env_cfg_override=None: SimpleNamespace(),
@@ -1157,7 +1157,7 @@ def test_collector_rejects_cuda_transport_with_cpu_ring() -> None:
             metrics_queue=queue.Queue(),
             sim_backend="mujoco",
             backend_device=None,
-            env_cfg_override={"tensor_runtime": True, "tensor_runtime_device": "cuda:0"},
+            env_cfg_override={},
             inference_transport="cuda",
             seed=None,
             trace_enabled=False,

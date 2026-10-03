@@ -988,16 +988,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         # Keep the resolved env public-device request on the same rank-local
         # CUDA device as the ring. Copying here avoids mutating the probe env's
         # opaque owner mapping while still validating it before spawn.
-        if self.inference_placement.mode is InferenceTransport.CPU:
-            override.pop("tensor_runtime", None)
-            override.pop("tensor_runtime_device", None)
-            # This key is process-local transport metadata for the worker. It
-            # is injected below as an explicit collector-only argument rather
-            # than an EnvCfg field, which must remain owned by UniLab.
-            override.pop("inference_transport", None)
-        else:
-            override["tensor_runtime"] = True
-            override["tensor_runtime_device"] = self.inference_placement.env_device
+        override.pop("tensor_runtime", None)
+        override.pop("tensor_runtime_device", None)
+        # Inference transport is process-local metadata, not an EnvCfg field.
+        # The resolved placement reaches the worker only through the explicit
+        # collector argument below; EnvCfg remains owned by UniLab.
+        override.pop("inference_transport", None)
         return override or None
 
     def _wait_for_inference_request(

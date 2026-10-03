@@ -217,6 +217,7 @@ def resolve_inference_placement(
     transport: str | None = None,
     tensor_runtime: bool = False,
     tensor_runtime_device: str | None = None,
+    env_tensor_native: bool | None = None,
     algo_name: str,
 ) -> InferencePlacement:
     """Resolve one explicit topology and reject mixed placement before spawn.
@@ -233,18 +234,22 @@ def resolve_inference_placement(
             f"{algo_name} env.tensor_runtime_device must be a string or omitted, "
             f"got {tensor_runtime_device!r}"
         )
+    if env_tensor_native is None and tensor_runtime_device is not None:
+        env_tensor_native = True
+    if env_tensor_native is None and tensor_runtime:
+        env_tensor_native = True
+    if env_tensor_native is None and transport == InferenceTransport.CUDA.value:
+        env_tensor_native = True
+    if env_tensor_native is None:
+        env_tensor_native = False
     requested_env_device = tensor_runtime_device
-    if tensor_runtime and requested_env_device is None:
-        requested_env_device = learner
-    elif tensor_runtime_device is not None:
-        tensor_runtime = True
-    if transport == InferenceTransport.CUDA.value and requested_env_device is None:
+    if env_tensor_native and requested_env_device is None:
         requested_env_device = learner
     if requested_env_device is None:
         requested_env_device = "cpu"
     env_resolved = _canonical_device(requested_env_device, label="env device", algo_name=algo_name)
 
-    if tensor_runtime and transport is None:
+    if env_tensor_native and transport is None:
         transport = InferenceTransport.CUDA.value
     elif transport is None:
         transport = InferenceTransport.CPU.value
@@ -256,9 +261,9 @@ def resolve_inference_placement(
             f"{algo_name} inference transport must be one of {{'cuda', 'cpu'}}, got {transport!r}"
         )
 
-    if tensor_runtime and transport == InferenceTransport.CPU.value:
+    if env_tensor_native and transport == InferenceTransport.CPU.value:
         raise ValueError(
-            f"{algo_name} requests CUDA env.tensor_runtime with CPU inference transport"
+            f"{algo_name} requests CUDA tensor-native env observations with CPU inference transport"
         )
 
     if transport == InferenceTransport.CUDA.value:
@@ -317,6 +322,7 @@ def resolve_inference_transport(
     *,
     device: str,
     algo_name: str,
+    env_tensor_native: bool | None = None,
 ) -> InferencePlacement:
     """Resolve placement from the owner config's single config-source tree."""
     requested_transport = OmegaConf.select(cfg, "training.inference_transport", default=None)
@@ -344,6 +350,7 @@ def resolve_inference_transport(
         transport=requested_transport,
         tensor_runtime=tensor_runtime,
         tensor_runtime_device=env_device,
+        env_tensor_native=env_tensor_native,
         algo_name=algo_name,
     )
 
