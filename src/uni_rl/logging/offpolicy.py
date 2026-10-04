@@ -627,6 +627,8 @@ class OffPolicyLogger(BaseTrainingLogger):
             self._tail_throughput_env_steps += self._throughput_env_steps
         if metrics:
             self._latest_metrics.update(metrics)
+        if return_mean_ep100 is not None:
+            self._reward_history.append(float(return_mean_ep100))
         if reward_components:
             self._latest_reward_components = reward_components
         self._status = "Training"

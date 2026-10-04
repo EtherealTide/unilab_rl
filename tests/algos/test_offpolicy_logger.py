@@ -709,6 +709,17 @@ def test_offpolicy_collector_counters_do_not_update_reward_history() -> None:
     assert not logger._reward_history
 
 
+def test_offpolicy_log_step_return_feeds_terminal_reward_table() -> None:
+    logger = OffPolicyLogger(log_backend="none")
+
+    logger.log_step(iteration=1, metrics={"Loss/critic": 1.0}, return_mean_ep100=2.5)
+
+    assert list(logger._reward_history) == [2.5]
+    reward_cells = list(logger._build_reward_table().columns[0].cells)
+    assert "Waiting for data..." not in reward_cells
+    assert any("Reward" in cell for cell in reward_cells)
+
+
 def test_offpolicy_backend_step_axis_falls_back_to_iteration() -> None:
     logger = OffPolicyLogger(log_backend="none")
     writer = _BatchedWriter()
