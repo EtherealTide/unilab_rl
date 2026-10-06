@@ -119,12 +119,20 @@ def test_reward_terms_are_namespaced_and_reserved_names_fail_closed() -> None:
             validate_metric_tags([invalid_tag])
 
 
-def test_dp_metrics_use_explicit_per_rank_units() -> None:
+@pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("timing_enabled", [False, True])
+def test_dp_metrics_use_explicit_per_rank_units(graph_mode, timing_enabled) -> None:
     runner = object.__new__(DoubleBufferOffPolicyRunner)
     runner.dp_sync = SimpleNamespace(take_gradient_sync_metrics=lambda: (0.25, 3))
+    runner.learner = SimpleNamespace(use_update_cycle=graph_mode)
+    runner.trace_enabled = timing_enabled
+    runner.trace_cuda_events = True
     iter_metrics: defaultdict[str, list[float]] = defaultdict(list)
 
     runner._collect_dp_sync_metrics(iter_metrics)
 
-    assert iter_metrics["Perf/dp_gradient_sync_ms_per_rank"] == [250.0]
+    if not graph_mode or timing_enabled:
+        assert iter_metrics["Perf/dp_gradient_sync_ms_per_rank"] == [250.0]
+    else:
+        assert "Perf/dp_gradient_sync_ms_per_rank" not in iter_metrics
     assert iter_metrics["Perf/dp_gradient_sync_calls_per_rank"] == [3.0]

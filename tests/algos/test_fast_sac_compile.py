@@ -134,14 +134,76 @@ def test_fast_sac_whole_cycle_uses_max_autotune_without_nested_graphs(monkeypatc
     ]
 
 
-def test_fast_sac_gradient_sync_rejects_dp_in_whole_cycle_mode() -> None:
+def test_fast_sac_gradient_sync_invalidates_captured_cycle() -> None:
     learner = _small_fast_sac_learner()
     learner._compile_full_update_cycle = True
+    learner._update_cycle_graph_cache_key = ("old",)
 
-    with pytest.raises(RuntimeError, match="does not support DP fallback"):
-        learner.set_gradient_sync(lambda _parameters: None)
+    def sync(_parameters):
+        pass
 
+    learner.set_gradient_sync(sync)
+    assert learner._gradient_sync is sync
+    assert learner._update_cycle_graph_cache_key is None
     assert learner.use_update_cycle is True
+    learner.set_gradient_graph_hooks(lambda: None, lambda: None, lambda: None)
+    learner._update_cycle_graph_cache_key = ("same",)
+    learner.set_gradient_sync(sync)
+    assert learner._update_cycle_graph_cache_key == ("same",)
+    learner.set_gradient_sync(None)
+    assert learner._update_cycle_graph_cache_key is None
+    assert learner._gradient_graph_hooks is None
+
+
+@pytest.mark.parametrize("optimizer_name", ["q_optimizer", "actor_optimizer", "alpha_optimizer"])
+def test_dp_nonfinite_loss_with_finite_gradients_arms_same_gate(optimizer_name, monkeypatch):
+    """A loss constant can overflow on one rank without corrupting its gradients."""
+    for rank in range(2):
+        learner = _small_fast_sac_learner()
+        learner._device_type = "cuda"  # Exercise gate math with CPU tensors.
+        learner._host_finite_checks = False
+        optimizer = getattr(learner, optimizer_name)
+        parameter = optimizer.param_groups[0]["params"][0]
+        parameter.grad = torch.ones_like(parameter)
+        sentinel_pointer = learner._gradient_loss_flag.grad.data_ptr()
+
+        def average(parameters):
+            parameters = list(parameters)
+            assert parameters[-1] is learner._gradient_loss_flag
+            flag = parameters[-1].grad
+            assert flag.item() == float(rank == 0)
+            flag.add_(float(rank == 1)).div_(2)
+
+        learner.set_gradient_sync(average)
+        monkeypatch.setattr(torch, "_amp_foreach_non_finite_check_and_unscale_", lambda *args: None)
+        loss = torch.tensor(float("inf") if rank == 0 else 1.0)
+        learner._sync_loss_gradients([parameter], loss)
+        learner._arm_optimizer_finite_gate(optimizer, loss)
+        assert learner._optimizer_found_inf.item() == 1.0
+        assert learner._gradient_loss_flag.grad.data_ptr() == sentinel_pointer
+        assert torch.isfinite(parameter.grad).all()
+
+
+def test_gradient_graph_capture_hook_ends_when_warmup_fails(monkeypatch):
+    learner = _small_fast_sac_learner()
+    events = []
+    learner.set_gradient_graph_hooks(
+        lambda: events.append("begin"), lambda: events.append("end"), lambda: None
+    )
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("warmup failed")
+
+    monkeypatch.setattr(learner, "_warm_update_cycle_graph", fail)
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        learner._ensure_update_cycle_graph(
+            {"obs": torch.zeros(2, 4)},
+            updates_per_step=1,
+            policy_frequency=1,
+            target_frequency=1,
+            policy_before_critic=False,
+        )
+    assert events == ["begin", "end"]
 
 
 def test_fast_sac_update_cycle_rejects_compatibility_fallback() -> None:
@@ -694,6 +756,12 @@ def test_fast_sac_update_cycle_rekeys_on_shape_and_invalidates_checkpoint() -> N
         use_layer_norm=False,
         use_compile=True,
     )
+    hook_events = []
+    learner.set_gradient_graph_hooks(
+        lambda: hook_events.append("begin"),
+        lambda: hook_events.append("end"),
+        lambda: hook_events.append("replay"),
+    )
     batch = {
         "obs": torch.randn(16, 4, device="cuda:0"),
         "critic": torch.randn(16, 5, device="cuda:0"),
@@ -730,6 +798,8 @@ def test_fast_sac_update_cycle_rekeys_on_shape_and_invalidates_checkpoint() -> N
         for key, tensor in learner._update_cycle_static_batch.items()
     )
     assert all(math.isfinite(value) for value in learner.read_deferred_cycle_metrics().values())
+
+    assert hook_events == ["begin", "end", "replay", "begin", "end", "replay"]
 
     learner.load_state_dict(learner.get_state_dict())
     assert learner._update_cycle_graph is None

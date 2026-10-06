@@ -57,6 +57,11 @@ class DpParameterSync:
         self._statistics_schema: dict[str, str] = {}
         self._gradient_sync_time_sec = 0.0
         self._gradient_sync_calls = 0
+        self._capturing_gradient_graph = False
+        self._gradient_graph_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._gradient_graph_calls = 0
+        self._gradient_graph_timing_enabled = True
+        self._gradient_graph_pending = False
         self._gradient_buffers: dict[tuple[int, ...], torch.Tensor] = {}
         self._started = False
 
@@ -110,6 +115,16 @@ class DpParameterSync:
         gradient layout.
         """
         sync_start = time.perf_counter()
+        timing_events = None
+        capturing = self._capturing_gradient_graph and torch.cuda.is_current_stream_capturing()
+        if capturing:
+            self._gradient_graph_calls += 1
+        if capturing and self._gradient_graph_timing_enabled:
+            timing_events = (
+                torch.cuda.Event(enable_timing=True, external=True),
+                torch.cuda.Event(enable_timing=True, external=True),
+            )
+            timing_events[0].record()
         params = [
             parameter
             for parameter in parameters
@@ -156,11 +171,57 @@ class DpParameterSync:
             gradient.copy_(packed[offset : offset + width].view_as(parameter))
             offset += width
 
-        self._gradient_sync_time_sec += time.perf_counter() - sync_start
-        self._gradient_sync_calls += 1
+        if timing_events is not None:
+            timing_events[1].record()
+            self._gradient_graph_events.append(timing_events)
+        elif not capturing:
+            self._gradient_sync_time_sec += time.perf_counter() - sync_start
+            self._gradient_sync_calls += 1
+
+    def begin_gradient_graph_capture(self, *, enable_timing: bool = True) -> None:
+        """Start a new CUDA graph's synchronization instrumentation.
+
+        Call outside CUDA capture, around warmup and capture. Warmup metrics
+        are discarded; only operations inside CUDA capture create events.
+        The owner must release the previous graph before replacing its events.
+        """
+        self._consume_gradient_graph_timing()
+        self._gradient_sync_time_sec = 0.0
+        self._gradient_sync_calls = 0
+        self._gradient_graph_events.clear()
+        self._gradient_graph_calls = 0
+        self._gradient_graph_timing_enabled = enable_timing
+        self._capturing_gradient_graph = True
+
+    def end_gradient_graph_capture(self) -> None:
+        """Finish instrumentation, including when capture raises."""
+        self._capturing_gradient_graph = False
+        self._gradient_sync_time_sec = 0.0
+        self._gradient_sync_calls = 0
+
+    def record_gradient_graph_replay(self) -> None:
+        """Account for one replay; call immediately BEFORE graph.replay().
+
+        Consume an uncollected previous replay before its events are overwritten.
+        Normally the runner already consumed it at its iteration metrics boundary.
+        GPU time includes packing, collective dependencies, averaging and unpacking;
+        it is not an isolated wire-transfer measurement.
+        """
+        self._consume_gradient_graph_timing()
+        self._gradient_sync_calls += self._gradient_graph_calls
+        self._gradient_graph_pending = bool(self._gradient_graph_events)
+
+    def _consume_gradient_graph_timing(self) -> None:
+        if not self._gradient_graph_pending:
+            return
+        for start, end in self._gradient_graph_events:
+            end.synchronize()
+            self._gradient_sync_time_sec += start.elapsed_time(end) / 1000.0
+        self._gradient_graph_pending = False
 
     def take_gradient_sync_metrics(self) -> tuple[float, int]:
         """Return and reset this rank's gradient-sync time and call count."""
+        self._consume_gradient_graph_timing()
         metrics = (self._gradient_sync_time_sec, self._gradient_sync_calls)
         self._gradient_sync_time_sec = 0.0
         self._gradient_sync_calls = 0
@@ -222,12 +283,16 @@ class DpParameterSync:
 
         keys = tuple(sorted(self._statistics_schema))
         values = mean | total
-        packed = torch.zeros((2, len(keys)), dtype=torch.float64, device=device)
-        for index, key in enumerate(keys):
-            if key not in values:
-                continue
-            packed[0, index] = float(values[key])
-            packed[1, index] = 1.0
+        # Materialize the entire payload on the host before one device transfer.
+        # Per-scalar CUDA assignments launch a copy for every value and mask.
+        packed = torch.tensor(
+            [
+                [float(values.get(key, 0.0)) for key in keys],
+                [float(key in values) for key in keys],
+            ],
+            dtype=torch.float64,
+            device=device,
+        )
         dist.all_reduce(packed, op=dist.ReduceOp.SUM)
 
         value_sums = packed[0].tolist()
@@ -291,6 +356,9 @@ class DpParameterSync:
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
         self._gradient_buffers.clear()
+        self._gradient_graph_events.clear()
+        self._gradient_graph_pending = False
+        self._gradient_graph_calls = 0
         self._started = False
 
     def _ordered_keys(self, tensors: dict[str, torch.Tensor]) -> tuple[str, ...]:
