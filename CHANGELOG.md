@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.9] - 2026-10-08
+
+### Fixed
+
+- Off-policy terminal logging now separates replay-ingress diagnostics from
+  losses and policy metrics with stable short labels. Terminal rendering is
+  width-aware, and immaterial collector timing diagnostics are hidden until
+  they reach 1% of the collector cycle (#86).
+
 ## [1.4.8] - 2026-10-08
 
 ### Fixed
