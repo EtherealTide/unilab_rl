@@ -589,7 +589,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
     @property
     def use_update_cycle(self) -> bool:
         """Whether this learner owns the whole-cycle update orchestration."""
-        return self._compile_full_update_cycle
+        return bool(self._compile_full_update_cycle and self._gradient_sync is None)
 
     def prepare_for_collection(self, warmup_context: OffPolicyWarmupContext) -> None:
         """Compile/capture all learner-owned update cold paths before collection.
@@ -654,9 +654,10 @@ class FastSACLearner(LearnerBoilerplateMixin):
                 torch.cuda.synchronize(self.device)
 
     def set_gradient_sync(self, sync: Callable[[Iterable[torch.Tensor]], None] | None) -> None:
-        """Attach the compatibility-device DP reduction."""
+        """Attach DP reduction and permanently leave the whole-cycle graph."""
         if sync is not None and self._compile_full_update_cycle:
-            raise RuntimeError("FastSAC NVIDIA CUDA whole-cycle mode does not support DP fallback")
+            self._compile_full_update_cycle = False
+            self._reset_update_cycle_graph()
         self._gradient_sync = sync
 
     def normalize_obs(self, obs: torch.Tensor, update: bool = False) -> torch.Tensor:
