@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Explicit `resume_checkpoint` support on `DoubleBufferOffPolicyRunner.learn`,
+  restoring the complete learner state and resuming from the checkpointed
+  update count. Invalid or missing checkpoint progress metadata fails closed.
 - Reviewed tensor-runtime defaults and deterministic bounds for inference-ring
   capacity, collector metric intervals, replay ingress depth, replay ingress
   slot rows, and learner sampling. FastSAC, FlashSAC, and WarpSAC resolve one
