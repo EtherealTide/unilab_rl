@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.5.0] - 2026-10-08
 
 ### Added
 
@@ -14,8 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update count. Invalid or missing checkpoint progress metadata fails closed.
 - Reviewed tensor-runtime defaults and deterministic bounds for inference-ring
   capacity, collector metric intervals, replay ingress depth, replay ingress
-  slot rows, and learner sampling. FastSAC, FlashSAC, and WarpSAC resolve one
-  validated settings object before environment probing, and runtime manifests
+  slot rows, and learner sampling. FastSAC and FlashSAC resolve one validated
+  settings object before environment probing, and runtime manifests
   record configured, default, effective, and maximum values.
 - Configurable bounded replay-ingress slots that may contain fewer rows than a
   collector vector. The collector publishes vectors in bounded chunks with
@@ -36,6 +36,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with bounded slot reuse, plus deterministic cleanup for partially constructed
   inference rings.
 
+### Changed
+
+- Removed the separate age-biased SAC algorithm identity and package.
+  FlashSAC now owns its substantive behavior as options: age-biased device
+  replay (`decay_step`, `replay_min_weight`, `replay_num_buckets`), actor/critic
+  parameter-normalization switches, target-update frequency, and
+  actor-before-critic ordering. Defaults preserve FlashSAC's uniform replay,
+  normalized parameters, target frequency 1, and critic-before-actor ordering.
+  No old compatibility layer is retained.
+
 ### Fixed
 
 - Collector inference metrics distinguish configured ring capacity from dynamic
@@ -46,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- FlashSAC/WarpSAC whole-cycle CUDA graph capture no longer poisons the
+- FlashSAC whole-cycle CUDA graph capture no longer poisons the
   process on failure. The torch.compile capture-error mode is thread-local
   instead of process-global, and a failed capture (e.g.
   `cudaErrorStreamCaptureUnsupported` at larger observation dims) falls back
@@ -68,7 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - A learner-owned off-policy preparation phase between DP initialization and
-  collector startup. FastSAC, FlashSAC, and WarpSAC warm representative actor
+  collector startup. FastSAC and FlashSAC warm representative actor
   inference, replay gather/device paths, and compiled update/CUDA-graph paths
   before tick 0.
 - Custom learner/runtime/actor warmup hooks: `prepare_for_collection`,
@@ -102,15 +112,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `log_interval` backend-logging throttle on `BaseTrainingLogger`,
   `OffPolicyLogger`, `OnPolicyLogger`, `OffPolicyRunner`, and `APPORunner`
-  (all default 1). The off-policy builders (`fast_sac`, `flash_sac`,
-  `warp_sac`) read it from `cfg.training.log_interval`. Terminal rendering is
+  (all default 1). The off-policy builders (`fast_sac`, `flash_sac`) read it
+  from `cfg.training.log_interval`. Terminal rendering is
   unaffected; only TensorBoard/wandb writes are gated, and the final iteration
   is always logged.
 
 ### Changed
 
-- FastSAC, FlashSAC, and inherited WarpSAC now use one owner-managed
-  whole-update-cycle CUDA Graph on NVIDIA CUDA. All three compile that graph
+- FastSAC and FlashSAC now use one owner-managed
+  whole-update-cycle CUDA Graph on NVIDIA CUDA. Both compile that graph
   with architecture-portable Inductor max autotuning. The legacy NVIDIA
   opt-out and loss-graph fallback were removed; incompatible options fail
   closed instead of silently selecting the slower path. ROCm/HIP, MPS, CPU,
@@ -159,11 +169,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- New WarpSAC algorithm package. `WarpSACLearner` inherits UniLab's FlashSAC
-  learner without modifying it, while `WarpSACReplayPipeline` adds the official
-  implementation's bucketed linear age-bias replay sampling to the asynchronous
-  device-authoritative runtime.
-- WarpSAC double-buffer builder with `decay_step`, `replay_min_weight`,
+- New age-biased SAC algorithm package built on FlashSAC, with bucketed linear
+  age-bias replay sampling in the asynchronous device-authoritative runtime.
+- Its double-buffer builder exposed `decay_step`, `replay_min_weight`,
   `replay_num_buckets`, `target_frequency`, and actor/critic
   parameter-normalization switches.
 - Generic off-policy replay-pipeline injection so algorithm owners can provide

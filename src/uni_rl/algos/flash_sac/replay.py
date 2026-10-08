@@ -1,9 +1,10 @@
-"""Regime-aware replay sampling for WarpSAC.
+"""Age-biased replay sampling for FlashSAC.
 
 The device ring remains owned by the generic GPU-resident pipeline. This
-subclass only changes index selection, preserving the source implementation's
-positive and negative linear-decay weight profiles. Bucketed sampling preserves
-its approximate behavior for large device-resident replay buffers.
+subclass changes only index selection: zero decay uses uniform sampling,
+while positive and negative decays bias toward recent and older transitions
+respectively. Bucketed sampling preserves that bias approximately for large
+device-resident replay buffers.
 """
 
 from __future__ import annotations
@@ -27,11 +28,11 @@ def _linear_age_weights(
 
 
 def _with_zero_weight_fallback(weights: torch.Tensor) -> torch.Tensor:
-    """Match the source buffer's all-zero-weight fallback without a host sync."""
+    """Fall back to uniform weights when all biased weights vanish."""
     return torch.where(weights.sum() > 0, weights, torch.ones_like(weights))
 
 
-def _biased_replay_indices(
+def biased_replay_indices(
     *,
     visible_size: int,
     capacity: int,
@@ -99,8 +100,8 @@ def _biased_replay_indices(
     return (ring_start + logical_indices) % capacity
 
 
-class WarpSACReplayPipeline(GPUResidentReplayPipeline):
-    """GPU-resident replay with WarpSAC's linear age-bias sampler."""
+class AgeBiasedReplayPipeline(GPUResidentReplayPipeline):
+    """GPU-resident replay with a linear age-bias sampler."""
 
     def __init__(
         self,
@@ -121,7 +122,7 @@ class WarpSACReplayPipeline(GPUResidentReplayPipeline):
         super().__init__(replay_buffer, **kwargs)
 
     def _gather_rows(self, *, visible_size: int, slot: int, gen: torch.Generator) -> None:
-        indices = _biased_replay_indices(
+        indices = biased_replay_indices(
             visible_size=visible_size,
             capacity=self._capacity,
             current_ptr=int(self._visible_ptr),
@@ -135,4 +136,4 @@ class WarpSACReplayPipeline(GPUResidentReplayPipeline):
         torch.index_select(self._gpu_storage, 0, indices, out=self._gpu_packed[slot])
 
 
-__all__ = ["WarpSACReplayPipeline"]
+__all__ = ["AgeBiasedReplayPipeline"]

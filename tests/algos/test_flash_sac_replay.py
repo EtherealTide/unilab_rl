@@ -1,4 +1,4 @@
-"""WarpSAC migration tests."""
+"""FlashSAC age-biased replay option tests."""
 
 from __future__ import annotations
 
@@ -11,12 +11,10 @@ import torch
 from omegaconf import OmegaConf
 
 from uni_rl.algos.common.actor_factory import build_actor
+from uni_rl.algos.flash_sac.double_buffer import build_flashsac_double_buffer_runner
 from uni_rl.algos.flash_sac.learner import FlashSACLearner
-from uni_rl.algos.warp_sac.double_buffer import build_warpsac_double_buffer_runner
-from uni_rl.algos.warp_sac.learner import WarpSACLearner
-from uni_rl.algos.warp_sac.replay import WarpSACReplayPipeline, _biased_replay_indices
+from uni_rl.algos.flash_sac.replay import AgeBiasedReplayPipeline, biased_replay_indices
 from uni_rl.logging.metric_schema import normalize_metric_map
-from uni_rl.offpolicy.double_buffer_runner import algo_display_name
 from uni_rl.offpolicy.worker import sample_offpolicy_actions
 
 
@@ -33,7 +31,7 @@ def _sample(**kwargs: Any) -> torch.Tensor:
     defaults.update(kwargs)
     generator = torch.Generator(device="cpu")
     generator.manual_seed(7)
-    return _biased_replay_indices(generator=generator, **defaults)
+    return biased_replay_indices(generator=generator, **defaults)
 
 
 def test_replay_bias_prefers_recent_data_for_positive_decay() -> None:
@@ -69,8 +67,8 @@ def test_replay_bias_maps_logical_rows_onto_wrapped_ring() -> None:
     assert set(indices.tolist()) <= {0, 1, 2, 3}
 
 
-def test_warpsac_learner_inherits_flashsac_training_interface() -> None:
-    learner = WarpSACLearner(
+def test_age_biased_flashsac_learner_keeps_training_interface() -> None:
+    learner = FlashSACLearner(
         obs_dim=4,
         action_dim=2,
         critic_obs_dim=6,
@@ -92,7 +90,6 @@ def test_warpsac_learner_inherits_flashsac_training_interface() -> None:
         "truncated": torch.zeros(8),
     }
 
-    assert isinstance(learner, FlashSACLearner)
     critic_metrics = learner.update_critic(batch)
     actor_metrics = learner.update_actor(batch)
     assert set(critic_metrics) == {"Loss/critic", "Train/reward_scale_std"}
@@ -105,8 +102,8 @@ def test_warpsac_learner_inherits_flashsac_training_interface() -> None:
     normalize_metric_map({**critic_metrics, **actor_metrics})
 
 
-def test_warpsac_can_disable_inherited_parameter_normalization() -> None:
-    learner = WarpSACLearner(
+def test_flashsac_can_disable_parameter_normalization() -> None:
+    learner = FlashSACLearner(
         obs_dim=4,
         action_dim=2,
         critic_obs_dim=6,
@@ -131,8 +128,8 @@ def test_warpsac_can_disable_inherited_parameter_normalization() -> None:
     assert torch.equal(target_weight, critic_weight)
 
 
-def test_runtime_routes_warp_sac_exploration_and_display_name() -> None:
-    actor = WarpSACLearner(
+def test_runtime_routes_flashsac_exploration() -> None:
+    actor = FlashSACLearner(
         obs_dim=3,
         action_dim=1,
         critic_obs_dim=3,
@@ -144,15 +141,14 @@ def test_runtime_routes_warp_sac_exploration_and_display_name() -> None:
         device="cpu",
     ).actor
 
-    action = sample_offpolicy_actions(actor, "warpsac", torch.randn(4, 3), torch.zeros(4))
+    action = sample_offpolicy_actions(actor, "flashsac", torch.randn(4, 3), torch.zeros(4))
 
     assert action.shape == (4, 1)
-    assert algo_display_name("warpsac") == "WarpSAC"
 
 
-def test_actor_factory_builds_warp_sac_actor() -> None:
+def test_actor_factory_builds_flashsac_actor() -> None:
     actor = build_actor(
-        "warpsac",
+        "flashsac",
         obs_dim=3,
         action_dim=1,
         actor_hidden_dim=4,
@@ -174,14 +170,22 @@ class _FakeRunner:
         _FakeRunner.last = self
 
 
+class _FakeLearner:
+    def __init__(self, *args, **kwargs) -> None:
+        del args
+        self.kwargs = kwargs
+
+
 class _FakeEnv:
     obs_groups_spec = {"obs": 4, "critic": 6}
 
     class action_space:
         shape = (2,)
 
-    def init_state(self) -> SimpleNamespace:
-        return SimpleNamespace(obs={"obs": torch.zeros((1, 4)), "critic": torch.zeros((1, 6))})
+    def init_state(self):
+        return SimpleNamespace(
+            obs={"obs": torch.zeros(1, 4), "critic": torch.zeros(1, 6)},
+        )
 
     def close(self) -> None:
         pass
@@ -192,13 +196,14 @@ def _fake_env_factory(num_envs: int, cfg: dict[str, Any] | None = None) -> _Fake
 
 
 @pytest.mark.usefixtures("monkeypatch")
-def test_warpsac_builder_uses_regime_aware_replay_factory(
+def test_flashsac_builder_can_select_age_biased_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import uni_rl.algos.warp_sac.double_buffer as module
+    import uni_rl.algos.flash_sac.double_buffer as module
 
     monkeypatch.setattr(module, "require_offpolicy_replay_device", lambda device: device)
     monkeypatch.setattr(module, "apply_training_seed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "FlashSACLearner", _FakeLearner)
     monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
 
     cfg = OmegaConf.create(
@@ -213,10 +218,6 @@ def test_warpsac_builder_uses_regime_aware_replay_factory(
                 "trace_thread_time": False,
                 "trace_cuda_events": False,
                 "log_interval": 2,
-                "inference_slot_capacity": 3,
-                "collector_metrics_interval": 7,
-                "replay_ingress_depth": 4,
-                "replay_ingress_slot_rows": 2,
             },
             "algo": {
                 "num_envs": 4,
@@ -225,6 +226,7 @@ def test_warpsac_builder_uses_regime_aware_replay_factory(
                 "learning_starts": 4,
                 "updates_per_step": 1,
                 "policy_frequency": 2,
+                "policy_before_critic": True,
                 "seed": 1,
                 "gamma": 0.99,
                 "tau": 0.01,
@@ -262,7 +264,7 @@ def test_warpsac_builder_uses_regime_aware_replay_factory(
             },
         }
     )
-    runner = build_warpsac_double_buffer_runner(
+    runner = build_flashsac_double_buffer_runner(
         cfg,
         env_factory=_fake_env_factory,
         env_cfg_override=None,
@@ -271,69 +273,21 @@ def test_warpsac_builder_uses_regime_aware_replay_factory(
     )
 
     replay_factory = runner.kwargs["replay_pipeline_factory"]
-    assert replay_factory.func is WarpSACReplayPipeline
+    assert replay_factory.func is AgeBiasedReplayPipeline
     assert replay_factory.keywords == {
         "decay_step": 123,
         "min_weight": 0.2,
         "num_buckets": 64,
     }
-    assert runner.kwargs["algo_type"] == "warpsac"
+    assert runner.kwargs["algo_type"] == "flashsac"
     assert runner.kwargs["policy_before_critic"] is True
     assert runner.kwargs["target_frequency"] == 1
-    settings = runner.kwargs["tensor_runtime_settings"]
-    assert settings.inference_slot_capacity == 3
-    assert settings.collector_metrics_interval == 7
-    assert settings.replay_ingress_depth == 4
-    assert settings.replay_ingress_slot_rows == 2
-    assert settings.batch_size == 4
-    assert settings.updates_per_step == 1
-    assert settings.learner_sample_count == 4
-
-
-def test_warpsac_builder_rejects_runtime_bounds_before_env_probe(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import uni_rl.algos.warp_sac.double_buffer as module
-
-    monkeypatch.setattr(module, "require_offpolicy_replay_device", lambda device: device)
-    monkeypatch.setattr(module, "apply_training_seed", lambda *args, **kwargs: None)
-    monkeypatch.setattr(module, "WarpSACLearner", lambda *args, **kwargs: pytest.fail())
-
-    def _fail_factory(*args, **kwargs):
-        raise AssertionError("invalid bounds must fail before env probing")
-
-    cfg = OmegaConf.create(
-        {
-            "training": {
-                "replay_ingress_depth": 17,
-                "task_name": "fake",
-                "sim_backend": "mujoco",
-                "env_steps_per_sync": 1,
-                "use_amp": False,
-            },
-            "algo": {
-                "num_envs": 4,
-                "batch_size": 4,
-                "updates_per_step": 1,
-                "seed": 1,
-                "algo_params": {"n_step": 1},
-            },
-        }
-    )
-    with pytest.raises(ValueError, match="replay_ingress_depth.*17"):
-        build_warpsac_double_buffer_runner(
-            cfg,
-            env_factory=_fail_factory,
-            env_cfg_override=None,
-            replay_prefetch_mode="one_tick",
-            device="cpu",
-        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only inherited whole-cycle graph")
-def test_warpsac_inherits_flashsac_whole_cycle_cuda_graph() -> None:
+def test_flashsac_age_biased_options_keep_whole_cycle_cuda_graph() -> None:
     torch.manual_seed(123)
-    learner = WarpSACLearner(
+    learner = FlashSACLearner(
         obs_dim=4,
         action_dim=2,
         critic_obs_dim=6,

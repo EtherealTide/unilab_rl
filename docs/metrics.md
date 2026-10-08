@@ -104,7 +104,7 @@ SAC-family collectors have no equivalent complete rollout phase to misrepresent.
 runner measured the complete iteration wall time; an accounted-phase sum is not
 presented as wall time.
 
-Deferred FastSAC/FlashSAC/WarpSAC device reads use the same unsuffixed canonical
+Deferred FastSAC/FlashSAC device reads use the same unsuffixed canonical
 tags; their schema aggregation states that these learners sample the final update
 when deferral is active. Historical migration notes below identify old fields
 whose unsuffixed meaning was not declared.

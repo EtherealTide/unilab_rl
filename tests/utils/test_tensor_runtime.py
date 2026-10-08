@@ -299,7 +299,7 @@ def test_explicit_transport_can_request_cuda_without_legacy_boolean() -> None:
             env={"tensor_runtime_device": "cuda:4"},
         ),
         device="cuda:4",
-        algo_name="WarpSAC",
+        algo_name="FlashSAC",
     )
 
     assert placement.mode is InferenceTransport.CUDA

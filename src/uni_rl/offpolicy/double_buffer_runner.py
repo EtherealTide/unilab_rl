@@ -75,7 +75,6 @@ from uni_rl.utils.tensor_runtime import (
 _ALGO_DISPLAY_NAMES = {
     "sac": "SAC",
     "flashsac": "FlashSAC",
-    "warpsac": "WarpSAC",
 }
 
 _DP_METRIC_PREFIX = "metric::"
