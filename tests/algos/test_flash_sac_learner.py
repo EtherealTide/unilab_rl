@@ -117,14 +117,14 @@ def test_flashsac_cuda_adam_optimizers_are_capturable(monkeypatch) -> None:
     assert all(call["capturable"] for call in calls)
 
 
-def test_flashsac_gradient_sync_rejects_dp_in_whole_cycle_mode() -> None:
+def test_flashsac_gradient_sync_leaves_whole_cycle_mode_for_dp() -> None:
     learner = _make_small_learner()
     learner._compile_full_update_cycle = True
 
-    with pytest.raises(RuntimeError, match="does not support DP fallback"):
-        learner.set_gradient_sync(lambda _parameters: None)
+    learner.set_gradient_sync(lambda _parameters: None)
 
-    assert learner.use_update_cycle is True
+    assert learner._compile_full_update_cycle is False
+    assert learner.use_update_cycle is False
 
 
 def test_flashsac_update_cycle_rejects_compatibility_fallback() -> None:

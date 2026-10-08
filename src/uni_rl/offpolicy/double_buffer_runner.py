@@ -965,6 +965,33 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         logger.log_save(ckpt_path)
         return ckpt_path
 
+    def _restore_resume_checkpoint(self, resume_checkpoint: str) -> int:
+        """Restore learner state and return the first training iteration.
+
+        Checkpoints are produced by :meth:`_save_checkpoint` and may contain
+        optimizer state, so this path is intentionally not restricted to
+        tensor-only loading. Malformed progress metadata fails closed rather
+        than silently restarting training from old model weights.
+        """
+        state = torch.load(resume_checkpoint, map_location=self.device, weights_only=False)
+        if not isinstance(state, dict):
+            raise TypeError("resume checkpoint must contain a learner state dictionary")
+        try:
+            update_count = int(state["update_count"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("resume checkpoint is missing a valid integer update_count") from exc
+        if update_count < 0:
+            raise ValueError(
+                f"resume checkpoint update_count must be non-negative, got {update_count}"
+            )
+
+        self.learner.load_state_dict(state)
+        print(
+            f"Resumed learner state from {resume_checkpoint} "
+            f"(update_count={update_count}, next_iteration={update_count + 1})"
+        )
+        return update_count + 1
+
     def close(self) -> None:
         try:
             # Rank 0 owns the live terminal, and every rank owns a collector and
@@ -1318,7 +1345,17 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         save_interval: int = 50,
         log_dir: str = "logs",
         logger_type: str = "tensorboard",
+        resume_checkpoint: str | None = None,
     ) -> None:
+        resume_start_iteration = 1
+        if resume_checkpoint is not None:
+            resume_start_iteration = self._restore_resume_checkpoint(resume_checkpoint)
+        self.resume_start_iteration = resume_start_iteration
+        if resume_start_iteration > max_iterations + 1:
+            raise ValueError(
+                "resume checkpoint is newer than max_iterations: "
+                f"next_iteration={resume_start_iteration}, max_iterations={max_iterations}"
+            )
         self._shutdown_recorder.reset(inference_epoch=self.inference_epoch)
         self.runtime_manifest.pop("shutdown", None)
         self.last_run_summary = None
@@ -1372,6 +1409,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         last_mean_reward = 0.0
         ckpt_path: str | None = None
         iteration = 0
+        start_iteration = self.resume_start_iteration
 
         self._shutdown_recorder.set_phase(owner="learner", phase="startup/memory_budget")
         # --- memory budget check ---
@@ -1721,7 +1759,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             training_e2e_start_ns = 0
 
             # ---- training loop ----
-            for iteration in range(1, max_iterations + 1):
+            for iteration in range(start_iteration, max_iterations + 1):
                 self._shutdown_recorder.set_phase(
                     owner="learner",
                     phase="training/wait_for_inference_request",

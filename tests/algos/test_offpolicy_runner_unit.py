@@ -894,6 +894,114 @@ def test_learn_startup_failure_records_shutdown_and_replaces_stale_state(
     runner.close()
 
 
+def test_offpolicy_resume_restores_state_and_iteration_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    checkpoint_path = tmp_path / "model_7.pt"
+    checkpoint = {"weights": torch.ones(2), "update_count": 7}
+    loaded: list[dict[str, object]] = []
+
+    class _ResumeLearner:
+        def __init__(self) -> None:
+            self.loaded_state: dict[str, object] | None = None
+
+        def load_state_dict(self, state: dict[str, object]) -> None:
+            self.loaded_state = state
+
+    def fake_load(path, **kwargs):
+        loaded.append({"path": path, **kwargs})
+        return checkpoint
+
+    learner = _ResumeLearner()
+    runner = _make_device_runner(monkeypatch, learner=learner, device="cpu")
+    monkeypatch.setattr(device_runner_module.torch, "load", fake_load)
+    captured_impl: dict[str, object] = {}
+
+    def fake_impl(**kwargs):
+        captured_impl.update(kwargs)
+
+    monkeypatch.setattr(runner, "_learn_impl", fake_impl)
+
+    runner.learn(
+        max_iterations=20,
+        save_interval=4,
+        log_dir=str(tmp_path),
+        resume_checkpoint=str(checkpoint_path),
+    )
+
+    assert loaded == [
+        {
+            "path": str(checkpoint_path),
+            "map_location": "cpu",
+            "weights_only": False,
+        }
+    ]
+    assert learner.loaded_state is checkpoint
+    assert runner.resume_start_iteration == 8
+    assert captured_impl == {
+        "max_iterations": 20,
+        "save_interval": 4,
+        "log_dir": str(tmp_path),
+        "logger_type": "tensorboard",
+    }
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "message"),
+    [
+        (torch.ones(1), "must contain a learner state dictionary"),
+        ({"weights": torch.ones(1)}, "missing a valid integer update_count"),
+        ({"update_count": "invalid"}, "missing a valid integer update_count"),
+        ({"update_count": -1}, "update_count must be non-negative"),
+    ],
+)
+def test_offpolicy_resume_rejects_invalid_checkpoint_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    checkpoint,
+    message,
+) -> None:
+    learner = _Learner()
+    runner = _make_device_runner(monkeypatch, learner=learner, device="cpu")
+    monkeypatch.setattr(
+        device_runner_module.torch,
+        "load",
+        lambda *args, **kwargs: checkpoint,
+    )
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        runner.learn(
+            max_iterations=10,
+            save_interval=0,
+            log_dir=str(tmp_path),
+            resume_checkpoint=str(tmp_path / "model.pt"),
+        )
+
+    assert not hasattr(runner, "resume_start_iteration")
+
+
+def test_offpolicy_resume_rejects_iteration_past_max(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    learner = SimpleNamespace(load_state_dict=lambda state: None)
+    runner = _make_device_runner(monkeypatch, learner=learner, device="cpu")
+    monkeypatch.setattr(
+        device_runner_module.torch,
+        "load",
+        lambda *args, **kwargs: {"update_count": 10},
+    )
+    monkeypatch.setattr(runner, "_learn_impl", lambda **kwargs: pytest.fail("training started"))
+
+    with pytest.raises(ValueError, match="newer than max_iterations"):
+        runner.learn(
+            max_iterations=9,
+            save_interval=0,
+            log_dir=str(tmp_path),
+            resume_checkpoint=str(tmp_path / "model_10.pt"),
+        )
+
+    assert runner.resume_start_iteration == 11
+
+
 def test_minimal_failed_summary_is_schema_valid(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = _make_device_runner(monkeypatch)
     summary = runner._minimal_failed_summary("failed")
