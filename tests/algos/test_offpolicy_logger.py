@@ -136,31 +136,29 @@ def test_offpolicy_logger_displays_env_step_breakdown_as_indented_children() -> 
     )
 
     table = logger._build_timing_table()
-    collector_cells = list(table.columns[2].cells)[:8]
-    collector_value_cells = list(table.columns[3].cells)[:8]
+    logger._console = Console(width=140, record=True, force_terminal=False)
+    table = logger._build_timing_table()
+    collector_cells = [cell for cell in table.columns[2].cells if cell][:8]
+    collector_value_cells = [cell for cell in table.columns[3].cells if cell][:8]
 
     assert collector_cells == [
-        "Inference Request",
         "Learner Action Wait",
         "Env Step",
         "[dim]  Backend Step[/]",
         "[dim]  Update State[/]",
         "[dim]  Reset Done[/]",
-        "Transition Extract",
         "Replay Write",
     ]
     assert collector_value_cells == [
-        "    0.1ms    1%",
         "    0.2ms    1%",
         "   14.0ms   95%",
         "[dim cyan]   12.5ms  84%─┤[/]",
         "[dim cyan]    1.0ms   7%─┤[/]",
         "[dim cyan]    0.5ms   3%─┘[/]",
-        "    0.1ms    1%",
         "    0.3ms    2%",
     ]
 
-    console = Console(width=100, record=True, force_terminal=False)
+    console = Console(width=140, record=True, force_terminal=False)
     with console.capture() as capture:
         console.print(table)
     connector_columns = [
@@ -171,6 +169,159 @@ def test_offpolicy_logger_displays_env_step_breakdown_as_indented_children() -> 
     ]
     assert len(connector_columns) == 3
     assert len(set(connector_columns)) == 1
+
+
+def test_offpolicy_logger_hides_small_collector_diagnostics_until_material() -> None:
+    logger = OffPolicyLogger(log_backend="none")
+    logger._unicode_console = False
+    logger._console = Console(width=140, record=True, force_terminal=False)
+    logger.update_collector_timing(
+        {
+            "inference_request_ms": 0.1,
+            "learner_action_wait_ms": 1.0,
+            "env_step_ms": 90.0,
+            "env_step_action_validate_ms": 0.05,
+            "env_step_apply_action_ms": 0.20,
+            "env_step_backend_ms": 80.0,
+            "transition_extract_ms": 0.10,
+            "replay_write_ms": 1.0,
+            "metrics_publish_ms": 0.01,
+        }
+    )
+
+    quiet_cells = [cell for cell in logger._build_timing_table().columns[2].cells if cell]
+    assert quiet_cells == [
+        "Learner Action Wait",
+        "Env Step",
+        "[dim]  Backend Step[/]",
+        "Replay Write",
+    ]
+    assert "Inference Request" not in quiet_cells
+    assert "Action Validate" not in quiet_cells
+    assert "Transition Extract" not in quiet_cells
+    assert "Metrics Publish" not in quiet_cells
+
+    logger.update_collector_timing(
+        {
+            "inference_request_ms": 0.1,
+            "learner_action_wait_ms": 1.0,
+            "env_step_ms": 50.0,
+            "env_step_action_validate_ms": 0.05,
+            "env_step_apply_action_ms": 20.0,
+            "env_step_backend_ms": 10.0,
+            "transition_extract_ms": 5.0,
+            "replay_write_ms": 1.0,
+            "metrics_publish_ms": 0.01,
+        }
+    )
+    active_cells = [cell for cell in logger._build_timing_table().columns[2].cells if cell]
+    assert "[dim]  Apply Action[/]" in active_cells
+    assert "Transition Extract" in active_cells
+    assert "Metrics Publish" not in active_cells
+
+
+def test_offpolicy_metrics_table_separates_replay_ingress_from_losses() -> None:
+    logger = OffPolicyLogger(log_backend="none")
+    logger._console = Console(width=140, record=True, force_terminal=False)
+    logger._latest_metrics = {
+        "Loss/critic": 4.2,
+        "Policy/temperature": 0.01,
+        "Train/reward_scale_std": 0.3,
+        "Train/replay_ingress_depth": 2.0,
+        "Train/replay_ingress_backpressure_wait_ms": 12.0,
+    }
+
+    table = logger._build_metrics_table()
+    labels = [cell for cell in table.columns[0].cells if cell]
+    console = Console(width=140, record=True, force_terminal=False)
+    with console.capture():
+        console.print(table)
+    output = console.export_text()
+
+    assert labels == [
+        "Critic",
+        "Temperature",
+        "  Reward Scale Std",
+        "  Ingress Backpressure",
+        "  Ingress Depth",
+    ]
+    assert labels.index("Critic") < labels.index("Temperature")
+    assert labels.index("Temperature") < labels.index("  Ingress Depth")
+    assert "Backpressure Wait Ms" not in output
+    assert all("Wait Ms" not in line for line in output.splitlines())
+
+
+def test_offpolicy_terminal_render_is_width_aware() -> None:
+    metrics = {
+        "Loss/critic": 4.2,
+        "Policy/temperature": 0.01,
+        "Train/reward_scale_std": 0.3,
+        "Train/replay_ingress_depth": 2.0,
+        "Train/replay_ingress_backpressure_wait_ms": 12.0,
+    }
+    collector_timing = {
+        "inference_request_ms": 0.1,
+        "learner_action_wait_ms": 1.0,
+        "env_step_ms": 30.0,
+        "env_step_apply_action_ms": 9.0,
+        "env_step_backend_ms": 14.0,
+        "env_step_update_state_ms": 2.0,
+        "env_step_reset_done_ms": 4.0,
+        "transition_extract_ms": 0.1,
+        "replay_write_ms": 0.2,
+        "metrics_publish_ms": 0.005,
+    }
+
+    expectations = {
+        80: {
+            "layout": "stacked",
+            "headers": ("Metrics", "Rewards", "Timing"),
+            "intact": (
+                "Collector Wait",
+                "Learner Action Wait",
+                "Apply Action",
+                "Backend Step",
+                "Ingress Backpressure",
+            ),
+        },
+        100: {
+            "layout": "two-column",
+            "headers": ("Losses & Policy", "Learner", "Collector"),
+            "intact": ("Collector Wait", "Learner Action Wait", "Apply Action"),
+        },
+        120: {
+            "layout": "three-column",
+            "headers": ("Learner (Iter Wall)", "Collector (own clock)", "System"),
+            "intact": ("Collector Wait", "Learner Action Wait", "Apply Action"),
+        },
+        140: {
+            "layout": "three-column",
+            "headers": ("Learner (Iter Wall)", "Collector (own clock)", "System"),
+            "intact": ("Collector Wait", "Learner Action Wait", "Apply Action"),
+        },
+    }
+
+    for width, expected in expectations.items():
+        logger = OffPolicyLogger(log_backend="none")
+        logger._console = Console(width=width, record=True, force_terminal=False)
+        logger._unicode_console = False
+        logger._latest_metrics = dict(metrics)
+        logger.update_collector_timing(dict(collector_timing))
+        logger._reward_history.extend([1.0, 2.0])
+        logger._latest_reward_components = {"reward/alive": 1.0}
+
+        console = Console(width=width, record=True, force_terminal=False)
+        console.print(logger._build_display())
+        output = console.export_text()
+        lines = output.splitlines()
+
+        for header in expected["headers"]:
+            assert any(header in line for line in lines), (width, header, output)
+        for label in expected["intact"]:
+            assert any(label in line for line in lines), (width, label, output)
+        if width >= 120:
+            assert "…" not in output
+        assert "Wait Ms" not in output
 
 
 def test_offpolicy_logger_rejects_retired_collector_timing_names() -> None:
@@ -184,6 +335,7 @@ def test_offpolicy_logger_rejects_retired_collector_timing_names() -> None:
 
 def test_offpolicy_logger_waits_for_complete_collector_cycle_before_percentages() -> None:
     logger = OffPolicyLogger(log_backend="none")
+    logger._console = Console(width=140, record=True, force_terminal=False)
     logger.update_collector_timing({"replay_write_ms": 2.5})
 
     assert logger._get_collector_cycle_ms() is None
@@ -217,6 +369,7 @@ def test_offpolicy_logger_shows_complete_additive_learner_timeline() -> None:
         iteration_time=1.0,
     )
 
+    logger._console = Console(width=140, record=True, force_terminal=False)
     table = logger._build_timing_table()
 
     assert table.columns[0].header == "Learner (Iter Wall)"
@@ -300,6 +453,7 @@ def test_offpolicy_logger_appo_profile_only_shows_applicable_learner_phases() ->
 def test_offpolicy_logger_rollout_collector_uses_milliseconds_without_cycle_total() -> None:
     logger = OffPolicyLogger(log_backend="none", timing_profile="appo")
     logger._unicode_console = False
+    logger._console = Console(width=140, record=True, force_terminal=False)
     logger.update_collector_timing(
         {
             "mlp_infer_ms": 1.5,
@@ -473,6 +627,7 @@ def test_offpolicy_terminal_averages_aggregated_samples_over_two_seconds(
     assert snapshot.scalars["env_steps_per_sec"] == pytest.approx(600.0)
     assert snapshot.scalars["learner_replay_rows_per_sec"] == pytest.approx(2_000.0)
     assert snapshot.collector_timing["env_step_ms"] == pytest.approx(4.0)
+    logger._console = Console(width=140, record=True, force_terminal=False)
     collector_values = list(logger._build_timing_table().columns[3].cells)
     assert "    4.0ms   27%" in collector_values
     assert "Avg 2s (n=2)" in logger._build_compact_header(include_status=False).plain

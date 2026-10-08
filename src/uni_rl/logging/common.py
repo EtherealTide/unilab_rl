@@ -439,6 +439,7 @@ class BaseTrainingLogger:
         reward_history: tuple[float, ...] | None = None,
         reward_components: dict[str, float] | None = None,
         mean_reward: float | None = None,
+        compact: bool = False,
     ) -> Table:
         table = Table(
             box=box.SIMPLE_HEAVY,
@@ -448,8 +449,8 @@ class BaseTrainingLogger:
             expand=True,
             pad_edge=False,
         )
-        table.add_column("Rewards", style="white", width=31, no_wrap=True)
-        table.add_column("Value", justify="right", ratio=2, no_wrap=True)
+        table.add_column("Rewards", style="white", width=24 if compact else 31, no_wrap=True)
+        table.add_column("Value", justify="right", width=23 if compact else None, no_wrap=True)
 
         recent = list(self._reward_history if reward_history is None else reward_history)
         if recent:
@@ -474,7 +475,9 @@ class BaseTrainingLogger:
 
             table.add_row(
                 f"[bold]Reward[/] {trend}",
-                f"Mean [bold green]{mean_rew:.3f}[/] / Peak [dim]{peak_rew:.3f}[/]",
+                f"Mean [bold green]{mean_rew:.3f}[/] / Peak [dim]{peak_rew:.2f}[/]"
+                if compact
+                else f"Mean [bold green]{mean_rew:.3f}[/] / Peak [dim]{peak_rew:.3f}[/]",
             )
             if include_ep_length and self._mean_ep_length > 0:
                 table.add_row("  Ep Len", f"[dim]{self._mean_ep_length:.1f}[/]")

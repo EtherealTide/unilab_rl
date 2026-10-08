@@ -96,6 +96,37 @@ _LEARNER_DETAIL_TIMING_PROFILES = {
 _LEARNER_OTHER_TIMING_LABEL = "Other"
 _ITER_WALL_TIMING_SPEC = ("Perf/iteration_time", "Iter Wall", "")
 
+_METRIC_DISPLAY_LABELS = {
+    "Loss/surrogate": "Surrogate",
+    "Loss/value": "Value",
+    "Loss/entropy": "Entropy",
+    "Loss/actor": "Actor",
+    "Loss/critic": "Critic",
+    "Loss/temperature": "Temperature",
+    "Loss/learning_rate": "Learning Rate",
+    "Policy/mean_std": "Mean Std",
+    "Policy/temperature": "Temperature",
+    "Train/global_gradient_norm": "Global Grad Norm",
+    "Train/actor_gradient_norm": "Actor Grad Norm",
+    "Train/critic_gradient_norm": "Critic Grad Norm",
+    "Train/target_q_max": "Target Q Max",
+    "Train/target_q_min": "Target Q Min",
+    "Train/reward_scale_std": "Reward Scale Std",
+    "Train/ring_available_slots": "Ring Slots",
+    "Train/rollouts_read": "Rollouts Read",
+    "Train/approx_kl": "Approx KL",
+    "Train/clip_fraction": "Clip Fraction",
+    "Train/behavior_to_current_log_prob_delta": "LogProb Delta",
+    "Train/vtrace_rho_clip_fraction": "VTrace Rho Clip",
+    "Train/vtrace_rho_p99": "VTrace Rho p99",
+    "Train/replay_ingress_depth": "Ingress Depth",
+    "Train/replay_ingress_occupancy": "Ingress Occupancy",
+    "Train/replay_ingress_high_water": "Ingress High Water",
+    "Train/replay_ingress_backpressure_wait_ms": "Ingress Backpressure",
+    "Train/replay_ingress_dropped_batches": "Ingress Drops",
+}
+_REPLAY_INGRESS_PREFIX = "Train/replay_ingress_"
+
 _COLLECTOR_TIMING_SPECS = {
     "mlp_infer_ms": (1.0, "MLP Infer", "per_step"),
     "inference_request_ms": (1.0, "Inference Request", "cycle_phase"),
@@ -138,6 +169,16 @@ OFFPOLICY_ENV_STEP_DETAIL_KEYS = (
 _OFFPOLICY_COLLECTOR_CYCLE_KEYS = tuple(
     key for key, (_, _, role) in _COLLECTOR_TIMING_SPECS.items() if role == "cycle_phase"
 )
+_COLLECTOR_CORE_TERMINAL_KEYS = frozenset(
+    {
+        "mlp_infer_ms",
+        "learner_action_wait_ms",
+        "env_step_ms",
+        "replay_write_ms",
+        "rollout_ms",
+    }
+)
+_COLLECTOR_DIAGNOSTIC_TERMINAL_MIN_PCT = 1.0
 
 _TERMINAL_AVERAGE_WINDOW_SEC = 2.0
 _TERMINAL_AVERAGE_MAX_SAMPLES = 512
@@ -720,11 +761,18 @@ class OffPolicyLogger(BaseTrainingLogger):
         left = self._build_metrics_table(snapshot)
         right = self._build_reward_table(snapshot)
         bottom = self._build_timing_table(snapshot)
-        grid = Table.grid(expand=True)
-        grid.add_column(ratio=1)
-        grid.add_column(width=2)
-        grid.add_column(ratio=1)
-        grid.add_row(left, "", right)
+        if self._console.width >= 96:
+            grid = Table.grid(expand=True)
+            grid.add_column(ratio=1)
+            grid.add_column(width=2)
+            grid.add_column(ratio=1)
+            grid.add_row(left, "", right)
+        else:
+            grid = Table.grid(expand=True)
+            grid.add_column()
+            grid.add_row(left)
+            grid.add_row(Text(""))
+            grid.add_row(right)
         title = Text()
         if self._unicode_console:
             title.append(" 🚀")
@@ -755,21 +803,49 @@ class OffPolicyLogger(BaseTrainingLogger):
             expand=True,
             pad_edge=False,
         )
-        table.add_column("Losses & Metrics", style="white", ratio=2)
-        table.add_column("Value", style="yellow", justify="right", ratio=1)
+        compact = self._console.width < 96
+        table.add_column(
+            "Metrics" if compact else "Losses & Policy",
+            style="white",
+            no_wrap=compact,
+        )
+        table.add_column("Value", style="yellow", justify="right", width=13, no_wrap=True)
         metrics = snapshot.metrics if snapshot is not None else self._latest_metrics
         if not metrics:
             table.add_row("[dim]Waiting for data...[/]", "")
         else:
-            loss_keys = sorted([key for key in metrics if "loss" in key.lower()])
-            other_keys = sorted([key for key in metrics if "loss" not in key.lower()])
+            loss_keys = sorted(
+                key
+                for key in metrics
+                if key.startswith(("Loss/", "Policy/")) or "loss" in key.lower()
+            )
+            training_keys = sorted(
+                key
+                for key in metrics
+                if key.startswith("Train/")
+                and not key.startswith(_REPLAY_INGRESS_PREFIX)
+                and key not in loss_keys
+            )
+            replay_keys = sorted(key for key in metrics if key.startswith(_REPLAY_INGRESS_PREFIX))
+            known_keys = set(loss_keys) | set(training_keys) | set(replay_keys)
+            other_keys = sorted(key for key in metrics if key not in known_keys)
+
+            def _display_label(key: str, *, indent: str = "") -> str:
+                label = _METRIC_DISPLAY_LABELS.get(key)
+                if label is None:
+                    label = key.split("/", 1)[-1].replace("_", " ").title()
+                return f"{indent}{label}"
+
             for key in loss_keys:
                 value = metrics[key]
                 style = "red" if value > 10 else "yellow"
-                table.add_row(key.replace("_", " ").title(), f"[{style}]{_fmt_number(value)}[/]")
+                table.add_row(_display_label(key), f"[{style}]{_fmt_number(value)}[/]")
+            for key in training_keys:
+                table.add_row(_display_label(key, indent="  "), _fmt_number(metrics[key]))
+            for key in replay_keys:
+                table.add_row(_display_label(key, indent="  "), _fmt_number(metrics[key]))
             for key in other_keys:
-                value = metrics[key]
-                table.add_row(f"  {key.replace('_', ' ').title()}", _fmt_number(value))
+                table.add_row(_display_label(key, indent="  "), _fmt_number(metrics[key]))
         return table
 
     def _build_reward_table(self, snapshot: _TerminalSnapshot | None = None) -> Table:
@@ -780,10 +856,12 @@ class OffPolicyLogger(BaseTrainingLogger):
             reward_history=(snapshot.reward_history if snapshot is not None else None),
             reward_components=(snapshot.reward_components if snapshot is not None else None),
             mean_reward=(snapshot.scalars.get("reward") if snapshot is not None else None),
+            compact=self._console.width < 96,
         )
 
     def _build_timing_table(self, snapshot: _TerminalSnapshot | None = None) -> Table:
         snapshot = snapshot or self._terminal_snapshot
+        terminal_width = self._console.width
         table = Table(
             box=box.SIMPLE_HEAVY,
             show_header=True,
@@ -792,12 +870,21 @@ class OffPolicyLogger(BaseTrainingLogger):
             expand=True,
             pad_edge=False,
         )
-        table.add_column("Learner (Iter Wall)", style="white", ratio=5, no_wrap=True)
-        table.add_column("Value", style="yellow", justify="right", width=16, no_wrap=True)
-        table.add_column("Collector (own clock)", style="white", ratio=6, no_wrap=True)
-        table.add_column("Value", style="yellow", justify="right", width=16, no_wrap=True)
-        table.add_column("System", style="white", ratio=4, no_wrap=True)
-        table.add_column("Value", style="yellow", justify="right", width=12, no_wrap=True)
+        if terminal_width >= 120:
+            table.add_column("Learner (Iter Wall)", style="white", no_wrap=True)
+            table.add_column("Value", style="yellow", justify="right", width=16, no_wrap=True)
+            table.add_column("Collector (own clock)", style="white", no_wrap=True)
+            table.add_column("Value", style="yellow", justify="right", width=16, no_wrap=True)
+            table.add_column("System", style="white", no_wrap=True)
+            table.add_column("Value", style="yellow", justify="right", width=12, no_wrap=True)
+        elif terminal_width >= 96:
+            table.add_column("Learner", style="white", no_wrap=True)
+            table.add_column("Value", style="yellow", justify="right", width=16, no_wrap=True)
+            table.add_column("Collector", style="white", no_wrap=True)
+            table.add_column("Value", style="yellow", justify="right", width=16, no_wrap=True)
+        else:
+            table.add_column("Timing", style="white", no_wrap=True)
+            table.add_column("Value", style="yellow", justify="right", width=16, no_wrap=True)
 
         iter_wall_time = (
             snapshot.scalars.get("iter_wall_time", self._get_iter_wall_time())
@@ -859,8 +946,17 @@ class OffPolicyLogger(BaseTrainingLogger):
         ]
         last_env_step_detail_key = env_step_detail_keys[-1] if env_step_detail_keys else None
         cycle_total_ms = self._get_collector_cycle_ms(collector_timing) or 0.0
+
+        def _show_collector_row(key: str) -> bool:
+            if key in _COLLECTOR_CORE_TERMINAL_KEYS or cycle_total_ms <= 0.0:
+                return True
+            percentage = collector_timing[key] / cycle_total_ms * 100.0
+            return percentage >= _COLLECTOR_DIAGNOSTIC_TERMINAL_MIN_PCT
+
         collector_items: list[tuple[str, str]] = []
         for key, value in sorted_collector_timing:
+            if not _show_collector_row(key):
+                continue
             _, label, role = _COLLECTOR_TIMING_SPECS.get(
                 key,
                 (float("inf"), key, "diagnostic"),
@@ -897,10 +993,17 @@ class OffPolicyLogger(BaseTrainingLogger):
         system_items.append(("Envs", f"{self.num_envs:,}"))
         if batch_size_per_rank > 0:
             system_items.append(("Batch/Rank", f"{batch_size_per_rank:,}"))
-        row_count = max(len(learner_items), len(collector_items), len(system_items))
+        column_items: tuple[list[tuple[str, str]], ...]
+        if terminal_width >= 120:
+            column_items = (learner_items, collector_items, system_items)
+        elif terminal_width >= 96:
+            column_items = (learner_items, collector_items)
+        else:
+            column_items = (learner_items + collector_items,)
+        row_count = max(len(items) for items in column_items)
         for index in range(row_count):
             row: list[str] = []
-            for items in (learner_items, collector_items, system_items):
+            for items in column_items:
                 if index < len(items):
                     row.extend(items[index])
                 else:
