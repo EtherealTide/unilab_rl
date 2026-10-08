@@ -80,7 +80,13 @@ class TensorRolloutRingBuffer:
                     raise ValueError(f"missing shared-memory name for rollout field {field!r}")
                 shm = shared_memory.SharedMemory(name=shm_name_prefix[field], create=False)
             self._shm_blocks[field] = shm
-            self._tensors[field] = torch.frombuffer(shm.buf, dtype=torch.float32).reshape(shape)
+            # Some platforms round shared-memory allocations up to page granularity.
+            # Bind only the logical payload; padding must not affect the shape.
+            self._tensors[field] = torch.frombuffer(
+                shm.buf,
+                dtype=torch.float32,
+                count=count,
+            ).reshape(shape)
 
         if create:
             self._write_ptr = _SPAWN_CTX.Value("l", 0)
