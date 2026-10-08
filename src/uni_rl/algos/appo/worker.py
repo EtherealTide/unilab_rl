@@ -64,7 +64,12 @@ def compute_timeout_bootstrap_correction(
 
     from tensordict import TensorDict
 
-    critic_input = final_critic[timeout_mask].to(device=collector_device)
+    # An env can keep its authoritative state on CPU while policy inference
+    # uses a CUDA collector device. Move the boolean selector and terminal
+    # rows to one device before indexing, then restore the correction to the
+    # reward carrier's device.
+    mask = timeout_mask.to(device=final_critic.device)
+    critic_input = final_critic[mask].to(device=collector_device)
     critic_td = TensorDict(
         {"policy": critic_input},
         batch_size=critic_input.shape[0],
@@ -72,7 +77,7 @@ def compute_timeout_bootstrap_correction(
     )
     with torch.no_grad():
         bootstrap = critic(critic_td).squeeze(-1).to(device=timeout_mask.device)
-    corrections[timeout_mask] = float(gamma) * bootstrap
+    corrections[mask.to(device=corrections.device)] = float(gamma) * bootstrap
     return corrections
 
 
