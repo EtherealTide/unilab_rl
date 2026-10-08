@@ -59,9 +59,9 @@ def build_sac_double_buffer_runner(
     try:
         probe_state = probe_env.init_state()
         probe_observation = probe_state.obs.get("obs")
-        env_tensor_native = (
-            isinstance(probe_observation, torch.Tensor) and probe_observation.device.type == "cuda"
-        )
+        env_tensor_native = isinstance(probe_observation, torch.Tensor) and str(
+            probe_observation.device
+        ).startswith("cuda")
     finally:
         probe_env.close()
     inference_placement = resolve_inference_transport(
