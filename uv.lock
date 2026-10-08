@@ -1816,7 +1816,7 @@ wheels = [
 
 [[package]]
 name = "unilab-rl"
-version = "1.5.0"
+version = "1.4.7"
 source = { editable = "." }
 dependencies = [
     { name = "hydra-core" },
