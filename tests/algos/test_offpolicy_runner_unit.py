@@ -2020,7 +2020,7 @@ def test_drain_metrics_propagates_collector_error():
 @pytest.mark.parametrize("algo_type", ["sac", "flashsac"])
 def test_learner_inference_matches_existing_actor_exploration(algo_type: str) -> None:
     if algo_type == "sac":
-        from uni_rl.algos.fast_sac.learner import SACActor
+        from uni_rl.algos.sac.learner import SACActor
 
         actor = SACActor(3, 2, hidden_dim=8, use_layer_norm=False)
     else:

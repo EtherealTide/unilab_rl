@@ -52,7 +52,7 @@ def _binder(backend: str) -> str | None:
 
 
 def _learner_name(algo: str) -> str:
-    return "FastSACLearner" if algo == "sac" else "FlashSACLearner"
+    return "SACLearner" if algo == "sac" else "FlashSACLearner"
 
 
 def _training_cfg() -> dict[str, Any]:
@@ -151,9 +151,9 @@ def _flashsac_cfg() -> Any:
 def test_sac_builder_forwards_backend_device_binder(
     monkeypatch: pytest.MonkeyPatch, with_binder: bool
 ) -> None:
-    import uni_rl.algos.fast_sac.double_buffer as module
+    import uni_rl.algos.sac.double_buffer as module
 
-    monkeypatch.setattr(module, "FastSACLearner", _FakeLearner)
+    monkeypatch.setattr(module, "SACLearner", _FakeLearner)
     monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
 
     kwargs: dict[str, Any] = {}
@@ -234,10 +234,10 @@ def test_double_buffer_builders_forward_tensor_runtime_settings(
     monkeypatch: pytest.MonkeyPatch, algo: str
 ) -> None:
     if algo == "sac":
-        import uni_rl.algos.fast_sac.double_buffer as module
+        import uni_rl.algos.sac.double_buffer as module
 
         cfg = _sac_cfg()
-        learner_name = "FastSACLearner"
+        learner_name = "SACLearner"
     else:
         import uni_rl.algos.flash_sac.double_buffer as module
 
@@ -288,7 +288,7 @@ def test_double_buffer_builders_reject_runtime_bounds_before_env_probe(
     monkeypatch: pytest.MonkeyPatch, algo: str
 ) -> None:
     if algo == "sac":
-        import uni_rl.algos.fast_sac.double_buffer as module
+        import uni_rl.algos.sac.double_buffer as module
 
         cfg = _sac_cfg()
         build = module.build_sac_double_buffer_runner
@@ -342,9 +342,9 @@ def test_flashsac_builder_resolves_tensor_runtime_before_collector_spawn(
 def test_sac_builder_resolves_tensor_runtime_before_collector_spawn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import uni_rl.algos.fast_sac.double_buffer as module
+    import uni_rl.algos.sac.double_buffer as module
 
-    monkeypatch.setattr(module, "FastSACLearner", _FakeLearner)
+    monkeypatch.setattr(module, "SACLearner", _FakeLearner)
     monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
     cfg = _sac_cfg()
     cfg.env = {"tensor_runtime": False}
@@ -364,9 +364,9 @@ def test_sac_builder_resolves_tensor_runtime_before_collector_spawn(
 def test_sac_builder_resolves_transport_on_cpu_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import uni_rl.algos.fast_sac.double_buffer as module
+    import uni_rl.algos.sac.double_buffer as module
 
-    monkeypatch.setattr(module, "FastSACLearner", _FakeLearner)
+    monkeypatch.setattr(module, "SACLearner", _FakeLearner)
     monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
     cfg = _sac_cfg()
 
@@ -407,14 +407,14 @@ def test_flashsac_builder_rejects_tensor_runtime_on_cpu(
 def test_sac_builder_forwards_custom_runtime_preparation_hook(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import uni_rl.algos.fast_sac.double_buffer as module
+    import uni_rl.algos.sac.double_buffer as module
     from uni_rl.offpolicy.runtime import OffPolicyRuntime
 
     def prepare_hook(learner, context):
         del learner, context
 
     runtime = OffPolicyRuntime(learner_cls=_FakeLearner, learner_prepare_hook=prepare_hook)
-    monkeypatch.setattr(module, "FastSACLearner", _FakeLearner)
+    monkeypatch.setattr(module, "SACLearner", _FakeLearner)
     monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
     monkeypatch.setattr(module, "resolve_custom_offpolicy_runtime", lambda rl_cfg: runtime)
 

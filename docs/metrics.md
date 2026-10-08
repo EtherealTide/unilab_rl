@@ -73,7 +73,7 @@ metrics.
   they are not forced onto PPO's `Loss/surrogate` or `Loss/value`.
 - SAC policy temperature is a post-update state and uses
   `Policy/temperature`; estimates and optimizer diagnostics use `Loss/entropy`
-  and `Train/*_gradient_norm`. FastSAC's former pre-update action-standard-deviation
+  and `Train/*_gradient_norm`. SAC's former pre-update action-standard-deviation
   chart is omitted instead of misusing the RSL-RL `Policy/mean_std` semantics.
 - PPO/APPO update diagnostics use `Train/*` rather than a separate algorithm
   namespace. In particular, `Train/behavior_to_current_log_prob_delta` remains
@@ -104,7 +104,7 @@ SAC-family collectors have no equivalent complete rollout phase to misrepresent.
 runner measured the complete iteration wall time; an accounted-phase sum is not
 presented as wall time.
 
-Deferred FastSAC/FlashSAC device reads use the same unsuffixed canonical
+Deferred SAC/FlashSAC device reads use the same unsuffixed canonical
 tags; their schema aggregation states that these learners sample the final update
 when deferral is active. Historical migration notes below identify old fields
 whose unsuffixed meaning was not declared.
@@ -192,7 +192,7 @@ new runs do not emit or accept the old keys.
 | `train/alpha_loss`, `train/temperature_loss` | `Loss/temperature` |
 | `train/alpha`, `train/temperature` | `Policy/temperature` |
 | `Policy/mean_std`, `policy/mean_std` | `Policy/mean_std` |
-| `train/action_std` | _removed_; FastSAC sampled it before the actor update |
+| `train/action_std` | _removed_; SAC sampled it before the actor update |
 | `Loss/learning_rate`, `optim/learning_rate` | `Loss/learning_rate` |
 | `grad/global_norm` | `Train/global_gradient_norm` |
 | `train/actor_grad_norm` | `Train/actor_gradient_norm` |

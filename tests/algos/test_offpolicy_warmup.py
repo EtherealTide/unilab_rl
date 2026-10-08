@@ -11,8 +11,8 @@ from typing import Any
 import pytest
 import torch
 
-from uni_rl.algos.fast_sac.learner import FastSACLearner
 from uni_rl.algos.flash_sac.learner import FlashSACLearner
+from uni_rl.algos.sac.learner import SACLearner
 from uni_rl.offpolicy.warmup import OffPolicyWarmupContext
 
 
@@ -54,7 +54,7 @@ def _assert_equivalent(left: Any, right: Any, path: str = "state") -> None:
 @pytest.mark.parametrize(
     "learner",
     [
-        FastSACLearner(
+        SACLearner(
             obs_dim=4,
             action_dim=2,
             critic_obs_dim=5,
@@ -91,7 +91,7 @@ def _assert_equivalent(left: Any, right: Any, path: str = "state") -> None:
             critic_normalize_parameters=False,
         ),
     ],
-    ids=["fastsac", "flashsac", "flashsac-unnormalized"],
+    ids=["sac", "flashsac", "flashsac-unnormalized"],
 )
 def test_compatibility_warmup_restores_complete_learner_state(learner: Any) -> None:
     torch.manual_seed(321)
@@ -169,10 +169,10 @@ def test_flashsac_whole_cycle_warmup_captures_representative_batch(
     _assert_equivalent(original_state, learner.get_state_dict())
 
 
-def test_fastsac_whole_cycle_warmup_captures_before_collection(
+def test_sac_whole_cycle_warmup_captures_before_collection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    learner = FastSACLearner(
+    learner = SACLearner(
         obs_dim=4,
         action_dim=2,
         critic_obs_dim=5,
@@ -202,10 +202,10 @@ def test_fastsac_whole_cycle_warmup_captures_before_collection(
 @pytest.mark.parametrize(
     ("module_name", "learner_cls"),
     [
-        ("uni_rl.algos.fast_sac.learner", FastSACLearner),
+        ("uni_rl.algos.sac.learner", SACLearner),
         ("uni_rl.algos.flash_sac.learner", FlashSACLearner),
     ],
-    ids=["fastsac", "flashsac"],
+    ids=["sac", "flashsac"],
 )
 def test_compatibility_warmup_exercises_compiled_update_paths(
     monkeypatch: pytest.MonkeyPatch,
@@ -228,7 +228,7 @@ def test_compatibility_warmup_exercises_compiled_update_paths(
     monkeypatch.setattr(module, "get_torch_compile_for_cuda", lambda *args, **kwargs: compile_fn)
     learner_kwargs = (
         {"critic_obs_dim": 5, "num_atoms": 3, "use_layer_norm": False}
-        if learner_cls is FastSACLearner
+        if learner_cls is SACLearner
         else {
             "critic_obs_dim": 6,
             "actor_num_blocks": 1,

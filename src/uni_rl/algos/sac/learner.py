@@ -1,11 +1,11 @@
-"""FastSAC Learner — replicated from holosoma's FastSAC implementation.
+"""SAC Learner — replicated from holosoma's SAC implementation.
 
 Network architecture:
 - Actor: MLP with SiLU + LayerNorm, tanh-squashed Gaussian
 - Critic: Distributional Q-Networks (C51 variant, num_atoms=101)
 - Automatic entropy coefficient (alpha) learning
 
-Hyperparameters aligned with holosoma FastSACConfig defaults.
+Hyperparameters aligned with holosoma SACConfig defaults.
 """
 
 from __future__ import annotations
@@ -385,14 +385,14 @@ class SACCritic(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# FastSACLearner — the training algorithm
+# SACLearner — the training algorithm
 # ---------------------------------------------------------------------------
 
 
-class FastSACLearner(LearnerBoilerplateMixin):
-    """FastSAC learner with holosoma-aligned hyperparameters.
+class SACLearner(LearnerBoilerplateMixin):
+    """SAC learner with holosoma-aligned hyperparameters.
 
-    Key hyperparameters (aligned with holosoma FastSACConfig):
+    Key hyperparameters (aligned with holosoma SACConfig):
     - gamma=0.97, tau=0.125
     - batch_size=8192, num_updates=8, policy_frequency=4
     - alpha_init=0.001, target_entropy_ratio=0.0
@@ -445,7 +445,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
         self._nvidia_cuda = self._device_type == "cuda" and not is_hip_runtime()
         compile_fn = get_torch_compile_for_cuda(self.device, warn=not self._nvidia_cuda)
         if self._nvidia_cuda and compile_fn is None:
-            raise RuntimeError("FastSAC requires CUDA Inductor/Triton on NVIDIA CUDA")
+            raise RuntimeError("SAC requires CUDA Inductor/Triton on NVIDIA CUDA")
         # NVIDIA CUDA always uses the performance path; the legacy opt-out is
         # retained only for ROCm/HIP, MPS, CPU, and other compatibility devices.
         self.use_compile = self._nvidia_cuda or (bool(use_compile) and compile_fn is not None)
@@ -579,13 +579,13 @@ class FastSACLearner(LearnerBoilerplateMixin):
         self._compile_full_update_cycle = bool(self.use_compile and self._nvidia_cuda)
         if self._compile_full_update_cycle and self.scaler is not None:
             raise ValueError(
-                "FastSAC CUDA compile mode requires bf16 (or fp32); "
+                "SAC CUDA compile mode requires bf16 (or fp32); "
                 "fp16 GradScaler is incompatible with the whole-cycle graph"
             )
         if self._compile_full_update_cycle and not isinstance(self.obs_normalizer, nn.Identity):
-            raise ValueError("FastSAC whole-cycle CUDA graphs do not yet support obs normalization")
+            raise ValueError("SAC whole-cycle CUDA graphs do not yet support obs normalization")
         if self._compile_full_update_cycle and self.nvtx_profile_ranges:
-            raise ValueError("FastSAC whole-cycle CUDA graphs do not support NVTX ranges")
+            raise ValueError("SAC whole-cycle CUDA graphs do not support NVTX ranges")
         if self.use_compile:
             if self._compile_full_update_cycle:
                 self._materialize_capturable_optimizer_state()
@@ -661,7 +661,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
     def set_gradient_sync(self, sync: Callable[[Iterable[torch.Tensor]], None] | None) -> None:
         """Attach DP reduction and leave the unsupported whole-cycle graph.
 
-        The FastSAC CUDA whole-cycle graph is captured through the ordinary
+        The SAC CUDA whole-cycle graph is captured through the ordinary
         learner update path and does not yet host the runner's graph-safe DP
         collective. Preserve the develop-line behavior of selecting eager DP
         updates when synchronization is attached; changing or clearing the
@@ -760,7 +760,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
         setattr(optimizer, "found_inf", found_inf)
 
     def _compile_training_methods(self) -> None:
-        """Compile loss kernels for the selected FastSAC orchestration scope."""
+        """Compile loss kernels for the selected SAC orchestration scope."""
         compile_fn = get_torch_compile_for_cuda(self.device, warn=True)
         if compile_fn is None:
             return
@@ -1157,7 +1157,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
         del read_metrics  # Metrics are staged on device and read once by the runner.
         if not self.use_update_cycle:
             raise RuntimeError(
-                "FastSAC update_cycle() requires the NVIDIA CUDA whole-cycle path; "
+                "SAC update_cycle() requires the NVIDIA CUDA whole-cycle path; "
                 "use the per-update methods for compatibility devices"
             )
         self._ensure_update_cycle_graph(

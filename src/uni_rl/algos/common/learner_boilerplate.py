@@ -1,6 +1,6 @@
 """Algorithm-agnostic learner boilerplate shared by the off-policy SAC learners.
 
-``LearnerBoilerplateMixin`` centralizes the pieces of ``FastSACLearner`` and
+``LearnerBoilerplateMixin`` centralizes the pieces of ``SACLearner`` and
 ``FlashSACLearner`` that are identical between the two: AMP dtype/scaler
 resolution, autocast context, observation-normalizer updates, gradient-sync
 plumbing, and loss-method compilation. The mixin only declares the attribute

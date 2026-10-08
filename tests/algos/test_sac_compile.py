@@ -7,17 +7,17 @@ from typing import Any
 import pytest
 import torch
 
-import uni_rl.algos.fast_sac.learner as fast_sac_module
-from uni_rl.algos.fast_sac.learner import (
+import uni_rl.algos.sac.learner as sac_module
+from uni_rl.algos.sac.learner import (
     DistributionalQNetwork,
-    FastSACLearner,
     SACActor,
+    SACLearner,
 )
 from uni_rl.logging.metric_schema import normalize_metric_map
 
 
-def _small_fast_sac_learner(*, use_autotune: bool = True) -> FastSACLearner:
-    return FastSACLearner(
+def _small_sac_learner(*, use_autotune: bool = True) -> SACLearner:
+    return SACLearner(
         obs_dim=4,
         action_dim=2,
         critic_obs_dim=5,
@@ -45,8 +45,8 @@ def _small_offpolicy_batch(batch_size: int = 4) -> dict[str, torch.Tensor]:
     }
 
 
-def test_fast_sac_metric_source_keys_are_canonical() -> None:
-    learner = _small_fast_sac_learner()
+def test_sac_metric_source_keys_are_canonical() -> None:
+    learner = _small_sac_learner()
     batch = _small_offpolicy_batch()
 
     critic_metrics = learner.update_critic(batch)
@@ -68,14 +68,14 @@ def test_fast_sac_metric_source_keys_are_canonical() -> None:
     normalize_metric_map({**critic_metrics, **actor_metrics})
 
 
-def test_fast_sac_compile_targets_training_hot_paths(monkeypatch) -> None:
+def test_sac_compile_targets_training_hot_paths(monkeypatch) -> None:
     calls: list[tuple[str, dict[str, Any]]] = []
 
     def fake_compile(fn: Callable, **kwargs):
         calls.append((fn.__qualname__, kwargs))
         return fn
 
-    learner = FastSACLearner(
+    learner = SACLearner(
         obs_dim=4,
         action_dim=2,
         critic_obs_dim=5,
@@ -94,28 +94,28 @@ def test_fast_sac_compile_targets_training_hot_paths(monkeypatch) -> None:
 
     assert calls == [
         (
-            "FastSACLearner._critic_loss_tensors",
+            "SACLearner._critic_loss_tensors",
             {"dynamic": False, "options": {"triton.cudagraphs": True}},
         ),
         (
-            "FastSACLearner._actor_loss_tensors",
+            "SACLearner._actor_loss_tensors",
             {"dynamic": False, "options": {"triton.cudagraphs": True}},
         ),
     ]
 
 
-def test_fast_sac_whole_cycle_uses_max_autotune_without_nested_graphs(monkeypatch) -> None:
+def test_sac_whole_cycle_uses_max_autotune_without_nested_graphs(monkeypatch) -> None:
     calls: list[tuple[str, Any]] = []
 
     def fake_compile(fn: Callable, **kwargs):
         calls.append((fn.__qualname__, kwargs))
         return fn
 
-    learner = _small_fast_sac_learner()
+    learner = _small_sac_learner()
     learner.device = torch.device("cuda")
     learner._compile_full_update_cycle = True
     monkeypatch.setattr(
-        fast_sac_module,
+        sac_module,
         "get_torch_compile_for_cuda",
         lambda *_args, **_kwargs: fake_compile,
     )
@@ -124,18 +124,18 @@ def test_fast_sac_whole_cycle_uses_max_autotune_without_nested_graphs(monkeypatc
 
     assert calls == [
         (
-            "FastSACLearner._critic_loss_tensors",
+            "SACLearner._critic_loss_tensors",
             {"dynamic": False, "mode": "max-autotune-no-cudagraphs"},
         ),
         (
-            "FastSACLearner._actor_loss_tensors",
+            "SACLearner._actor_loss_tensors",
             {"dynamic": False, "mode": "max-autotune-no-cudagraphs"},
         ),
     ]
 
 
-def test_fast_sac_gradient_sync_leaves_whole_cycle_mode_for_dp() -> None:
-    learner = _small_fast_sac_learner()
+def test_sac_gradient_sync_leaves_whole_cycle_mode_for_dp() -> None:
+    learner = _small_sac_learner()
     learner._compile_full_update_cycle = True
     learner._update_cycle_graph_cache_key = ("old",)
 
@@ -162,7 +162,7 @@ def test_fast_sac_gradient_sync_leaves_whole_cycle_mode_for_dp() -> None:
 def test_dp_nonfinite_loss_with_finite_gradients_arms_same_gate(optimizer_name, monkeypatch):
     """A loss constant can overflow on one rank without corrupting its gradients."""
     for rank in range(2):
-        learner = _small_fast_sac_learner()
+        learner = _small_sac_learner()
         learner._device_type = "cuda"  # Exercise gate math with CPU tensors.
         learner._host_finite_checks = False
         optimizer = getattr(learner, optimizer_name)
@@ -188,7 +188,7 @@ def test_dp_nonfinite_loss_with_finite_gradients_arms_same_gate(optimizer_name, 
 
 
 def test_gradient_graph_capture_hook_ends_when_warmup_fails(monkeypatch):
-    learner = _small_fast_sac_learner()
+    learner = _small_sac_learner()
     events = []
     learner.set_gradient_graph_hooks(
         lambda: events.append("begin"), lambda: events.append("end"), lambda: None
@@ -209,8 +209,8 @@ def test_gradient_graph_capture_hook_ends_when_warmup_fails(monkeypatch):
     assert events == ["begin", "end"]
 
 
-def test_fast_sac_update_cycle_rejects_compatibility_fallback() -> None:
-    learner = _small_fast_sac_learner()
+def test_sac_update_cycle_rejects_compatibility_fallback() -> None:
+    learner = _small_sac_learner()
 
     with pytest.raises(RuntimeError, match="requires the NVIDIA CUDA whole-cycle path"):
         learner.update_cycle(
@@ -223,13 +223,11 @@ def test_fast_sac_update_cycle_rejects_compatibility_fallback() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA runtime required")
-def test_fast_sac_nvidia_cuda_fails_closed_without_inductor(monkeypatch) -> None:
-    monkeypatch.setattr(
-        fast_sac_module, "get_torch_compile_for_cuda", lambda *_args, **_kwargs: None
-    )
+def test_sac_nvidia_cuda_fails_closed_without_inductor(monkeypatch) -> None:
+    monkeypatch.setattr(sac_module, "get_torch_compile_for_cuda", lambda *_args, **_kwargs: None)
 
     with pytest.raises(RuntimeError, match="requires CUDA Inductor/Triton"):
-        FastSACLearner(
+        SACLearner(
             obs_dim=4,
             action_dim=2,
             critic_obs_dim=5,
@@ -239,10 +237,10 @@ def test_fast_sac_nvidia_cuda_fails_closed_without_inductor(monkeypatch) -> None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime selection required")
-def test_fast_sac_hip_cuda_keeps_compatible_compile_opt_out(monkeypatch) -> None:
+def test_sac_hip_cuda_keeps_compatible_compile_opt_out(monkeypatch) -> None:
     with monkeypatch.context() as hip_runtime:
         hip_runtime.setattr(torch.version, "hip", "simulated-rocm", raising=False)
-        learner = FastSACLearner(
+        learner = SACLearner(
             obs_dim=4,
             action_dim=2,
             critic_obs_dim=5,
@@ -262,9 +260,9 @@ def test_fast_sac_hip_cuda_keeps_compatible_compile_opt_out(monkeypatch) -> None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA runtime required")
-def test_fast_sac_nvidia_cuda_fails_closed_for_graph_incompatible_options(monkeypatch) -> None:
+def test_sac_nvidia_cuda_fails_closed_for_graph_incompatible_options(monkeypatch) -> None:
     monkeypatch.setattr(
-        fast_sac_module,
+        sac_module,
         "get_torch_compile_for_cuda",
         lambda *_args, **_kwargs: lambda fn: fn,
     )
@@ -281,16 +279,16 @@ def test_fast_sac_nvidia_cuda_fails_closed_for_graph_incompatible_options(monkey
     }
 
     with pytest.raises(ValueError, match="fp16 GradScaler"):
-        FastSACLearner(**common, use_amp=True, amp_dtype="fp16")
+        SACLearner(**common, use_amp=True, amp_dtype="fp16")
 
     with pytest.raises(ValueError, match="obs normalization"):
-        FastSACLearner(**common, obs_normalization=True)
+        SACLearner(**common, obs_normalization=True)
 
     with pytest.raises(ValueError, match="NVTX ranges"):
-        FastSACLearner(**common, nvtx_profile_ranges=True)
+        SACLearner(**common, nvtx_profile_ranges=True)
 
 
-def test_fast_sac_categorical_projection_preserves_rows() -> None:
+def test_sac_categorical_projection_preserves_rows() -> None:
     num_atoms = 5
     qnet = DistributionalQNetwork(
         obs_dim=4,
@@ -336,7 +334,7 @@ def test_fast_sac_categorical_projection_preserves_rows() -> None:
     assert torch.allclose(projected.sum(dim=-1), torch.ones(4), atol=1e-6)
 
 
-def test_fast_sac_cuda_adamw_optimizers_are_capturable(monkeypatch) -> None:
+def test_sac_cuda_adamw_optimizers_are_capturable(monkeypatch) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA-only optimizer kwargs require a CUDA-enabled torch build")
 
@@ -348,17 +346,15 @@ def test_fast_sac_cuda_adamw_optimizers_are_capturable(monkeypatch) -> None:
 
     monkeypatch.setattr(torch.optim, "AdamW", _FakeAdamW)
     monkeypatch.setattr(
-        fast_sac_module,
+        sac_module,
         "get_torch_compile_for_cuda",
         lambda *_args, **_kwargs: lambda fn: fn,
     )
-    monkeypatch.setattr(
-        FastSACLearner, "_materialize_capturable_optimizer_state", lambda _self: None
-    )
-    monkeypatch.setattr(FastSACLearner, "_compile_training_methods", lambda _self: None)
+    monkeypatch.setattr(SACLearner, "_materialize_capturable_optimizer_state", lambda _self: None)
+    monkeypatch.setattr(SACLearner, "_compile_training_methods", lambda _self: None)
 
     for device in ("cuda", torch.device("cuda")):
-        FastSACLearner(
+        SACLearner(
             obs_dim=4,
             action_dim=2,
             critic_obs_dim=5,
@@ -377,7 +373,7 @@ def test_fast_sac_cuda_adamw_optimizers_are_capturable(monkeypatch) -> None:
     assert all(call["capturable"] for call in calls)
 
 
-def test_fast_sac_cpu_adamw_optimizers_keep_default_capturability(monkeypatch) -> None:
+def test_sac_cpu_adamw_optimizers_keep_default_capturability(monkeypatch) -> None:
     calls: list[dict[str, Any]] = []
 
     class _FakeAdamW:
@@ -386,7 +382,7 @@ def test_fast_sac_cpu_adamw_optimizers_keep_default_capturability(monkeypatch) -
 
     monkeypatch.setattr(torch.optim, "AdamW", _FakeAdamW)
 
-    FastSACLearner(
+    SACLearner(
         obs_dim=4,
         action_dim=2,
         critic_obs_dim=5,
@@ -405,23 +401,23 @@ def test_fast_sac_cpu_adamw_optimizers_keep_default_capturability(monkeypatch) -
     assert all("capturable" not in call for call in calls)
 
 
-def test_fast_sac_amp_dtype_resolution_and_scaler_rules() -> None:
-    assert FastSACLearner._resolve_amp_dtype("auto", "cuda") is torch.bfloat16
-    assert FastSACLearner._resolve_amp_dtype("auto", "xpu") is torch.bfloat16
-    assert FastSACLearner._resolve_amp_dtype("fp16", "cuda") is torch.float16
-    assert FastSACLearner._resolve_amp_dtype("bf16", "cuda") is torch.bfloat16
+def test_sac_amp_dtype_resolution_and_scaler_rules() -> None:
+    assert SACLearner._resolve_amp_dtype("auto", "cuda") is torch.bfloat16
+    assert SACLearner._resolve_amp_dtype("auto", "xpu") is torch.bfloat16
+    assert SACLearner._resolve_amp_dtype("fp16", "cuda") is torch.float16
+    assert SACLearner._resolve_amp_dtype("bf16", "cuda") is torch.bfloat16
 
-    assert FastSACLearner._should_use_grad_scaler(True, "cuda", torch.float16)
-    assert not FastSACLearner._should_use_grad_scaler(True, "cuda", torch.bfloat16)
-    assert not FastSACLearner._should_use_grad_scaler(True, "xpu", torch.bfloat16)
-    assert not FastSACLearner._should_use_grad_scaler(False, "cuda", torch.float16)
+    assert SACLearner._should_use_grad_scaler(True, "cuda", torch.float16)
+    assert not SACLearner._should_use_grad_scaler(True, "cuda", torch.bfloat16)
+    assert not SACLearner._should_use_grad_scaler(True, "xpu", torch.bfloat16)
+    assert not SACLearner._should_use_grad_scaler(False, "cuda", torch.float16)
 
     with pytest.raises(ValueError, match="amp_dtype"):
-        FastSACLearner._resolve_amp_dtype("tf32", "cuda")
+        SACLearner._resolve_amp_dtype("tf32", "cuda")
 
 
-def test_fast_sac_alpha_loss_helper_matches_reference_value_and_grad() -> None:
-    learner = FastSACLearner(
+def test_sac_alpha_loss_helper_matches_reference_value_and_grad() -> None:
+    learner = SACLearner(
         obs_dim=4,
         action_dim=3,
         critic_obs_dim=5,
@@ -535,8 +531,8 @@ def test_sac_actor_tensor_gaussian_sampling_matches_normal_without_tanh() -> Non
     torch.testing.assert_close(log_std.grad, reference_log_std.grad)
 
 
-def test_fast_sac_actor_update_does_not_accumulate_critic_gradients() -> None:
-    learner = _small_fast_sac_learner()
+def test_sac_actor_update_does_not_accumulate_critic_gradients() -> None:
+    learner = _small_sac_learner()
 
     learner.update_actor(_small_offpolicy_batch())
 
@@ -544,8 +540,8 @@ def test_fast_sac_actor_update_does_not_accumulate_critic_gradients() -> None:
     assert all(parameter.grad is None for parameter in learner.qnet.parameters())
 
 
-def test_fast_sac_public_updates_can_defer_metric_reads() -> None:
-    learner = _small_fast_sac_learner()
+def test_sac_public_updates_can_defer_metric_reads() -> None:
+    learner = _small_sac_learner()
     batch = _small_offpolicy_batch()
 
     assert learner.update_critic(batch, read_metrics=False) == {}
@@ -556,14 +552,14 @@ def test_fast_sac_public_updates_can_defer_metric_reads() -> None:
     ("policy_frequency", "target_frequency", "policy_before_critic"),
     [(2, 3, False), (2, 3, True)],
 )
-def test_fast_sac_update_cycle_matches_runner_composition(
+def test_sac_update_cycle_matches_runner_composition(
     policy_frequency: int,
     target_frequency: int,
     policy_before_critic: bool,
 ) -> None:
-    def seeded_learner() -> FastSACLearner:
+    def seeded_learner() -> SACLearner:
         torch.manual_seed(1234)
-        return _small_fast_sac_learner()
+        return _small_sac_learner()
 
     actual = seeded_learner()
     expected = seeded_learner()
@@ -620,8 +616,8 @@ def test_fast_sac_update_cycle_matches_runner_composition(
                 )
 
 
-def test_fast_sac_update_cycle_defers_metrics_until_one_read() -> None:
-    learner = _small_fast_sac_learner()
+def test_sac_update_cycle_defers_metrics_until_one_read() -> None:
+    learner = _small_sac_learner()
     batch = _small_offpolicy_batch()
     large_batch = {key: value.repeat(2, *[1] * (value.ndim - 1)) for key, value in batch.items()}
 
@@ -650,11 +646,11 @@ def test_fast_sac_update_cycle_defers_metrics_until_one_read() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only whole-cycle graph")
-def test_fast_sac_update_cycle_raw_graph_replays_with_stable_inputs_and_metrics(
+def test_sac_update_cycle_raw_graph_replays_with_stable_inputs_and_metrics(
     monkeypatch,
 ) -> None:
     torch.manual_seed(123)
-    learner = FastSACLearner(
+    learner = SACLearner(
         obs_dim=4,
         action_dim=2,
         critic_obs_dim=5,
@@ -669,7 +665,7 @@ def test_fast_sac_update_cycle_raw_graph_replays_with_stable_inputs_and_metrics(
     torch.manual_seed(123)
     with monkeypatch.context() as hip_runtime:
         hip_runtime.setattr(torch.version, "hip", "simulated-rocm", raising=False)
-        eager_learner = FastSACLearner(
+        eager_learner = SACLearner(
             obs_dim=4,
             action_dim=2,
             critic_obs_dim=5,
@@ -745,9 +741,9 @@ def test_fast_sac_update_cycle_raw_graph_replays_with_stable_inputs_and_metrics(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only whole-cycle graph")
-def test_fast_sac_update_cycle_rekeys_on_shape_and_invalidates_checkpoint() -> None:
+def test_sac_update_cycle_rekeys_on_shape_and_invalidates_checkpoint() -> None:
     torch.manual_seed(123)
-    learner = FastSACLearner(
+    learner = SACLearner(
         obs_dim=4,
         action_dim=2,
         critic_obs_dim=5,
@@ -822,12 +818,12 @@ def test_fast_sac_update_cycle_rekeys_on_shape_and_invalidates_checkpoint() -> N
     ],
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only fused optimizer gate")
-def test_fast_sac_armed_finite_gate_skips_nonfinite_optimizer_step(
+def test_sac_armed_finite_gate_skips_nonfinite_optimizer_step(
     optimizer_name: str,
     loss_value: float,
     grad_value: float,
 ) -> None:
-    learner = FastSACLearner(
+    learner = SACLearner(
         obs_dim=4,
         action_dim=2,
         critic_obs_dim=5,

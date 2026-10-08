@@ -1,4 +1,4 @@
-"""FastSAC builder for the device-authoritative replay path."""
+"""SAC builder for the device-authoritative replay path."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from uni_rl.algos.fast_sac.learner import FastSACLearner
+from uni_rl.algos.sac.learner import SACLearner
 from uni_rl.env_contract import EnvFactory
 from uni_rl.offpolicy.actor_adapter import import_actor_adapter_modules
 from uni_rl.offpolicy.double_buffer_runner import DoubleBufferOffPolicyRunner
@@ -52,7 +52,7 @@ def build_sac_double_buffer_runner(
     # Invalid training knobs must fail closed without materializing a backend.
     tensor_runtime_settings = resolve_tensor_runtime_settings(
         cfg,
-        algo_name="FastSAC",
+        algo_name="SAC",
         num_envs=cfg.algo.num_envs,
     )
     probe_env = env_factory(1, env_cfg_override)
@@ -67,7 +67,7 @@ def build_sac_double_buffer_runner(
     inference_placement = resolve_inference_transport(
         cfg,
         device=device,
-        algo_name="FastSAC",
+        algo_name="SAC",
         env_tensor_native=env_tensor_native,
     )
 
@@ -87,7 +87,7 @@ def build_sac_double_buffer_runner(
     finally:
         env.close()
 
-    learner_cls: type[Any] = FastSACLearner
+    learner_cls: type[Any] = SACLearner
     algo_type = "sac"
     learner_extra_kwargs: dict[str, Any] = {}
     if custom_runtime is not None:

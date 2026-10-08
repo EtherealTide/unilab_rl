@@ -39,7 +39,7 @@ def build_actor(
             priv_mlp_hidden_dims=priv_mlp_hidden_dims,
         )
     if algo_type == "sac":
-        from uni_rl.algos.fast_sac.learner import SACActor
+        from uni_rl.algos.sac.learner import SACActor
 
         return SACActor(
             obs_dim=obs_dim,

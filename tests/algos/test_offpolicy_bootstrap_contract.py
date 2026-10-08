@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from uni_rl.algos.fast_sac.learner import FastSACLearner
+from uni_rl.algos.sac.learner import SACLearner
 
 
 class _CaptureSacTargetCritic(torch.nn.Module):
@@ -36,8 +36,8 @@ def _offpolicy_batch(batch_size: int = 3) -> dict[str, torch.Tensor]:
     }
 
 
-def test_fast_sac_critic_bootstrap_uses_combined_dones_and_truncated() -> None:
-    learner = FastSACLearner(
+def test_sac_critic_bootstrap_uses_combined_dones_and_truncated() -> None:
+    learner = SACLearner(
         obs_dim=4,
         action_dim=2,
         critic_obs_dim=5,
@@ -58,8 +58,8 @@ def test_fast_sac_critic_bootstrap_uses_combined_dones_and_truncated() -> None:
     torch.testing.assert_close(target_critic.bootstrap, torch.tensor([1.0, 1.0, 0.0]))
 
 
-def test_fast_sac_critic_requires_truncated_field() -> None:
-    learner = FastSACLearner(
+def test_sac_critic_requires_truncated_field() -> None:
+    learner = SACLearner(
         obs_dim=4,
         action_dim=2,
         critic_obs_dim=5,
@@ -79,4 +79,4 @@ def test_fast_sac_critic_requires_truncated_field() -> None:
     except KeyError as exc:
         assert exc.args == ("truncated",)
     else:  # pragma: no cover - explicit failure path
-        raise AssertionError("FastSAC learner must require replay 'truncated'")
+        raise AssertionError("SAC learner must require replay 'truncated'")

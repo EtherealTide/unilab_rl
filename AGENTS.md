@@ -14,7 +14,7 @@ uni_rl（distribution 名 `unilab-rl`）是从 UniLab 拆出的 **RL 算法与�
 
 ## Layout
 
-- `src/uni_rl/algos/` — `appo`（异步 PPO）、`fast_sac` / `flash_sac`（off-policy learner + double-buffer builder）、`common`（共享网络 / normalization / compile 辅助 / learner 样板 mixin）
+- `src/uni_rl/algos/` — `appo`（异步 PPO）、`sac` / `flash_sac`（off-policy learner + double-buffer builder）、`common`（共享网络 / normalization / compile 辅助 / learner 样板 mixin）
 - `src/uni_rl/ipc/` — async runner、shm rollout/replay buffer、replay pipeline、DP gradient sync、memory budget
 - `src/uni_rl/offpolicy/` — 通用 off-policy double-buffer runner 脚手架；`actor_adapter.py` 是自定义 off-policy actor 的扩展 registry
 - `src/uni_rl/logging/` — tensorboard / wandb logger、trace recorder、collector 指标分发（metrics_drain）

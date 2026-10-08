@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.4.5] - 2026-10-08
+## [1.4.6] - 2026-10-08
 
 ### Added
 
@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update count. Invalid or missing checkpoint progress metadata fails closed.
 - Reviewed tensor-runtime defaults and deterministic bounds for inference-ring
   capacity, collector metric intervals, replay ingress depth, replay ingress
-  slot rows, and learner sampling. FastSAC and FlashSAC resolve one validated
+  slot rows, and learner sampling. SAC and FlashSAC resolve one validated
   settings object before environment probing, and runtime manifests
   record configured, default, effective, and maximum values.
 - Configurable bounded replay-ingress slots that may contain fewer rows than a
@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Made `SAC` the sole public identity for the high-performance SAC
+  implementation, with no compatibility layer: the package is
+  `uni_rl.algos.sac`, the learner class is `SACLearner`, and display/log names
+  use `SAC`. Existing consumers must update imports and runtime references.
 - Removed the separate age-biased SAC algorithm identity and package.
   FlashSAC now owns its substantive behavior as options: age-biased device
   replay (`decay_step`, `replay_min_weight`, `replay_num_buckets`), actor/critic
@@ -78,7 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - A learner-owned off-policy preparation phase between DP initialization and
-  collector startup. FastSAC and FlashSAC warm representative actor
+  collector startup. SAC and FlashSAC warm representative actor
   inference, replay gather/device paths, and compiled update/CUDA-graph paths
   before tick 0.
 - Custom learner/runtime/actor warmup hooks: `prepare_for_collection`,
@@ -112,14 +116,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `log_interval` backend-logging throttle on `BaseTrainingLogger`,
   `OffPolicyLogger`, `OnPolicyLogger`, `OffPolicyRunner`, and `APPORunner`
-  (all default 1). The off-policy builders (`fast_sac`, `flash_sac`) read it
+  (all default 1). The off-policy builders (`sac`, `flash_sac`) read it
   from `cfg.training.log_interval`. Terminal rendering is
   unaffected; only TensorBoard/wandb writes are gated, and the final iteration
   is always logged.
 
 ### Changed
 
-- FastSAC and FlashSAC now use one owner-managed
+- SAC and FlashSAC now use one owner-managed
   whole-update-cycle CUDA Graph on NVIDIA CUDA. Both compile that graph
   with architecture-portable Inductor max autotuning. The legacy NVIDIA
   opt-out and loss-graph fallback were removed; incompatible options fail
@@ -150,7 +154,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update count is derived from its configured epoch/minibatch schedule instead
   of being charted.
 - Removed derived or semantically mismatched charts: APPO staging-pool occupancy,
-  active collector throughput, learner replay throughput, and FastSAC's
+  active collector throughput, learner replay throughput, and SAC's
   pre-update action standard deviation are no longer persisted. Async reward
   terms are now averaged across the collector reports in each learner iteration.
 
@@ -190,7 +194,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- FastSAC's compiled C51 projection no longer caches an Inductor CUDA Graph
+- SAC's compiled C51 projection no longer caches an Inductor CUDA Graph
   Trees output tensor in Python. Recreating the row-offset tensor inside the
   traced expression avoids stale output storage across compiled replays; the
   recreated offsets retain the original `num_atoms` row stride and therefore
@@ -225,15 +229,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- FastSAC's `torch.compile` path now enables Inductor CUDA Graph replay for
+- SAC's `torch.compile` path now enables Inductor CUDA Graph replay for
   fused critic/actor loss kernels and defers scalar metric reads to the final
   update in each learner cycle.
-- FastSAC actor updates no longer accumulate unused critic-parameter gradients.
+- SAC actor updates no longer accumulate unused critic-parameter gradients.
   The policy still receives the same `dQ/da` gradient.
-- Compiled FastSAC updates replace per-loss host finite-check synchronization
+- Compiled SAC updates replace per-loss host finite-check synchronization
   with fused-optimizer device gating, preserving non-finite step suppression
   without fragmenting the learner window.
-- FastSAC critic CUDA Graph replay now captures the Polyak target-network
+- SAC critic CUDA Graph replay now captures the Polyak target-network
   update, removing the graph-external foreach launches between critic replays.
 - The off-policy runtime manifest now reports the effective CUDA Graph replay,
   packed-staging, target-update capture, and eager-fallback state.
@@ -243,7 +247,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed a redundant CUDA stream synchronization between learner-owned actor
   inference and its blocking D2H action copy. CUDA event timing preserves the
   forward-duration metric without adding another graph-boundary sync.
-- FastSAC CUDA Graph calls now fail closed to eager updates when observation
+- SAC CUDA Graph calls now fail closed to eager updates when observation
   normalization is active, matching the existing FlashSAC safety behavior.
 
 ## [1.3.2] - 2026-09-22
@@ -256,7 +260,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"td3"` entries in the off-policy worker exploration routing and the
   double-buffer runner display names, and the TD3-only
   `Critic` / `DistributionalQNetwork` networks in
-  `uni_rl.algos.common` (FastSAC and FlashSAC each define their own critic
+  `uni_rl.algos.common` (SAC and FlashSAC each define their own critic
   networks). UniLab has dropped its TD3 task configs and dispatch branches
   accordingly.
 
@@ -283,7 +287,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The FastSAC, FlashSAC, and FastTD3 double-buffer builders now require and
+- The SAC, FlashSAC, and FastTD3 double-buffer builders now require and
   directly read `training.inference_request_timeout_sec`.
 
 ### Fixed
@@ -293,13 +297,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inference-tick timeout only after collector readiness, so backend-owned cold
   starts (such as Genesis JIT and first reset) cannot consume the steady-state
   tick budget. FlashSAC and FastTD3 builders also forward
-  `training.inference_request_timeout_sec`, matching FastSAC.
+  `training.inference_request_timeout_sec`, matching SAC.
 
 ## [1.2.1] - 2026-09-15
 
 ### Removed
 
-- `FastSACRunner` and `FlashSACRunner` kwargs-style runner classes. They were
+- `SACRunner` and `FlashSACRunner` kwargs-style runner classes. They were
   stale duplicates of the `build_*_double_buffer_runner` builder functions
   (lacking `dp_sync`, `nan_guard_cfg`, `collector_cpu_ids`,
   `actor_adapter_modules`, and `inference_request_timeout_sec` support) with no
@@ -331,7 +335,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared learner boilerplate (AMP dtype resolution, grad-scaler/autocast,
   gradient sync, obs-normalizer update, Polyak target update, CUDA-graph
   release/compile helpers) is consolidated into
-  `uni_rl.algos.common.learner_boilerplate`; `fast_sac` and `flash_sac`
+  `uni_rl.algos.common.learner_boilerplate`; `sac` and `flash_sac`
   learners no longer carry 24 byte-identical method copies. Behavior is
   bit-identical (verified by A/B comparison).
 - Collector metrics draining is shared between `APPORunner` and
@@ -447,7 +451,7 @@ keys) is now covered by semantic versioning.
 
 ### Changed
 
-- Grouped algorithm packages under `uni_rl.algos` (`appo`, `fast_sac`,
+- Grouped algorithm packages under `uni_rl.algos` (`appo`, `sac`,
   `fast_td3`, `flash_sac`, `him_ppo`, `hora`, `rsl_rl` wrappers, `common`).
 - Added CI (ruff / mypy / pyright / pytest+coverage) and release workflows,
   plus `AGENTS.md` contributor guidance.

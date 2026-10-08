@@ -41,7 +41,7 @@ environment stack.
 - **Async PPO (APPO)**: native collector/learner multiprocess implementation
   (actor/critic networks built on
   [rsl_rl](https://github.com/leggedrobotics/rsl_rl) model classes)
-- **Off-policy**: FastSAC and FlashSAC with double-buffer async runners;
+- **Off-policy**: SAC and FlashSAC with double-buffer async runners;
   FlashSAC supports optional age-biased replay sampling
 - **Runtime infrastructure**: shared-memory rollout/replay buffers, replay
   pipelines, data-parallel gradient sync, memory budgeting, tensorboard/wandb
@@ -50,7 +50,7 @@ environment stack.
 ## Layout
 
 - `uni_rl.algos.*` — the algorithm layer: async on-policy (`appo`),
-  off-policy learners (`fast_sac`, `flash_sac`), and shared
+  off-policy learners (`sac`, `flash_sac`), and shared
   algorithm helpers (`common`)
 - `uni_rl.ipc` — runtime infrastructure: async runner, shared-memory
   rollout/replay buffers, replay pipelines, DP gradient sync, memory budget
@@ -106,7 +106,7 @@ and before starting the collector. Implement
 `prepare_for_collection(context: OffPolicyWarmupContext)` on a custom learner
 for compilation, graph capture, and other cold paths. Preparation must leave
 weights, optimizers, schedulers, RNG state, and counters unchanged; compiler and
-graph caches are the only sanctioned retained effects. A custom FastSAC runtime
+graph caches are the only sanctioned retained effects. A custom SAC runtime
 may instead provide `OffPolicyRuntime.learner_prepare_hook`, and actor adapters
 may provide `warmup_actions`.
 

@@ -197,7 +197,7 @@ def test_offpolicy_logger_rejects_unknown_timing_profile() -> None:
 
 def test_offpolicy_logger_shows_complete_additive_learner_timeline() -> None:
     logger = OffPolicyLogger(
-        algo_name="FastSAC",
+        algo_name="SAC",
         max_iterations=2,
         num_envs=8,
         env_name="Dummy",
@@ -354,7 +354,7 @@ def test_offpolicy_logger_training_timer_excludes_warmup_from_elapsed_and_eta(
     monkeypatch.setattr(common_logger_module.time, "time", lambda: now)
 
     logger = OffPolicyLogger(
-        algo_name="FastSAC",
+        algo_name="SAC",
         max_iterations=2,
         num_envs=8,
         env_name="G1WalkFlat",
@@ -377,7 +377,7 @@ def test_offpolicy_logger_training_timer_excludes_warmup_from_elapsed_and_eta(
 
 def test_offpolicy_logger_moves_identity_and_iteration_to_panel_title() -> None:
     logger = OffPolicyLogger(
-        algo_name="FastSAC",
+        algo_name="SAC",
         max_iterations=5000,
         num_envs=4096,
         env_name="G1WalkFlat",
@@ -396,9 +396,9 @@ def test_offpolicy_logger_moves_identity_and_iteration_to_panel_title() -> None:
 
     assert isinstance(display.title, type(header))
     assert display.title.plain == (
-        " 🚀 UniLab Off-Policy Training | FastSAC | G1WalkFlat | GPUs 1 | iter 5000/5000 "
+        " 🚀 UniLab Off-Policy Training | SAC | G1WalkFlat | GPUs 1 | iter 5000/5000 "
     )
-    assert "FastSAC" not in header.plain
+    assert "SAC" not in header.plain
     assert "G1WalkFlat" not in header.plain
     assert "iter 5000/5000" not in header.plain
     assert "Training" not in header.plain
