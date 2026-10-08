@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
 from omegaconf import DictConfig, OmegaConf
 
 from uni_rl.algos.flash_sac.learner import FlashSACLearner
+from uni_rl.algos.flash_sac.replay import AgeBiasedReplayPipeline
 from uni_rl.env_contract import EnvFactory
 from uni_rl.ipc.replay_pipelines.gpu_resident import require_offpolicy_replay_device
 from uni_rl.offpolicy.double_buffer_runner import DoubleBufferOffPolicyRunner
@@ -25,6 +27,13 @@ from uni_rl.utils.tensor_runtime import (
 
 if TYPE_CHECKING:
     from uni_rl.ipc.dp_sync import DpParameterSync
+
+
+def _algo_param(algo_cfg: DictConfig, name: str, default: Any) -> Any:
+    params = algo_cfg.get("algo_params", {})
+    if name in params:
+        return params[name]
+    return algo_cfg.get(name, default)
 
 
 def _validate_flashsac_double_buffer_runtime(
@@ -134,6 +143,12 @@ def build_flashsac_double_buffer_runner(
         "compile_full_objectives": bool(
             getattr(cfg.algo.algo_params, "compile_full_objectives", False)
         ),
+        "actor_normalize_parameters": bool(
+            _algo_param(cfg.algo, "actor_normalize_parameters", True)
+        ),
+        "critic_normalize_parameters": bool(
+            _algo_param(cfg.algo, "critic_normalize_parameters", True)
+        ),
     }
     learner = FlashSACLearner(device=device, **learner_kwargs)
 
@@ -148,6 +163,8 @@ def build_flashsac_double_buffer_runner(
         learning_starts=cfg.algo.learning_starts,
         updates_per_step=tensor_runtime_settings.updates_per_step,
         policy_frequency=cfg.algo.policy_frequency,
+        target_frequency=int(_algo_param(cfg.algo, "target_frequency", 1)),
+        policy_before_critic=bool(_algo_param(cfg.algo, "policy_before_critic", False)),
         env_steps_per_sync=cfg.training.env_steps_per_sync,
         device=device,
         obs_normalization=cfg.algo.obs_normalization,
@@ -168,4 +185,10 @@ def build_flashsac_double_buffer_runner(
         inference_placement=inference_placement,
         tensor_runtime_settings=tensor_runtime_settings,
         log_interval=int(cfg.training.log_interval),
+        replay_pipeline_factory=partial(
+            AgeBiasedReplayPipeline,
+            decay_step=int(_algo_param(cfg.algo, "decay_step", 0)),
+            min_weight=float(_algo_param(cfg.algo, "replay_min_weight", 0.1)),
+            num_buckets=int(_algo_param(cfg.algo, "replay_num_buckets", 2000)),
+        ),
     )

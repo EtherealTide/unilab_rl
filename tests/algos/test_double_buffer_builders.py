@@ -218,6 +218,15 @@ def test_flashsac_builder_forwards_backend_device_binder(
     assert settings.replay_ingress_depth == 2
     assert settings.replay_ingress_slot_rows == 4
     assert _FakeLearner.last_kwargs["compile_full_objectives"] is True
+    assert _FakeLearner.last_kwargs["actor_normalize_parameters"] is True
+    assert _FakeLearner.last_kwargs["critic_normalize_parameters"] is True
+    assert runner.kwargs["target_frequency"] == 1
+    assert runner.kwargs["policy_before_critic"] is False
+    assert runner.kwargs["replay_pipeline_factory"].keywords == {
+        "decay_step": 0,
+        "min_weight": 0.1,
+        "num_buckets": 2000,
+    }
 
 
 @pytest.mark.parametrize("algo", ["sac", "flashsac"])

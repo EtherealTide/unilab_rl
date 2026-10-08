@@ -68,7 +68,7 @@ def sample_offpolicy_actions(
     priv_info_torch: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample actions using the algorithm's exploration policy."""
-    if algo_type in ("sac", "flashsac", "warpsac"):
+    if algo_type in ("sac", "flashsac"):
         return cast(
             torch.Tensor,
             actor.explore(obs_torch, dones=prev_dones_torch, deterministic=False),

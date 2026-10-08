@@ -13,7 +13,6 @@ import torch
 
 from uni_rl.algos.fast_sac.learner import FastSACLearner
 from uni_rl.algos.flash_sac.learner import FlashSACLearner
-from uni_rl.algos.warp_sac.learner import WarpSACLearner
 from uni_rl.offpolicy.warmup import OffPolicyWarmupContext
 
 
@@ -77,7 +76,7 @@ def _assert_equivalent(left: Any, right: Any, path: str = "state") -> None:
             num_atoms=5,
             use_compile=False,
         ),
-        WarpSACLearner(
+        FlashSACLearner(
             obs_dim=4,
             action_dim=2,
             critic_obs_dim=6,
@@ -88,9 +87,11 @@ def _assert_equivalent(left: Any, right: Any, path: str = "state") -> None:
             critic_num_blocks=1,
             num_atoms=5,
             use_compile=False,
+            actor_normalize_parameters=False,
+            critic_normalize_parameters=False,
         ),
     ],
-    ids=["fastsac", "flashsac", "warpsac"],
+    ids=["fastsac", "flashsac", "flashsac-unnormalized"],
 )
 def test_compatibility_warmup_restores_complete_learner_state(learner: Any) -> None:
     torch.manual_seed(321)
