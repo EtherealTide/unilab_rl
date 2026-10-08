@@ -161,3 +161,29 @@ def test_strict_tensor_env_rejects_numpy_reset_indices() -> None:
     env = StrictTensorEnv()
     with pytest.raises(TypeError, match="reset indices must be torch.Tensor"):
         env.reset(np.array([0], dtype=np.int64))
+
+
+def test_timeout_bootstrap_correction_supports_cross_device_final_observation() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    from uni_rl.algos.appo.worker import compute_timeout_bootstrap_correction
+
+    class _Critic:
+        def __call__(self, obs):
+            return obs["policy"].sum(dim=1, keepdim=True)
+
+    cpu_final = torch.tensor([[2.0, 3.0], [9.0, 9.0]], dtype=torch.float32)
+    cuda_mask = torch.tensor([True, False], device="cuda")
+
+    correction = compute_timeout_bootstrap_correction(
+        critic=_Critic(),
+        collector_device="cuda",
+        gamma=0.5,
+        timeout_mask=cuda_mask,
+        final_obs=cpu_final,
+        final_critic=cpu_final,
+    )
+
+    assert correction.device.type == "cuda"
+    torch.testing.assert_close(correction, torch.tensor([2.5, 0.0], device="cuda"))
