@@ -11,6 +11,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
@@ -472,6 +473,16 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "for multi-GPU data parallelism"
             )
         setter(self.dp_sync.allreduce_gradients)
+        graph_hooks = getattr(self.learner, "set_gradient_graph_hooks", None)
+        if callable(graph_hooks):
+            graph_hooks(
+                begin_capture=partial(
+                    self.dp_sync.begin_gradient_graph_capture,
+                    enable_timing=self.trace_enabled and self.trace_cuda_events,
+                ),
+                end_capture=self.dp_sync.end_gradient_graph_capture,
+                before_replay=self.dp_sync.record_gradient_graph_replay,
+            )
 
     def _cuda_graph_runtime_manifest(self) -> dict[str, object]:
         """Describe the effective learner graph backend."""
@@ -634,8 +645,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
     def _shutdown_collector(self) -> None:
         """Release the lock-step collector without waiting on a tick deadline."""
-        self._learner_coordination.mark_stopped()
+        # Set the stop event before publishing STOPPED: a collector that
+        # observes STOPPED must already see the stop request, so a normal
+        # training completion is released gracefully instead of raising
+        # "Learner stopped before inference tick".
         self._stop_event.set()
+        self._learner_coordination.mark_stopped()
         process = self._collector_process
         if process is not None and process.is_alive():
             process.join(timeout=5.0)
@@ -671,7 +686,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             return
         sync_time, sync_calls = self.dp_sync.take_gradient_sync_metrics()
         if sync_calls > 0:
-            iter_metrics["Perf/dp_gradient_sync_ms_per_rank"].append(sync_time * 1000.0)
+            graph_mode = bool(getattr(self.learner, "use_update_cycle", False))
+            if not graph_mode or (self.trace_enabled and self.trace_cuda_events):
+                iter_metrics["Perf/dp_gradient_sync_ms_per_rank"].append(sync_time * 1000.0)
             iter_metrics["Perf/dp_gradient_sync_calls_per_rank"].append(float(sync_calls))
 
     @staticmethod
@@ -1000,7 +1017,13 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             super().close()
         finally:
             if self.dp_sync is not None:
-                self.dp_sync.close()
+                # Captured NCCL nodes retain the communicator. Destroy the
+                # learner graph before destroying its process group, otherwise
+                # ncclCommDestroy can wait forever for the graph reference.
+                try:
+                    self.learner.set_gradient_sync(None)
+                finally:
+                    self.dp_sync.close()
 
     def _collector_env_cfg_override(self) -> dict | None:
         """Env override copy for the collector process, with per-rank CPU ids.

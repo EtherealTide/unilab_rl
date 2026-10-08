@@ -230,6 +230,78 @@ def test_close_without_start_is_idempotent(tmp_path: Path):
     sync.close()
 
 
+def test_gradient_graph_metrics_count_replays_and_consume_events(tmp_path: Path, monkeypatch):
+    """Capture adds no steps; each replay contributes its GPU event duration."""
+    events = []
+
+    class FakeEvent:
+        def __init__(self, *, enable_timing, external):
+            assert enable_timing and external
+            self.recorded = False
+            self.waits = 0
+            events.append(self)
+
+        def record(self):
+            self.recorded = True
+
+        def synchronize(self):
+            self.waits += 1
+
+        def elapsed_time(self, end):
+            assert self.recorded and end.recorded
+            return 2.5
+
+    capturing = False
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr("uni_rl.ipc.dp_sync.dist.all_reduce", lambda *args, **kwargs: None)
+    sync = DpParameterSync(
+        world_size=2, rank=0, rendezvous_path=str(tmp_path / "unused"), backend="gloo"
+    )
+    parameter = torch.nn.Parameter(torch.ones(3))
+    parameter.grad = torch.ones_like(parameter)
+    sync.begin_gradient_graph_capture()
+    sync.allreduce_gradients([parameter])  # warmup is excluded by end_capture
+    assert events == []
+    capturing = True
+    sync.allreduce_gradients([parameter])
+    sync.allreduce_gradients([parameter])
+    sync.end_gradient_graph_capture()
+    assert sync.take_gradient_sync_metrics() == (0.0, 0)
+    sync.record_gradient_graph_replay()
+    assert sync.take_gradient_sync_metrics() == pytest.approx((0.005, 2))
+    assert sync.take_gradient_sync_metrics() == (0.0, 0)
+    sync.record_gradient_graph_replay()
+    # If the owner skips a metrics boundary, consume old events before replay.
+    sync.record_gradient_graph_replay()
+    assert sync.take_gradient_sync_metrics() == pytest.approx((0.010, 4))
+    assert [event.waits for event in events] == [0, 3, 0, 3]
+    sync.begin_gradient_graph_capture()
+    sync.end_gradient_graph_capture()
+    sync.record_gradient_graph_replay()
+    assert sync.take_gradient_sync_metrics() == (0.0, 0)
+
+
+def test_gradient_graph_counts_without_timing_events(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr("uni_rl.ipc.dp_sync.dist.all_reduce", lambda *args, **kwargs: None)
+
+    def unexpected_event(**_kwargs):
+        pytest.fail("Timing-disabled capture must not create CUDA events")
+
+    monkeypatch.setattr(torch.cuda, "Event", unexpected_event)
+    sync = DpParameterSync(
+        world_size=2, rank=0, rendezvous_path=str(tmp_path / "unused"), backend="gloo"
+    )
+    parameter = torch.nn.Parameter(torch.ones(3))
+    parameter.grad = torch.ones_like(parameter)
+    sync.begin_gradient_graph_capture(enable_timing=False)
+    sync.allreduce_gradients([parameter])
+    sync.end_gradient_graph_capture()
+    sync.record_gradient_graph_replay()
+    assert sync.take_gradient_sync_metrics() == (0.0, 1)
+
+
 def test_invalid_world_size_and_rank_are_rejected(tmp_path: Path):
     path = str(tmp_path / "unused")
     with pytest.raises(ValueError, match="world_size >= 2"):
