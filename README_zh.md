@@ -78,9 +78,12 @@ def make_env(num_envs: int, cfg: Mapping | None) -> EnvProtocol:
     ...
 ```
 
-env contract 是一个最小化的、基于 numpy 的自动 reset 向量化环境协议：按
-观测组键控的 dict 观测（`obs_groups_spec`)、带 final-observation 语义的
-`step()`，以及返回 `(obs, info)` 的 `reset()`。完整 contract 见
+env contract 是 tensor-native 的自动 reset 向量化环境协议：`step()` 接受
+位于 env authoritative `device` 上的 contiguous float32 Torch action；
+观测 / reward / termination 均为 Torch tensor，并按观测组
+（`obs_groups_spec`）键控；`reset()` 接受一维 Torch integer tensor 或
+`None`，并返回 `(obs, info)`。NumPy 只作为序列化 / 诊断 carrier，不再是
+trainer boundary。完整 contract 见
 [`src/uni_rl/env_contract.py`](src/uni_rl/env_contract.py) 的模块
 docstring；如何不 fork 本仓库、通过 `runtime_resolver` 接入自定义算法，
 见 [`AGENTS.md`](AGENTS.md) 的「新算法扩展方式」一节。

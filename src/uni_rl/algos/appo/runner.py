@@ -1,7 +1,7 @@
 """APPO Runner — Asynchronous PPO with native multiprocessing.
 
 Pipeline:
-  1. Collector subprocess publishes rollout payloads → RolloutRingBuffer
+  1. Collector subprocess publishes rollout payloads → TensorRolloutRingBuffer
   2. Learner reads rollouts, computes V-trace corrected updates
   3. Weights synced back to collector via SharedWeightSync
 """
@@ -17,10 +17,10 @@ import torch
 from rsl_rl.utils import resolve_callable
 
 from uni_rl.algos.appo.learner import APPOLearner
-from uni_rl.algos.appo.staging import RolloutStagingPool
+from uni_rl.algos.appo.staging import TensorRolloutStagingPool
 from uni_rl.algos.appo.worker import appo_collector_fn
 from uni_rl.env_contract import EnvFactory
-from uni_rl.ipc import AsyncRunner, RolloutRingBuffer, SharedWeightSync
+from uni_rl.ipc import AsyncRunner, SharedWeightSync, TensorRolloutRingBuffer
 from uni_rl.logging import OffPolicyLogger
 from uni_rl.logging.metrics_drain import RewardComponentWindow, drain_collector_metrics
 from uni_rl.utils.nan_guard import NanGuardCfg
@@ -64,6 +64,7 @@ class APPORunner(AsyncRunner):
         seed: int | None = None,
         resume_path: str | None = None,
         nan_guard_cfg: NanGuardCfg | None = None,
+        nan_guard_factory: Any | None = None,
         log_interval: int = 1,
     ):
         super().__init__(
@@ -82,6 +83,7 @@ class APPORunner(AsyncRunner):
         self.seed = seed
         self.resume_path = resume_path
         self.nan_guard_cfg = nan_guard_cfg
+        self.nan_guard_factory = nan_guard_factory
         self.log_interval = max(1, int(log_interval))
         self.env_factory = env_factory
         if self.staging_pool_size < 1:
@@ -228,7 +230,7 @@ class APPORunner(AsyncRunner):
 
         # Create shared rollout IPC ring buffer; learner-side tensor lifetime is
         # owned by the bounded staging pool below.
-        rollout_ring_buffer = RolloutRingBuffer(
+        rollout_ring_buffer = TensorRolloutRingBuffer(
             num_envs=self.num_envs,
             num_steps=self.steps_per_env,
             obs_dim=self.obs_dim,
@@ -280,6 +282,7 @@ class APPORunner(AsyncRunner):
             "env_cfg_override": self.env_cfg_overrides if self.env_cfg_overrides else None,
             "seed": derive_worker_seed(self.seed, worker_index=0),
             "nan_guard_cfg": self.nan_guard_cfg,
+            "nan_guard_factory": self.nan_guard_factory,
         }
         self._start_collector(
             target_fn=appo_collector_fn,
@@ -313,7 +316,7 @@ class APPORunner(AsyncRunner):
         reward_history: deque = deque(maxlen=10)
         latest_reward_components = RewardComponentWindow()
 
-        staging_pool = RolloutStagingPool(
+        staging_pool = TensorRolloutStagingPool(
             capacity=self.staging_pool_size,
             num_envs=self.num_envs,
             slot_shapes=rollout_ring_buffer.slot_shapes,
@@ -366,7 +369,7 @@ class APPORunner(AsyncRunner):
             learner_replay_stage_time = 0.0
             for _ in range(num_new):
                 h2d_start = time.perf_counter()
-                staging_pool.stage_numpy_views(rollout_ring_buffer.read_numpy_views())
+                staging_pool.stage_tensor_views(rollout_ring_buffer.read_tensor_views())
                 learner_replay_stage_time += time.perf_counter() - h2d_start
                 rollout_ring_buffer.advance_read()
 

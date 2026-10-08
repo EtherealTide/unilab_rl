@@ -3,7 +3,6 @@ from __future__ import annotations
 import queue
 from collections import deque
 
-import numpy as np
 import pytest
 import torch
 
@@ -15,8 +14,8 @@ from uni_rl.logging.metrics_drain import RewardComponentWindow
 @pytest.fixture(autouse=True)
 def _reset_fakes() -> None:
     _FakeLearner.last_instance = None
-    _FakeRolloutRingBuffer.last_instance = None
-    _FakeRolloutRingBuffer.available_rollouts = 1
+    _FakeTensorRolloutRingBuffer.last_instance = None
+    _FakeTensorRolloutRingBuffer.available_rollouts = 1
     _FakeLogger.last_instance = None
 
 
@@ -68,8 +67,8 @@ class _FakeLearner:
         self.target_update_calls += 1
 
 
-class _FakeRolloutRingBuffer:
-    last_instance: "_FakeRolloutRingBuffer | None" = None
+class _FakeTensorRolloutRingBuffer:
+    last_instance: "_FakeTensorRolloutRingBuffer | None" = None
     available_rollouts: int = 1
 
     def __init__(
@@ -89,7 +88,7 @@ class _FakeRolloutRingBuffer:
         self._read_ptr = object()
         self.wait_calls = 0
         self.advance_calls = 0
-        _FakeRolloutRingBuffer.last_instance = self
+        _FakeTensorRolloutRingBuffer.last_instance = self
 
     @property
     def slot_shapes(self) -> dict[str, tuple[int, ...]]:
@@ -126,10 +125,10 @@ class _FakeRolloutRingBuffer:
             "last_critic": torch.zeros(2, 7, device=device),
         }
 
-    def read_numpy_views(self) -> dict[str, np.ndarray]:
+    def read_tensor_views(self) -> dict[str, torch.Tensor]:
         value = float(self.advance_calls + 1)
         return {
-            field: np.full(shape, value, dtype=np.float32)
+            field: torch.full(shape, value, dtype=torch.float32)
             for field, shape in self.slot_shapes.items()
         }
 
@@ -226,7 +225,7 @@ def test_appo_runner_uses_explicit_runtime_context(
 
     monkeypatch.setattr(APPORunner, "_detect_dims", fake_detect_dims)
     monkeypatch.setattr(APPORunner, "_build_learner", lambda self: _FakeLearner())
-    monkeypatch.setattr(appo_runner_module, "RolloutRingBuffer", _FakeRolloutRingBuffer)
+    monkeypatch.setattr(appo_runner_module, "TensorRolloutRingBuffer", _FakeTensorRolloutRingBuffer)
     monkeypatch.setattr(appo_runner_module, "SharedWeightSync", _FakeWeightSync)
     monkeypatch.setattr(appo_runner_module, "OffPolicyLogger", _FakeLogger)
     monkeypatch.setattr(appo_runner_module.torch, "save", lambda *args, **kwargs: None)
@@ -268,7 +267,7 @@ def test_appo_runner_restores_resume_checkpoint(
 
     monkeypatch.setattr(APPORunner, "_detect_dims", fake_detect_dims)
     monkeypatch.setattr(APPORunner, "_build_learner", lambda self: _FakeLearner())
-    monkeypatch.setattr(appo_runner_module, "RolloutRingBuffer", _FakeRolloutRingBuffer)
+    monkeypatch.setattr(appo_runner_module, "TensorRolloutRingBuffer", _FakeTensorRolloutRingBuffer)
     monkeypatch.setattr(appo_runner_module, "SharedWeightSync", _FakeWeightSync)
     monkeypatch.setattr(appo_runner_module, "OffPolicyLogger", _FakeLogger)
     monkeypatch.setattr(appo_runner_module.torch, "load", lambda *args, **kwargs: checkpoint)
@@ -310,7 +309,7 @@ def test_appo_runner_logs_learner_timing_for_fps_inputs(
     monkeypatch.setattr(APPORunner, "_detect_dims", fake_detect_dims)
     monkeypatch.setattr(APPORunner, "_build_learner", lambda self: _FakeLearner())
     monkeypatch.setattr(APPORunner, "_check_collector_alive", lambda self: True)
-    monkeypatch.setattr(appo_runner_module, "RolloutRingBuffer", _FakeRolloutRingBuffer)
+    monkeypatch.setattr(appo_runner_module, "TensorRolloutRingBuffer", _FakeTensorRolloutRingBuffer)
     monkeypatch.setattr(appo_runner_module, "SharedWeightSync", _FakeWeightSync)
     monkeypatch.setattr(appo_runner_module, "OffPolicyLogger", _FakeLogger)
     monkeypatch.setattr(appo_runner_module.mp, "get_context", lambda method: queue)
@@ -359,7 +358,7 @@ def test_appo_runner_logs_learner_timing_for_fps_inputs(
     runner.learn(max_iterations=1, save_interval=0, log_dir=str(tmp_path))
 
     logger = _FakeLogger.last_instance
-    storage = _FakeRolloutRingBuffer.last_instance
+    storage = _FakeTensorRolloutRingBuffer.last_instance
     assert logger is not None
     assert storage is not None
     assert storage.wait_calls == 1
@@ -394,11 +393,11 @@ def test_appo_runner_stages_multiple_rollouts_without_runner_cat(
         del args, kwargs
         raise AssertionError("runner must not rebuild APPO batches with torch.cat")
 
-    _FakeRolloutRingBuffer.available_rollouts = 2
+    _FakeTensorRolloutRingBuffer.available_rollouts = 2
     monkeypatch.setattr(APPORunner, "_detect_dims", fake_detect_dims)
     monkeypatch.setattr(APPORunner, "_build_learner", lambda self: _FakeLearner())
     monkeypatch.setattr(APPORunner, "_check_collector_alive", lambda self: True)
-    monkeypatch.setattr(appo_runner_module, "RolloutRingBuffer", _FakeRolloutRingBuffer)
+    monkeypatch.setattr(appo_runner_module, "TensorRolloutRingBuffer", _FakeTensorRolloutRingBuffer)
     monkeypatch.setattr(appo_runner_module, "SharedWeightSync", _FakeWeightSync)
     monkeypatch.setattr(appo_runner_module, "OffPolicyLogger", _FakeLogger)
     monkeypatch.setattr(appo_runner_module.mp, "get_context", lambda method: queue)
@@ -423,7 +422,7 @@ def test_appo_runner_stages_multiple_rollouts_without_runner_cat(
 
     runner.learn(max_iterations=1, save_interval=0, log_dir=str(tmp_path))
 
-    storage = _FakeRolloutRingBuffer.last_instance
+    storage = _FakeTensorRolloutRingBuffer.last_instance
     learner = _FakeLearner.last_instance
     logger = _FakeLogger.last_instance
     assert storage is not None
@@ -462,7 +461,7 @@ def test_appo_runner_fails_fast_when_collector_dies_during_wait(
 
     # wait_for_data must always time out so the chunked loop reaches the
     # liveness check.
-    def never_ready(self: _FakeRolloutRingBuffer, timeout: float = 60.0) -> bool:
+    def never_ready(self: _FakeTensorRolloutRingBuffer, timeout: float = 60.0) -> bool:
         del timeout
         self.wait_calls += 1
         return False
@@ -470,8 +469,8 @@ def test_appo_runner_fails_fast_when_collector_dies_during_wait(
     monkeypatch.setattr(APPORunner, "_detect_dims", fake_detect_dims)
     monkeypatch.setattr(APPORunner, "_build_learner", lambda self: _FakeLearner())
     monkeypatch.setattr(APPORunner, "_check_collector_alive", fake_alive)
-    monkeypatch.setattr(_FakeRolloutRingBuffer, "wait_for_data", never_ready)
-    monkeypatch.setattr(appo_runner_module, "RolloutRingBuffer", _FakeRolloutRingBuffer)
+    monkeypatch.setattr(_FakeTensorRolloutRingBuffer, "wait_for_data", never_ready)
+    monkeypatch.setattr(appo_runner_module, "TensorRolloutRingBuffer", _FakeTensorRolloutRingBuffer)
     monkeypatch.setattr(appo_runner_module, "SharedWeightSync", _FakeWeightSync)
     monkeypatch.setattr(appo_runner_module, "OffPolicyLogger", _FakeLogger)
     monkeypatch.setattr(appo_runner_module.mp, "get_context", lambda method: queue)

@@ -86,10 +86,13 @@ def make_env(num_envs: int, cfg: Mapping | None) -> EnvProtocol:
     ...
 ```
 
-The env contract is a minimal numpy-based, autoresetting vectorized-env
-protocol: dict observations keyed by observation group (`obs_groups_spec`),
-`step()` with final-observation semantics, and `reset()` returning
-`(obs, info)`. See the module docstring in
+The env contract is tensor-native and autoresetting: `step()` accepts a
+contiguous float32 Torch action tensor on the env's authoritative `device`,
+observations/rewards/termination flags are Torch tensors keyed by observation
+group (`obs_groups_spec`), and `reset()` accepts a one-dimensional Torch
+integer tensor (or `None`) and returns `(obs, info)`. NumPy remains a
+serialization/diagnostic carrier only, not the trainer boundary. See the module
+docstring in
 [`src/uni_rl/env_contract.py`](src/uni_rl/env_contract.py) for the full
 contract, and the *new algorithm recipe* section in
 [`AGENTS.md`](AGENTS.md) for how to plug in a custom algorithm via

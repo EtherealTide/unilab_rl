@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import numpy as np
 import pytest
 import torch
 
-from uni_rl.algos.appo.staging import RolloutStagingPool
+from uni_rl.algos.appo.staging import TensorRolloutStagingPool
 
 _NUM_ENVS = 2
 _NUM_STEPS = 3
@@ -25,12 +24,12 @@ _SLOT_SHAPES = {
 }
 
 
-def _raw_rollout(value: float) -> dict[str, np.ndarray]:
-    return {field: np.full(shape, value, dtype=np.float32) for field, shape in _SLOT_SHAPES.items()}
+def _raw_rollout(value: float) -> dict[str, torch.Tensor]:
+    return {field: torch.full(shape, value) for field, shape in _SLOT_SHAPES.items()}
 
 
 def test_staging_pool_exposes_learner_ready_combined_batch() -> None:
-    pool = RolloutStagingPool(
+    pool = TensorRolloutStagingPool(
         capacity=2,
         num_envs=_NUM_ENVS,
         slot_shapes=_SLOT_SHAPES,
@@ -39,21 +38,15 @@ def test_staging_pool_exposes_learner_ready_combined_batch() -> None:
     first = _raw_rollout(1.0)
     second = _raw_rollout(2.0)
 
-    pool.stage_numpy_views(first)
-    pool.stage_numpy_views(second)
+    pool.stage_tensor_views(first)
+    pool.stage_tensor_views(second)
 
     batch = pool.batch()
     expected_obs = torch.cat(
-        [
-            torch.from_numpy(first["obs"]).transpose(0, 1),
-            torch.from_numpy(second["obs"]).transpose(0, 1),
-        ],
+        [first["obs"].transpose(0, 1), second["obs"].transpose(0, 1)],
         dim=1,
     )
-    expected_last_obs = torch.cat(
-        [torch.from_numpy(first["last_obs"]), torch.from_numpy(second["last_obs"])],
-        dim=0,
-    )
+    expected_last_obs = torch.cat([first["last_obs"], second["last_obs"]], dim=0)
 
     assert batch["observations"].shape == (_NUM_STEPS, 2 * _NUM_ENVS, _OBS_DIM)
     assert batch["critic"].shape == (_NUM_STEPS, 2 * _NUM_ENVS, _CRITIC_DIM)
@@ -64,16 +57,16 @@ def test_staging_pool_exposes_learner_ready_combined_batch() -> None:
 
 
 def test_staging_pool_reuses_slots_and_drops_overwritten_rollouts() -> None:
-    pool = RolloutStagingPool(
+    pool = TensorRolloutStagingPool(
         capacity=2,
         num_envs=_NUM_ENVS,
         slot_shapes=_SLOT_SHAPES,
         device="cpu",
     )
 
-    pool.stage_numpy_views(_raw_rollout(1.0))
-    pool.stage_numpy_views(_raw_rollout(2.0))
-    pool.stage_numpy_views(_raw_rollout(3.0))
+    pool.stage_tensor_views(_raw_rollout(1.0))
+    pool.stage_tensor_views(_raw_rollout(2.0))
+    pool.stage_tensor_views(_raw_rollout(3.0))
 
     batch = pool.batch()
     assert pool.active_count == 2
@@ -83,13 +76,13 @@ def test_staging_pool_reuses_slots_and_drops_overwritten_rollouts() -> None:
 
 
 def test_staging_pool_batch_dict_does_not_retain_learner_mutations() -> None:
-    pool = RolloutStagingPool(
+    pool = TensorRolloutStagingPool(
         capacity=2,
         num_envs=_NUM_ENVS,
         slot_shapes=_SLOT_SHAPES,
         device="cpu",
     )
-    pool.stage_numpy_views(_raw_rollout(1.0))
+    pool.stage_tensor_views(_raw_rollout(1.0))
 
     batch = pool.batch()
     batch["values"] = torch.zeros(_NUM_STEPS, _NUM_ENVS)
@@ -99,9 +92,44 @@ def test_staging_pool_batch_dict_does_not_retain_learner_mutations() -> None:
 
 def test_staging_pool_rejects_empty_capacity() -> None:
     with pytest.raises(ValueError, match="capacity"):
-        RolloutStagingPool(
+        TensorRolloutStagingPool(
             capacity=0,
             num_envs=_NUM_ENVS,
             slot_shapes=_SLOT_SHAPES,
             device="cpu",
         )
+
+
+def test_staging_pool_rejects_numpy_views() -> None:
+    import numpy as np
+
+    pool = TensorRolloutStagingPool(
+        capacity=1,
+        num_envs=_NUM_ENVS,
+        slot_shapes=_SLOT_SHAPES,
+        device="cpu",
+    )
+    raw = {field: np.zeros(shape, dtype=np.float32) for field, shape in _SLOT_SHAPES.items()}
+    with pytest.raises(TypeError, match="torch.Tensor"):
+        pool.stage_tensor_views(raw)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_staging_pool_copies_cuda_rollout_to_learner_device() -> None:
+    pool = TensorRolloutStagingPool(
+        capacity=1,
+        num_envs=_NUM_ENVS,
+        slot_shapes=_SLOT_SHAPES,
+        device="cuda",
+    )
+    raw = {
+        field: torch.full(shape, 1.0, dtype=torch.float32, device="cuda")
+        for field, shape in _SLOT_SHAPES.items()
+    }
+
+    pool.stage_tensor_views(raw)
+    batch = pool.batch()
+
+    assert batch["observations"].device.type == "cuda"
+    assert torch.all(batch["observations"] == 1.0)
+    assert torch.all(batch["last_critic"] == 1.0)

@@ -14,7 +14,6 @@ import math
 from collections.abc import Iterable
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 from rsl_rl.models import MLPModel
@@ -34,6 +33,21 @@ def _distribution_std(distribution: Any, mean: torch.Tensor) -> torch.Tensor:
     if distribution.std_type == "scalar":
         return distribution.std_param.expand_as(mean)
     return torch.exp(distribution.log_std_param).expand_as(mean)
+
+
+def gaussian_distribution_std(actor: Any) -> torch.Tensor:
+    """Return a Gaussian actor's learnable std without sample-time cache state.
+
+    APPO updates scalar/log Gaussian std parameters directly. Deriving sigma
+    from the authoritative parameter avoids depending on whether a prior
+    stochastic forward populated ``GaussianDistribution._distribution``.
+    """
+    distribution = getattr(actor, "distribution", None)
+    if distribution is None:
+        raise RuntimeError("APPO actor must expose a stochastic distribution")
+    if distribution.std_type == "scalar":
+        return distribution.std_param
+    return torch.exp(distribution.log_std_param)
 
 
 def _sample_tensor_for_metric(tensor: torch.Tensor, max_items: int = 8192) -> torch.Tensor:
@@ -105,20 +119,19 @@ def vtrace_advantages(
         # Temporal difference errors
         deltas = clipped_rhos * (rewards + gamma * next_values * non_terminal - values)
 
-        # Backward accumulation of V-trace corrections — run on CPU numpy to avoid
-        # T sequential GPU kernel launches (one-time transfer cost is cheaper).
-        deltas_np = deltas.cpu().numpy()
-        non_terminal_np = non_terminal.cpu().numpy()
-        cs_np = cs.cpu().numpy()
-        values_np = values.cpu().numpy()
-
-        vs_np = np.empty_like(values_np)
-        vs_minus_v = np.zeros(N, dtype=np.float32)
+        # Backward accumulation of V-trace corrections. This bounded sequence
+        # scan stays on the host for CUDA learners, but its carriers and math
+        # remain Torch tensors rather than NumPy rollout state.
+        deltas_cpu = deltas.cpu()
+        non_terminal_cpu = non_terminal.cpu()
+        cs_cpu = cs.cpu()
+        values_cpu = values.cpu()
+        vs_cpu = torch.empty_like(values_cpu)
+        vs_minus_v = torch.zeros(N, dtype=values_cpu.dtype)
         for t in range(T - 1, -1, -1):
-            vs_minus_v = deltas_np[t] + gamma * non_terminal_np[t] * cs_np[t] * vs_minus_v
-            vs_np[t] = values_np[t] + vs_minus_v
-
-        vs = torch.from_numpy(vs_np).to(device)
+            vs_minus_v = deltas_cpu[t] + gamma * non_terminal_cpu[t] * cs_cpu[t] * vs_minus_v
+            vs_cpu[t] = values_cpu[t] + vs_minus_v
+        vs = vs_cpu.to(device)
 
         # Vectorized policy gradient advantages
         next_vs = torch.cat([vs[1:], bootstrap_values.unsqueeze(0)], dim=0)
@@ -410,8 +423,11 @@ class APPOLearner:
         with torch.inference_mode():
             self.target_actor(obs_td, stochastic_output=True)
             target_log_probs_flat = self.target_actor.get_output_log_prob(actions_flat)
-            batch_dict["_old_mu"] = self.target_actor.output_mean.clone()
-            batch_dict["_old_sigma"] = self.target_actor.output_std.clone()
+            target_mean = self.target_actor.output_mean
+            batch_dict["_old_mu"] = target_mean.clone()
+            batch_dict["_old_sigma"] = (
+                gaussian_distribution_std(self.target_actor).expand_as(target_mean).clone()
+            )
         target_log_probs = target_log_probs_flat.view(T, N)
         with torch.inference_mode():
             rhos = torch.exp(target_log_probs - behavior_log_probs)
@@ -558,7 +574,7 @@ class APPOLearner:
         num_updates = max(num_updates, 1)
         final_lr = float(self.learning_rate)
         self.learning_rate = final_lr
-        policy_mean_std = float(self.actor.output_std.detach().mean().item())
+        policy_mean_std = float(gaussian_distribution_std(self.actor).detach().mean().item())
 
         metrics = {
             "Loss/surrogate": mean_surrogate_loss / num_updates,
