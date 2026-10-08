@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Explicit `resume_checkpoint` support on `DoubleBufferOffPolicyRunner.learn`,
+  restoring the complete learner state and resuming from the checkpointed
+  update count. Invalid or missing checkpoint progress metadata fails closed.
+- Reviewed tensor-runtime defaults and deterministic bounds for inference-ring
+  capacity, collector metric intervals, replay ingress depth, replay ingress
+  slot rows, and learner sampling. FastSAC, FlashSAC, and WarpSAC resolve one
+  validated settings object before environment probing, and runtime manifests
+  record configured, default, effective, and maximum values.
+- Configurable bounded replay-ingress slots that may contain fewer rows than a
+  collector vector. The collector publishes vectors in bounded chunks with
+  contiguous commit order, per-chunk terminal observation patching, backpressure,
+  and explicit partial-prefix semantics during shutdown.
+- Conservative combined CUDA pre-flight accounting for inference IPC, replay
+  storage, learner double-buffer batches, replay ingress, and allocator
+  workspace reserve. Impossible combinations fail before collector or replay
+  resource allocation.
+- Bounded inference scheduling diagnostics for tensor-native collectors, including
+  queue depth, action backlog, in-flight depth, publication lag, wait time, and
+  the legal sequential dependency graph in runtime manifests.
+- Conservative pre-flight CUDA inference accounting for the shared inference
+  ring, IPC/timing events, learner inference scratch, FlashSAC persistent
+  exploration scratch, and allocator/workspace reserve. CUDA learners now
+  preallocate timing events before collector startup.
+- A deterministic cross-process CUDA regression covering delayed action clones
+  with bounded slot reuse, plus deterministic cleanup for partially constructed
+  inference rings.
+
+### Fixed
+
+- Collector inference metrics distinguish configured ring capacity from dynamic
+  observation backlog and action backlog, preventing capacity from being
+  interpreted as concurrent in-flight requests.
+
 ## [1.4.4] - 2026-09-29
 
 ### Fixed

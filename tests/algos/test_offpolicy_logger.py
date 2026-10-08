@@ -129,13 +129,15 @@ def test_offpolicy_logger_displays_env_step_breakdown_as_indented_children() -> 
             "env_step_backend_ms": 12.5,
             "env_step_update_state_ms": 1.0,
             "env_step_reset_done_ms": 0.5,
+            "transition_extract_ms": 0.1,
             "replay_write_ms": 0.3,
+            "metrics_publish_ms": 0.1,
         }
     )
 
     table = logger._build_timing_table()
-    collector_cells = list(table.columns[2].cells)[:7]
-    collector_value_cells = list(table.columns[3].cells)[:7]
+    collector_cells = list(table.columns[2].cells)[:8]
+    collector_value_cells = list(table.columns[3].cells)[:8]
 
     assert collector_cells == [
         "Inference Request",
@@ -144,15 +146,17 @@ def test_offpolicy_logger_displays_env_step_breakdown_as_indented_children() -> 
         "[dim]  Backend Step[/]",
         "[dim]  Update State[/]",
         "[dim]  Reset Done[/]",
+        "Transition Extract",
         "Replay Write",
     ]
     assert collector_value_cells == [
         "    0.1ms    1%",
         "    0.2ms    1%",
-        "   14.0ms   96%",
-        "[dim cyan]   12.5ms  86%─┤[/]",
+        "   14.0ms   95%",
+        "[dim cyan]   12.5ms  84%─┤[/]",
         "[dim cyan]    1.0ms   7%─┤[/]",
         "[dim cyan]    0.5ms   3%─┘[/]",
+        "    0.1ms    1%",
         "    0.3ms    2%",
     ]
 
@@ -444,7 +448,9 @@ def test_offpolicy_terminal_averages_aggregated_samples_over_two_seconds(
             "inference_request_ms": 3.0,
             "learner_action_wait_ms": 4.0,
             "env_step_ms": 5.0,
+            "transition_extract_ms": 0.5,
             "replay_write_ms": 6.0,
+            "metrics_publish_ms": 0.5,
         }
     )
     logger.log_step(
@@ -468,7 +474,7 @@ def test_offpolicy_terminal_averages_aggregated_samples_over_two_seconds(
     assert snapshot.scalars["learner_replay_rows_per_sec"] == pytest.approx(2_000.0)
     assert snapshot.collector_timing["env_step_ms"] == pytest.approx(4.0)
     collector_values = list(logger._build_timing_table().columns[3].cells)
-    assert "    4.0ms   29%" in collector_values
+    assert "    4.0ms   27%" in collector_values
     assert "Avg 2s (n=2)" in logger._build_compact_header(include_status=False).plain
     assert "GPUs 2" in logger._build_display().title.plain
 
@@ -703,6 +709,17 @@ def test_offpolicy_collector_counters_do_not_update_reward_history() -> None:
     assert not logger._reward_history
 
 
+def test_offpolicy_log_step_return_feeds_terminal_reward_table() -> None:
+    logger = OffPolicyLogger(log_backend="none")
+
+    logger.log_step(iteration=1, metrics={"Loss/critic": 1.0}, return_mean_ep100=2.5)
+
+    assert list(logger._reward_history) == [2.5]
+    reward_cells = list(logger._build_reward_table().columns[0].cells)
+    assert "Waiting for data..." not in reward_cells
+    assert any("Reward" in cell for cell in reward_cells)
+
+
 def test_offpolicy_backend_step_axis_falls_back_to_iteration() -> None:
     logger = OffPolicyLogger(log_backend="none")
     writer = _BatchedWriter()
@@ -770,6 +787,28 @@ def test_tensorboard_and_wandb_use_the_same_canonical_payload(
     for key, value in wandb_payload.items():
         assert value == pytest.approx(tb_payload[key])
     assert wandb_calls[0]["payload"]["Loss/actor"] == pytest.approx(2.0)
+
+
+def test_offpolicy_replay_ingress_diagnostics_use_canonical_backend_payload() -> None:
+    logger = OffPolicyLogger(log_backend="none")
+    writer = _BatchedWriter()
+    logger._tb_writer = writer
+
+    logger.log_step(
+        iteration=1,
+        metrics={
+            "Train/replay_ingress_depth": 2.0,
+            "Train/replay_ingress_occupancy": 2.0,
+            "Train/replay_ingress_high_water": 2.0,
+            "Train/replay_ingress_backpressure_wait_ms": 250.0,
+            "Train/replay_ingress_dropped_batches": 1.0,
+        },
+    )
+
+    backend_scalars = _batched_scalar_map(writer)
+    assert backend_scalars["Train/replay_ingress_depth"] == pytest.approx(2.0)
+    assert backend_scalars["Train/replay_ingress_backpressure_wait_ms"] == pytest.approx(250.0)
+    assert backend_scalars["Train/replay_ingress_dropped_batches"] == pytest.approx(1.0)
 
 
 def test_onpolicy_tensorboard_and_wandb_use_the_same_canonical_payload(

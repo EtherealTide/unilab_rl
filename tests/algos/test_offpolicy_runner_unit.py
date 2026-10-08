@@ -15,8 +15,13 @@ import torch
 import uni_rl.offpolicy.double_buffer_runner as device_runner_module
 import uni_rl.offpolicy.runner as runner_module
 from uni_rl.ipc.async_runner import AsyncRunner
-from uni_rl.ipc.inference_slot import SharedInferenceSlot
-from uni_rl.logging.metric_schema import normalize_metric_map
+from uni_rl.ipc.inference_ring import SharedInferenceRing
+from uni_rl.logging.metric_schema import METRIC_SCHEMA_VERSION, normalize_metric_map
+from uni_rl.logging.metrics_drain import RewardComponentWindow
+from uni_rl.logging.runtime_manifest_schema import (
+    RUNTIME_MANIFEST_SCHEMA_VERSION,
+    validate_runtime_manifest,
+)
 from uni_rl.offpolicy.coordination import LearnerPhase
 from uni_rl.offpolicy.double_buffer_runner import (
     _LearnerInferenceScheduler,
@@ -28,6 +33,12 @@ from uni_rl.offpolicy.runner import (
     compute_train_start_threshold,
     replay_buffer_ready_for_learning,
     update_reward_stats_from_replay,
+)
+from uni_rl.utils.tensor_runtime import (
+    InferencePlacement,
+    InferenceTransport,
+    TensorRuntimeSettings,
+    resolve_inference_placement,
 )
 
 
@@ -201,6 +212,75 @@ def test_reward_stats_reject_missing_device_replay_source():
         )
 
 
+def test_runner_publishes_replay_ingress_metrics_and_manifest() -> None:
+    diagnostics = {
+        "ingress_depth": 2,
+        "ingress_slot_rows": 4,
+        "published_sequence": 7,
+        "release_sequence": 5,
+        "occupancy": 2,
+        "high_water_occupancy": 2,
+        "backpressure_waits": 1,
+        "backpressure_wait_s": 0.25,
+        "early_returns": 1,
+        "dropped_batches": 1,
+        "closed_returns": 0,
+        "stop_returns": 1,
+    }
+    pipeline = SimpleNamespace(ingress_diagnostics=lambda: diagnostics)
+    updates: list[dict] = []
+    logger = SimpleNamespace(
+        update_runtime_manifest=lambda manifest: updates.append(manifest),
+        _runtime_manifest={},
+    )
+    runner = object.__new__(device_runner_module.DoubleBufferOffPolicyRunner)
+    runner.runtime_manifest = {}
+    runner.last_run_summary = None
+
+    metrics = runner._replay_ingress_metrics(pipeline)
+    assert normalize_metric_map(metrics) == {
+        "Train/replay_ingress_depth": 2.0,
+        "Train/replay_ingress_occupancy": 2.0,
+        "Train/replay_ingress_high_water": 2.0,
+        "Train/replay_ingress_backpressure_wait_ms": 250.0,
+        "Train/replay_ingress_dropped_batches": 1.0,
+    }
+    runner._update_replay_ingress_manifest(logger, pipeline)
+
+    assert runner.runtime_manifest["replay_ingress"] == diagnostics
+    assert updates == [{"replay_ingress": diagnostics}]
+
+
+def test_runner_records_final_replay_ingress_diagnostics_in_summary() -> None:
+    diagnostics = {"occupancy": 0, "dropped_batches": 2}
+    replay_buffer = SimpleNamespace(ingress_diagnostics=lambda: diagnostics)
+    logger = SimpleNamespace(_runtime_manifest={})
+    runner = object.__new__(device_runner_module.DoubleBufferOffPolicyRunner)
+    runner.runtime_manifest = {"existing": True}
+    runner.last_run_summary = {"runtime_manifest": {"existing": True}}
+
+    runner._record_final_replay_ingress_diagnostics(logger, replay_buffer)
+
+    assert runner.runtime_manifest["replay_ingress"] == diagnostics
+    assert logger._runtime_manifest["replay_ingress"] == diagnostics
+    assert runner.last_run_summary["runtime_manifest"]["replay_ingress"] == diagnostics
+
+
+def test_runner_final_replay_ingress_diagnostics_is_safe_before_summary_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    diagnostics = {"occupancy": 0, "dropped_batches": 0}
+    replay_buffer = SimpleNamespace(ingress_diagnostics=lambda: diagnostics)
+    logger = SimpleNamespace(_runtime_manifest={})
+    runner = _make_device_runner(monkeypatch)
+
+    runner._record_final_replay_ingress_diagnostics(logger, replay_buffer)
+
+    assert runner.runtime_manifest["replay_ingress"] == diagnostics
+    assert logger._runtime_manifest["replay_ingress"] == diagnostics
+    assert runner.last_run_summary is None
+
+
 class _Actor:
     def state_dict(self):
         return {"weight": torch.zeros(1)}
@@ -217,6 +297,7 @@ class _Learner:
 
 class _FakeReplayBuffer:
     last_kwargs = None
+    diagnostics_calls = 0
 
     def __init__(self, **kwargs):
         type(self).last_kwargs = kwargs
@@ -226,6 +307,23 @@ class _FakeReplayBuffer:
         self.trace_recorder = None
         self.trace_thread_time = False
         self.trace_cuda_events = False
+
+    def ingress_diagnostics(self):
+        type(self).diagnostics_calls += 1
+        return {
+            "ingress_depth": 2,
+            "ingress_slot_rows": 2,
+            "published_sequence": 1,
+            "release_sequence": 1,
+            "occupancy": 0,
+            "high_water_occupancy": 1,
+            "backpressure_waits": 0,
+            "backpressure_wait_s": 0.0,
+            "early_returns": 0,
+            "dropped_batches": 0,
+            "closed_returns": 0,
+            "stop_returns": 0,
+        }
 
     def close(self):
         return None
@@ -247,6 +345,29 @@ class _FakePipeline:
             return
         self._closed = True
         type(self).close_calls += 1
+
+
+class _ReadyPipeline(_FakePipeline):
+    last_incremental_h2d_time_s = 0.0
+
+    def progress(self, *, wait=False):
+        del wait
+        return True
+
+    def start_prepare(self, tick_id, sample_count, min_snapshot_ptr=None):
+        del tick_id, sample_count, min_snapshot_ptr
+        return True
+
+    def batch_ready(self, tick_id, sample_count):
+        del tick_id, sample_count
+        return True
+
+    def sample_large_batch(self, tick_id, sample_count):
+        del tick_id, sample_count
+        return {}
+
+    def after_tick(self):
+        return None
 
 
 class _FakeLogger:
@@ -302,8 +423,26 @@ class _FakeLogger:
     def _get_learner_replay_rows_per_sec(self):
         return None
 
+    def _get_tail_env_steps_per_sec(self):
+        return None
+
     def _get_iter_wall_time(self):
         return 0.0
+
+
+class _RewardSummaryLogger(_FakeLogger):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._mean_ep_length = 0.0
+        self._runtime_manifest = {}
+        self._total_steps = 0
+
+    def update_mean_episode_length(self, length):
+        self._mean_ep_length = float(length)
+
+    def log_collector(self, total_steps, buffer_size):
+        del buffer_size
+        self._total_steps = int(total_steps)
 
 
 def _unused_env_factory(num_envs, env_cfg_override=None):
@@ -316,25 +455,47 @@ def _make_device_runner(
     *,
     device: str = "cuda",
     sim_backend: str = "mujoco",
+    env_name: str = "DummyEnv",
+    algo_type: str = "sac",
+    collector_tensor_native: bool | None = None,
+    inference_slot_capacity: int = 1,
+    inference_epoch: int = 0,
+    collector_metrics_interval: int = 1,
+    tensor_runtime_settings: TensorRuntimeSettings | None = None,
+    num_envs: int = 2,
+    batch_size: int = 4,
+    updates_per_step: int = 2,
 ):
     monkeypatch.setattr(
         device_runner_module, "require_offpolicy_replay_device", lambda value: value
     )
     monkeypatch.setattr(runner_module, "get_env_dims", lambda *args, **kwargs: (4, 2, 5))
+    placement = None
+    if collector_tensor_native is not None:
+        placement = resolve_inference_placement(
+            learner_device=device,
+            tensor_runtime=collector_tensor_native,
+            algo_name="TestRunner",
+        )
     return device_runner_module.DoubleBufferOffPolicyRunner(
         learner=learner or _Learner(),
-        env_name="DummyEnv",
-        algo_type="sac",
+        env_name=env_name,
+        algo_type=algo_type,
         env_factory=_unused_env_factory,
-        num_envs=2,
+        num_envs=num_envs,
         replay_buffer_n=8,
-        batch_size=4,
+        batch_size=batch_size,
         learning_starts=0,
-        updates_per_step=2,
+        updates_per_step=updates_per_step,
         policy_frequency=1,
         env_steps_per_sync=1,
         device=device,
         sim_backend=sim_backend,
+        inference_placement=placement,
+        inference_slot_capacity=inference_slot_capacity,
+        inference_epoch=inference_epoch,
+        collector_metrics_interval=collector_metrics_interval,
+        tensor_runtime_settings=tensor_runtime_settings,
     )
 
 
@@ -349,6 +510,7 @@ def test_mjwarp_collector_backend_device_follows_learner_device(
 
     assert runner.device == "cuda:3"
     assert runner.collector_backend_device == "cuda:3"
+    assert runner.last_run_summary is None
     assert runner.runtime_manifest["collector_accelerator_context"] is True
     assert runner.runtime_manifest["collector_backend_device"] == "cuda:3"
 
@@ -358,11 +520,27 @@ def test_mjwarp_collector_start_forwards_learner_device(
     tmp_path,
 ) -> None:
     _FakePipeline.close_calls = 0
+    _FakeReplayBuffer.diagnostics_calls = 0
     monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
     monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
     monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
     monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
     monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
 
     real_empty = torch.empty
 
@@ -377,6 +555,7 @@ def test_mjwarp_collector_start_forwards_learner_device(
         device="cuda:3",
         sim_backend="mjwarp",
     )
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
     collector_kwargs = {}
     lifecycle: list[str] = []
 
@@ -391,11 +570,679 @@ def test_mjwarp_collector_start_forwards_learner_device(
     monkeypatch.setattr(runner, "_start_collector", capture_collector)
     runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
 
+    assert _FakeReplayBuffer.diagnostics_calls == 4
+    assert runner.last_run_summary["status"] == "completed"
+    assert runner.last_run_summary["metric_schema_version"] == METRIC_SCHEMA_VERSION
+    assert (
+        runner.last_run_summary["runtime_manifest"]["schema_version"]
+        == RUNTIME_MANIFEST_SCHEMA_VERSION
+    )
+    diagnostics = runner.last_run_summary["runtime_manifest"]["replay_ingress"]
+    assert diagnostics["occupancy"] == 0
+    assert diagnostics["published_sequence"] == diagnostics["release_sequence"]
+    assert diagnostics["early_returns"] == 0
+    assert diagnostics["dropped_batches"] == 0
+    assert diagnostics["closed_returns"] == 0
+    assert diagnostics["stop_returns"] == 0
+
     assert lifecycle == ["dp_init", "prepare", "collector_start"]
     assert collector_kwargs["sim_backend"] == "mjwarp"
     assert collector_kwargs["backend_device"] == "cuda:3"
     assert collector_kwargs["learner_pid"] > 0
     assert collector_kwargs["learner_coordination"] is runner._learner_coordination
+
+
+def test_normal_completion_quiesces_collector_before_replay_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """The final collector transition must be published before ingress close."""
+
+    lifecycle: list[str] = []
+
+    class _CloseAfterCollectorQuiescePipeline(_ReadyPipeline):
+        def close(self):
+            assert runner._collector_quiesced, "replay pipeline closed before collector exit"
+            lifecycle.append("replay_close")
+            super().close()
+
+    class _ReadyReplayBuffer(_FakeReplayBuffer):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.ptr[0] = 4
+            self.size[0] = 4
+            self.published_ptr = 4
+
+    class _UpdateLearner(_Learner):
+        supports_deferred_update_metrics = True
+
+        def update_critic(self, batch, *, read_metrics: bool = True):
+            del batch
+            return {"Loss/critic": 7.0} if read_metrics else {}
+
+        def update_actor(self, batch, *, read_metrics: bool = True):
+            del batch
+            return {}
+
+        def read_deferred_actor_metrics(self):
+            return {"Loss/actor": 3.0}
+
+        def soft_update_target(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _ReadyReplayBuffer)
+    monkeypatch.setattr(
+        device_runner_module, "GPUResidentReplayPipeline", _CloseAfterCollectorQuiescePipeline
+    )
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
+    real_empty = torch.empty
+
+    def empty_without_cuda(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(device_runner_module.torch, "empty", empty_without_cuda)
+    runner = _make_device_runner(
+        monkeypatch,
+        _UpdateLearner(),
+        device="cuda:3",
+        sim_backend="mjwarp",
+    )
+    runner.device = "cpu"
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_start_collector", lambda *, target_fn, kwargs: None)
+    monkeypatch.setattr(runner, "_check_collector_alive", lambda: True)
+    monkeypatch.setattr(runner, "_wait_for_inference_request", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        runner,
+        "_serve_learner_inference",
+        lambda *args, **kwargs: {
+            "inference_h2d_time": 0.0,
+            "inference_forward_time": 0.0,
+            "inference_d2h_time": 0.0,
+            "inference_time": 0.0,
+        },
+    )
+    monkeypatch.setattr(runner, "_publish_inference_response", lambda *args, **kwargs: None)
+    runner._collector_quiesced = False
+
+    def quiesce_collector():
+        if not runner._collector_quiesced:
+            runner._collector_quiesced = True
+            lifecycle.append("collector_quiesce")
+
+    monkeypatch.setattr(runner, "_shutdown_collector", quiesce_collector)
+
+    runner.learn(max_iterations=1, save_interval=0, log_dir=str(tmp_path))
+
+    assert runner.last_run_summary["status"] == "completed"
+    assert lifecycle == ["collector_quiesce", "replay_close"]
+
+
+def test_learn_consumes_final_collector_return_metric(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consume a metric message queued by the collector at process shutdown."""
+
+    _FakePipeline.close_calls = 0
+    _FakeReplayBuffer.diagnostics_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _RewardSummaryLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
+    real_empty = torch.empty
+
+    def empty_without_cuda(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(device_runner_module.torch, "empty", empty_without_cuda)
+    runner = _make_device_runner(monkeypatch, device="cuda:3", sim_backend="mjwarp")
+    runner.device = "cpu"
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_start_collector", lambda *, target_fn, kwargs: None)
+
+    metrics_queue = queue.Queue()
+    metrics_queue.put_nowait(
+        {
+            "total_steps": 8192,
+            "buffer_size": 8192,
+            "return_mean_ep100": 4.0,
+            "mean_episode_length": 32.0,
+            "metric_flush": "final",
+        }
+    )
+    reward_history: deque[float] = deque(maxlen=10)
+    reward_history.append(1.0)
+    logger = _RewardSummaryLogger()
+
+    runner._drain_collector_metrics_after_shutdown(
+        metrics_queue,
+        reward_history,
+        RewardComponentWindow(),
+        logger,
+    )
+
+    assert list(reward_history) == [1.0, 4.0]
+    assert logger._mean_ep_length == pytest.approx(32.0)
+    assert logger._total_steps == 8192
+    assert metrics_queue.empty()
+
+
+def test_learn_failure_before_summary_preserves_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class _FinishFailureLogger(_FakeLogger):
+        def finish(self):
+            raise RuntimeError("finish failed")
+
+    _FakePipeline.close_calls = 0
+    _FakeReplayBuffer.diagnostics_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FinishFailureLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
+
+    real_empty = torch.empty
+
+    def empty_without_cuda(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(device_runner_module.torch, "empty", empty_without_cuda)
+    runner = _make_device_runner(monkeypatch, device="cuda:3", sim_backend="mjwarp")
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_start_collector", lambda *, target_fn, kwargs: None)
+
+    with pytest.raises(RuntimeError, match="finish failed") as excinfo:
+        runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    assert not isinstance(excinfo.value, AttributeError)
+    assert _FakeReplayBuffer.diagnostics_calls == 4
+    assert runner.last_run_summary["status"] == "failed"
+    shutdown = runner.last_run_summary["runtime_manifest"]["shutdown"]
+    assert shutdown["classification"] == "learner_failure"
+    assert shutdown["owner"] == "learner"
+    assert shutdown["phase"] == "finalize/logger_finish"
+    assert shutdown["exception"] == {"type": "RuntimeError", "message": "finish failed"}
+    assert runner.runtime_manifest["replay_ingress"]["occupancy"] == 0
+    assert _FinishFailureLogger.last_instance._runtime_manifest["replay_ingress"]["occupancy"] == 0
+    assert _FakePipeline.close_calls == 1
+
+
+def test_learn_startup_failure_records_shutdown_and_replaces_stale_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class _StartupFailureLogger:
+        def __init__(self, **kwargs):
+            del kwargs
+            raise RuntimeError("logger construction failed")
+
+    _FakePipeline.close_calls = 0
+    _FakeReplayBuffer.diagnostics_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _StartupFailureLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
+    real_empty = torch.empty
+
+    def empty_without_cuda(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(device_runner_module.torch, "empty", empty_without_cuda)
+    runner = _make_device_runner(monkeypatch, device="cuda:3", sim_backend="mjwarp")
+    runner.runtime_manifest["shutdown"] = {"classification": "normal_completion"}
+    runner.last_run_summary = {"status": "completed", "stale": True}
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
+
+    with pytest.raises(RuntimeError, match="logger construction failed"):
+        runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    assert runner.last_run_summary["status"] == "failed"
+    assert "stale" not in runner.last_run_summary
+    assert runner.last_run_summary["metric_schema_version"] == METRIC_SCHEMA_VERSION
+    assert (
+        runner.last_run_summary["runtime_manifest"]["schema_version"]
+        == device_runner_module.RUNTIME_MANIFEST_SCHEMA_VERSION
+    )
+    shutdown = runner.last_run_summary["runtime_manifest"]["shutdown"]
+    assert shutdown["classification"] == "learner_failure"
+    assert shutdown["owner"] == "learner"
+    assert shutdown["phase"] == "startup/logger"
+    assert shutdown["exception"] == {
+        "type": "RuntimeError",
+        "message": "logger construction failed",
+    }
+    assert "schema_version" not in shutdown
+    runner.close()
+
+
+def test_offpolicy_resume_restores_state_and_iteration_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    checkpoint_path = tmp_path / "model_7.pt"
+    checkpoint = {"weights": torch.ones(2), "update_count": 7}
+    loaded: list[dict[str, object]] = []
+
+    class _ResumeLearner:
+        def __init__(self) -> None:
+            self.loaded_state: dict[str, object] | None = None
+
+        def load_state_dict(self, state: dict[str, object]) -> None:
+            self.loaded_state = state
+
+    def fake_load(path, **kwargs):
+        loaded.append({"path": path, **kwargs})
+        return checkpoint
+
+    learner = _ResumeLearner()
+    runner = _make_device_runner(monkeypatch, learner=learner, device="cpu")
+    monkeypatch.setattr(device_runner_module.torch, "load", fake_load)
+    captured_impl: dict[str, object] = {}
+
+    def fake_impl(**kwargs):
+        captured_impl.update(kwargs)
+
+    monkeypatch.setattr(runner, "_learn_impl", fake_impl)
+
+    runner.learn(
+        max_iterations=20,
+        save_interval=4,
+        log_dir=str(tmp_path),
+        resume_checkpoint=str(checkpoint_path),
+    )
+
+    assert loaded == [
+        {
+            "path": str(checkpoint_path),
+            "map_location": "cpu",
+            "weights_only": False,
+        }
+    ]
+    assert learner.loaded_state is checkpoint
+    assert runner.resume_start_iteration == 8
+    assert captured_impl == {
+        "max_iterations": 20,
+        "save_interval": 4,
+        "log_dir": str(tmp_path),
+        "logger_type": "tensorboard",
+    }
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "message"),
+    [
+        (torch.ones(1), "must contain a learner state dictionary"),
+        ({"weights": torch.ones(1)}, "missing a valid integer update_count"),
+        ({"update_count": "invalid"}, "missing a valid integer update_count"),
+        ({"update_count": -1}, "update_count must be non-negative"),
+    ],
+)
+def test_offpolicy_resume_rejects_invalid_checkpoint_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    checkpoint,
+    message,
+) -> None:
+    learner = _Learner()
+    runner = _make_device_runner(monkeypatch, learner=learner, device="cpu")
+    monkeypatch.setattr(
+        device_runner_module.torch,
+        "load",
+        lambda *args, **kwargs: checkpoint,
+    )
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        runner.learn(
+            max_iterations=10,
+            save_interval=0,
+            log_dir=str(tmp_path),
+            resume_checkpoint=str(tmp_path / "model.pt"),
+        )
+
+    assert not hasattr(runner, "resume_start_iteration")
+
+
+def test_offpolicy_resume_rejects_iteration_past_max(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    learner = SimpleNamespace(load_state_dict=lambda state: None)
+    runner = _make_device_runner(monkeypatch, learner=learner, device="cpu")
+    monkeypatch.setattr(
+        device_runner_module.torch,
+        "load",
+        lambda *args, **kwargs: {"update_count": 10},
+    )
+    monkeypatch.setattr(runner, "_learn_impl", lambda **kwargs: pytest.fail("training started"))
+
+    with pytest.raises(ValueError, match="newer than max_iterations"):
+        runner.learn(
+            max_iterations=9,
+            save_interval=0,
+            log_dir=str(tmp_path),
+            resume_checkpoint=str(tmp_path / "model_10.pt"),
+        )
+
+    assert runner.resume_start_iteration == 11
+
+
+def test_minimal_failed_summary_is_schema_valid(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _make_device_runner(monkeypatch)
+    summary = runner._minimal_failed_summary("failed")
+
+    assert summary["metric_schema_version"] == METRIC_SCHEMA_VERSION
+    assert summary["runtime_manifest"]["schema_version"] == (
+        device_runner_module.RUNTIME_MANIFEST_SCHEMA_VERSION
+    )
+    validate_runtime_manifest(
+        summary["runtime_manifest"],
+        completed=False,
+    )
+
+
+def test_shutdown_diagnostics_cleanup_does_not_replace_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class _FinishFailureLogger(_FakeLogger):
+        def finish(self):
+            raise RuntimeError("finish failed")
+
+    class _FailingDiagnosticsReplayBuffer(_FakeReplayBuffer):
+        def ingress_diagnostics(self):
+            raise KeyboardInterrupt("replay diagnostics unavailable")
+
+    _FakePipeline.close_calls = 0
+    _FakeReplayBuffer.diagnostics_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FailingDiagnosticsReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FinishFailureLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
+    real_empty = torch.empty
+
+    def empty_without_cuda(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(device_runner_module.torch, "empty", empty_without_cuda)
+    runner = _make_device_runner(monkeypatch, device="cuda:3", sim_backend="mjwarp")
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_start_collector", lambda *, target_fn, kwargs: None)
+
+    with pytest.raises(RuntimeError, match="finish failed"):
+        runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    shutdown = runner.last_run_summary["runtime_manifest"]["shutdown"]
+    assert shutdown["classification"] == "learner_failure"
+    cleanup_errors = shutdown["cleanup"]["errors"]
+    assert {
+        "type": "KeyboardInterrupt",
+        "message": "replay diagnostics unavailable",
+    } in cleanup_errors
+    runner.close()
+
+
+def test_collector_failure_cleanup_does_not_replace_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class _CleanupFailureLogger(_FakeLogger):
+        def log_status(self, value):
+            if "Collector died" not in value:
+                return
+            raise KeyboardInterrupt("logger status failed")
+
+    class _CleanupFailurePipeline(_FakePipeline):
+        _close_failed = False
+        cleanup_close_calls = 0
+
+        def close(self):
+            if self._closed:
+                return
+            self._closed = True
+            type(self).cleanup_close_calls += 1
+            if not type(self)._close_failed:
+                type(self)._close_failed = True
+                raise SystemExit("pipeline close failed")
+
+    _FakePipeline.close_calls = 0
+    _FakeReplayBuffer.diagnostics_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _CleanupFailurePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _CleanupFailureLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
+    real_empty = torch.empty
+
+    def empty_without_cuda(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(device_runner_module.torch, "empty", empty_without_cuda)
+    runner = _make_device_runner(monkeypatch, device="cuda:3", sim_backend="mjwarp")
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_start_collector", lambda *, target_fn, kwargs: None)
+
+    def collector_died(*args, **kwargs):
+        del args, kwargs
+        raise device_runner_module._CollectorDiedError("collector dead test")
+
+    def shutdown_collector():
+        raise KeyboardInterrupt("collector shutdown failed")
+
+    monkeypatch.setattr(runner, "_wait_for_inference_request", collector_died)
+    monkeypatch.setattr(runner, "_shutdown_collector", shutdown_collector)
+
+    with pytest.raises(RuntimeError, match="Collector process died"):
+        runner.learn(max_iterations=1, save_interval=0, log_dir=str(tmp_path))
+
+    assert runner.last_run_summary["status"] == "collector_died"
+    assert runner.last_run_summary["metric_schema_version"] == METRIC_SCHEMA_VERSION
+    assert (
+        runner.last_run_summary["runtime_manifest"]["schema_version"]
+        == device_runner_module.RUNTIME_MANIFEST_SCHEMA_VERSION
+    )
+    cleanup_errors = runner.last_run_summary["runtime_manifest"]["shutdown"]["cleanup"]["errors"]
+    assert {"type": "KeyboardInterrupt", "message": "logger status failed"} in cleanup_errors
+    assert {"type": "SystemExit", "message": "pipeline close failed"} in cleanup_errors
+    assert {"type": "KeyboardInterrupt", "message": "collector shutdown failed"} in cleanup_errors
+    runner.close()
+
+
+def test_collector_died_learn_refreshes_ingress_after_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _FakePipeline.close_calls = 0
+    _FakeReplayBuffer.diagnostics_calls = 0
+
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
+
+    real_empty = torch.empty
+
+    def empty_without_cuda(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(device_runner_module.torch, "empty", empty_without_cuda)
+    runner = _make_device_runner(monkeypatch, device="cuda:3", sim_backend="mjwarp")
+    runner._shutdown_seen = False
+    diagnostics_after_shutdown: list[bool] = []
+
+    class _ShutdownAwareReplayBuffer(_FakeReplayBuffer):
+        def ingress_diagnostics(self):
+            assert runner._shutdown_seen
+            diagnostics_after_shutdown.append(runner._shutdown_seen)
+            diagnostics = super().ingress_diagnostics()
+            diagnostics["stop_returns"] = 1
+            return diagnostics
+
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _ShutdownAwareReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_start_collector", lambda *, target_fn, kwargs: None)
+
+    def collector_died(*args, **kwargs):
+        del args, kwargs
+        raise device_runner_module._CollectorDiedError("collector dead test")
+
+    monkeypatch.setattr(runner, "_wait_for_inference_request", collector_died)
+    monkeypatch.setattr(
+        runner,
+        "_shutdown_collector",
+        lambda: setattr(runner, "_shutdown_seen", True),
+    )
+
+    with pytest.raises(RuntimeError, match="Collector process died") as excinfo:
+        runner.learn(max_iterations=1, save_interval=0, log_dir=str(tmp_path))
+
+    assert not isinstance(excinfo.value, AttributeError)
+    assert diagnostics_after_shutdown == [True, True]
+    assert runner._shutdown_seen is True
+    assert runner.last_run_summary["status"] == "collector_died"
+    diagnostics = runner.last_run_summary["runtime_manifest"]["replay_ingress"]
+    assert diagnostics["occupancy"] == 0
+    assert diagnostics["published_sequence"] == diagnostics["release_sequence"]
+    assert diagnostics["stop_returns"] == 1
+    shutdown = runner.last_run_summary["runtime_manifest"]["shutdown"]
+    assert shutdown["classification"] == "collector_failure"
+    assert shutdown["owner"] == "collector"
+    assert shutdown["phase"] == "training/wait_for_inference_request"
+    assert shutdown["coordination_tick"] is None
+    assert _FakePipeline.close_calls == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -429,6 +1276,7 @@ def test_runner_constructs_only_bounded_device_replay(
         "critic_dim": 5,
         "ingress_slot_rows": 2,
         "ingress_depth": 2,
+        "ingress_device": "cpu",
     }
     assert _FakePipeline.last_kwargs == {
         "device": "cuda",
@@ -440,6 +1288,11 @@ def test_runner_constructs_only_bounded_device_replay(
     runtime_manifest = runner.last_run_summary["runtime_manifest"]
     assert runtime_manifest["replay_h2d_submitter"] == runner.replay_h2d_submitter
     assert "replay_device_submission_thread" in runtime_manifest
+    budget = runtime_manifest["inference_memory_budget"]
+    assert budget["ipc_event_count"] == 0
+    assert budget["timing_event_count"] == 2
+    assert budget["cuda_event_count"] == 2
+    assert len(runner._inference_forward_cuda_events) == 2
     assert not any(key.startswith("collector_pack") for key in collector_kwargs)
     assert "weight_sync_name" not in collector_kwargs
     assert "weight_param_shapes" not in collector_kwargs
@@ -451,6 +1304,295 @@ def test_runner_constructs_only_bounded_device_replay(
     assert "collection_ready_queue" not in collector_kwargs
     assert "trainer_done_queue" not in collector_kwargs
     assert _FakePipeline.close_calls == 1
+
+
+def test_cuda_inference_budget_fails_before_resource_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    monkeypatch.setattr(device_runner_module.torch.cuda, "mem_get_info", lambda device: (1, 2))
+
+    def fail_allocation(*args, **kwargs):
+        raise AssertionError("inference resources must not be allocated after budget failure")
+
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", fail_allocation)
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", fail_allocation)
+    runner = _make_device_runner(
+        monkeypatch,
+        device="cuda",
+        collector_tensor_native=True,
+        inference_slot_capacity=2,
+    )
+
+    with pytest.raises(MemoryError) as excinfo:
+        runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    message = str(excinfo.value)
+    assert "conservative CUDA tensor runtime (inference + replay) budget" in message
+    assert "80% limit" in message
+    assert "device free" in message
+    assert "training.inference_slot_capacity" in message
+    assert "training.replay_ingress_depth" in message
+    assert "algo.updates_per_step" in message
+    assert not runner._shared_resources
+
+
+@pytest.mark.parametrize(
+    ("collector_tensor_native", "expected_device"),
+    [
+        (True, "cuda"),
+        (False, "cpu"),
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_runner_collector_resources_follow_tensor_runtime_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    collector_tensor_native: bool,
+    expected_device: str,
+):
+    _FakePipeline.close_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    settings = TensorRuntimeSettings(
+        inference_slot_capacity=1,
+        collector_metrics_interval=1,
+        replay_ingress_depth=3,
+        replay_ingress_slot_rows=1,
+        batch_size=4,
+        updates_per_step=2,
+        num_envs=2,
+    )
+    runner = _make_device_runner(
+        monkeypatch,
+        env_name="G1MotionTrackingSAC",
+        algo_type="flashsac",
+        device="cuda",
+        sim_backend="mjwarp",
+        collector_tensor_native=collector_tensor_native,
+        tensor_runtime_settings=settings,
+    )
+    collector_kwargs = {}
+
+    def capture_collector(*, target_fn, kwargs):
+        del target_fn
+        collector_kwargs.update(kwargs)
+
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_start_collector", capture_collector)
+    runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    assert _FakeReplayBuffer.last_kwargs["ingress_device"] == expected_device
+    assert _FakeReplayBuffer.last_kwargs["ingress_slot_rows"] == 1
+    assert _FakeReplayBuffer.last_kwargs["ingress_depth"] == 3
+    assert collector_kwargs["inference_slot"].device.type == expected_device
+    manifest = runner.runtime_manifest
+    assert manifest["collector_tensor_native"] is collector_tensor_native
+    assert manifest["inference_ring_capacity"] == 1
+    assert manifest["inference_publication_ordering"] == "contiguous_ticks"
+    assert manifest["inference_publication_sync"] == (
+        "cuda_ipc_events" if collector_tensor_native else "cpu_synchronous"
+    )
+    assert manifest["inference_epoch"] == 0
+    assert manifest["inference_slot_bytes"] == 56
+    budget = manifest["inference_memory_budget"]
+    assert budget["ipc_event_count"] == (1 if collector_tensor_native else 0) * 3
+    assert budget["timing_event_count"] == 2
+    assert budget["cuda_event_count"] == budget["ipc_event_count"] + 2
+    tensor_budget = manifest["tensor_memory_budget"]
+    assert tensor_budget["total"] > 0
+    assert tensor_budget["available_bytes"] == 1 << 30
+    assert tensor_budget["threshold"] == 0.8
+    assert tensor_budget["allowed_bytes"] == int((1 << 30) * 0.8)
+    assert tensor_budget["replay_ingress_depth"] == 3
+    assert tensor_budget["replay_ingress_slot_rows"] == 1
+    assert manifest["collector_metrics_interval"] == 1
+    assert manifest["runtime_limits"]["replay_ingress_slot_rows"]["effective"] == 1
+    if torch.device(expected_device).type == "cuda":
+        expected_device = "cuda:0"
+    expected_learner = expected_device
+    if not collector_tensor_native:
+        expected_learner = "cuda:0"
+    assert manifest["learner_device"] == expected_learner
+    assert manifest["inference_ring_device"] == expected_device
+    assert manifest["env_public_device"] == expected_device
+    assert manifest["inference_staging_policy"] == (
+        "cuda_no_host_boundary"
+        if collector_tensor_native
+        else "cpu_ring_explicit_learner_actor_h2d_action_d2h"
+    )
+    assert manifest["inference_transport"] == {
+        "mode": "cuda" if collector_tensor_native else "cpu",
+        "env_device": expected_device,
+        "ring_device": expected_device,
+        "learner_device": expected_learner,
+        "staging_policy": (
+            "cuda_no_host_boundary"
+            if collector_tensor_native
+            else "cpu_ring_explicit_learner_actor_h2d_action_d2h"
+        ),
+    }
+    env_override = collector_kwargs["env_cfg_override"]
+    assert env_override is None or not {
+        "tensor_runtime",
+        "tensor_runtime_device",
+        "inference_transport",
+    } & set(env_override)
+    assert collector_kwargs["inference_epoch"] == 0
+    assert collector_kwargs["collector_metrics_interval"] == 1
+
+
+def test_runner_rejects_tensor_native_collector_without_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(
+        ValueError, match="CUDA inference transport requires CUDA env and learner devices"
+    ):
+        _make_device_runner(
+            monkeypatch,
+            device="cpu",
+            collector_tensor_native=True,
+        )
+
+
+@pytest.mark.parametrize("field", ["inference_slot_capacity", "collector_metrics_interval"])
+@pytest.mark.parametrize("value", [0, -1, True, "2", 1.0])
+def test_runner_rejects_invalid_tensor_runtime_intervals(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value,
+) -> None:
+    expected = TypeError if type(value) is not int else ValueError
+    with pytest.raises(expected, match=f"{field} must be a positive integer"):
+        _make_device_runner(monkeypatch, **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("inference_slot_capacity", 17),
+        ("collector_metrics_interval", 10_001),
+    ],
+)
+def test_runner_rejects_tensor_runtime_intervals_above_maxima(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: int,
+) -> None:
+    with pytest.raises(ValueError, match="no greater than"):
+        _make_device_runner(monkeypatch, **{field: value})
+
+
+def test_runner_rejects_conflicting_tensor_runtime_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = TensorRuntimeSettings(
+        inference_slot_capacity=2,
+        collector_metrics_interval=3,
+        replay_ingress_depth=2,
+        replay_ingress_slot_rows=2,
+        batch_size=4,
+        updates_per_step=2,
+        num_envs=2,
+    )
+    with pytest.raises(ValueError, match="conflict with tensor_runtime_settings"):
+        _make_device_runner(
+            monkeypatch,
+            device="cpu",
+            inference_slot_capacity=1,
+            tensor_runtime_settings=settings,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("num_envs", True),
+        ("batch_size", 4.0),
+        ("updates_per_step", "2"),
+    ],
+)
+def test_runner_rejects_non_integer_settings_overlaps(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    settings = TensorRuntimeSettings(
+        inference_slot_capacity=1,
+        collector_metrics_interval=1,
+        replay_ingress_depth=2,
+        replay_ingress_slot_rows=2,
+        batch_size=4,
+        updates_per_step=2,
+        num_envs=2,
+    )
+    with pytest.raises(TypeError, match=f"{field} must be a positive integer"):
+        _make_device_runner(
+            monkeypatch,
+            device="cpu",
+            tensor_runtime_settings=settings,
+            **{field: value},
+        )
+
+
+@pytest.mark.parametrize("value", [-1, True, "0"])
+def test_runner_rejects_invalid_inference_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+    value,
+) -> None:
+    expected = TypeError if isinstance(value, bool) or not isinstance(value, int) else ValueError
+    with pytest.raises(expected, match="inference_epoch must be"):
+        _make_device_runner(monkeypatch, inference_epoch=value)
+
+
+def test_runner_manifest_and_collector_forward_ring_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _FakePipeline.close_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    runner = _make_device_runner(
+        monkeypatch,
+        device="cpu",
+        inference_slot_capacity=3,
+        inference_epoch=2,
+        collector_metrics_interval=4,
+    )
+    collector_kwargs = {}
+
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+
+    def capture_collector(*, target_fn, kwargs):
+        del target_fn
+        collector_kwargs.update(kwargs)
+
+    monkeypatch.setattr(runner, "_start_collector", capture_collector)
+    runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    assert _FakeReplayBuffer.last_kwargs["ingress_device"] == "cpu"
+    assert collector_kwargs["inference_epoch"] == 2
+    assert collector_kwargs["collector_metrics_interval"] == 4
+    assert collector_kwargs["inference_slot"].diagnostics["capacity"] == 3
+    manifest = runner.runtime_manifest
+    assert manifest["inference_ring_capacity"] == 3
+    assert manifest["inference_publication_ordering"] == "contiguous_ticks"
+    assert manifest["inference_publication_sync"] == "cpu_synchronous"
+    assert manifest["inference_epoch"] == 2
+    assert manifest["inference_slot_bytes"] == 168
+    assert manifest["collector_metrics_interval"] == 4
 
 
 class _ReadyAfterPoll:
@@ -901,18 +2043,30 @@ def test_learner_inference_matches_existing_actor_exploration(algo_type: str) ->
     runner.obs_normalization = False
     runner.algo_type = algo_type
     runner.learner = SimpleNamespace(actor=actor)
-    slot = SharedInferenceSlot(2, 3, 2)
-    slot.publish_observation(tick_id=4, observations=observations, dones=dones)
+    runner.inference_epoch = 0
+    runner.inference_placement = InferencePlacement(
+        mode=InferenceTransport.CPU,
+        env_device="cpu",
+        ring_device="cpu",
+        learner_device="cpu",
+        collector_tensor_native=False,
+        staging_policy="cpu_no_device_transfer",
+    )
+    slot = SharedInferenceRing(2, 3, 2)
+    slot.publish_observation(tick_id=0, observations=observations, dones=dones, epoch=0)
     torch.manual_seed(17)
     runner._serve_learner_inference(
         slot,
-        tick_id=4,
+        tick_id=0,
         policy_version=9,
         obs_device=torch.empty(2, 3),
         dones_device=torch.empty(2),
+        actor_obs_device=torch.empty(2, 3),
+        actor_dones_device=torch.empty(2),
+        actions_host=torch.empty(2, 2),
         trace_recorder=None,
     )
-    actual, policy_version = slot.consume_action(tick_id=4)
+    actual, policy_version = slot.consume_action(tick_id=0, epoch=0)
 
     torch.testing.assert_close(torch.from_numpy(actual), expected)
     assert policy_version == 9
@@ -962,17 +2116,29 @@ def test_adapter_learner_inference_uses_actor_context(
     runner.obs_normalization = False
     runner.algo_type = "dummy_priv_sac"
     runner.learner = SimpleNamespace(actor=actor)
-    slot = SharedInferenceSlot(2, 5, 2)
-    slot.publish_observation(tick_id=5, observations=actor_input, dones=dones)
+    runner.inference_epoch = 0
+    runner.inference_placement = InferencePlacement(
+        mode=InferenceTransport.CPU,
+        env_device="cpu",
+        ring_device="cpu",
+        learner_device="cpu",
+        collector_tensor_native=False,
+        staging_policy="cpu_no_device_transfer",
+    )
+    slot = SharedInferenceRing(2, 5, 2)
+    slot.publish_observation(tick_id=0, observations=actor_input, dones=dones, epoch=0)
     runner._serve_learner_inference(
         slot,
-        tick_id=5,
+        tick_id=0,
         policy_version=10,
         obs_device=torch.empty(2, 5),
         dones_device=torch.empty(2),
+        actor_obs_device=torch.empty(2, 5),
+        actor_dones_device=torch.empty(2),
+        actions_host=torch.empty(2, 2),
         trace_recorder=None,
     )
-    actual, policy_version = slot.consume_action(tick_id=5)
+    actual, policy_version = slot.consume_action(tick_id=0, epoch=0)
 
     torch.testing.assert_close(torch.from_numpy(actual), expected)
     assert policy_version == 10
@@ -1047,3 +2213,24 @@ def test_dp_metric_reduction_follows_the_metric_schema() -> None:
     assert dp_sync.total["metric::Train/rollouts_read"] == 3.0
     assert payload["metrics"]["Train/rollouts_read"] == pytest.approx(6.0)
     assert payload["checkpoint_return_mean_reports10"] == pytest.approx(5.0)
+
+
+def test_collector_override_never_carries_removed_tensor_runtime_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_device_runner(
+        monkeypatch,
+        env_name="G1MotionTrackingSAC",
+        algo_type="flashsac",
+        device="cuda:0",
+        sim_backend="mjwarp",
+        collector_tensor_native=True,
+    )
+
+    override = runner._collector_env_cfg_override()
+
+    assert override is None or not {
+        "tensor_runtime",
+        "tensor_runtime_device",
+        "inference_transport",
+    } & set(override)

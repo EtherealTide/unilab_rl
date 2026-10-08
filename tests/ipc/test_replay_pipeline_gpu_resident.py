@@ -84,6 +84,28 @@ def _pattern_add_chunks(rb: ReplayBuffer, chunk_rows: int, chunks: int) -> None:
         _pattern_add(rb, chunk * chunk_rows, chunk_rows)
 
 
+def _pattern_add_vector(rb: ReplayBuffer, rows_n: int) -> None:
+    rows = torch.arange(rows_n, dtype=torch.float32)
+    col = rows.unsqueeze(1)
+    critic = next_critic = None
+    if rb._critic_dim > 0:
+        critic = col * 10000 + torch.arange(rb._critic_dim, dtype=torch.float32)
+        next_critic = col * 100000 + torch.arange(rb._critic_dim, dtype=torch.float32)
+    assert (
+        rb.add_batch(
+            obs=col * 10 + torch.arange(rb._obs_dim, dtype=torch.float32),
+            actions=col * 1000 + torch.arange(rb._action_dim, dtype=torch.float32),
+            rewards=rows,
+            next_obs=col * 100 + torch.arange(rb._obs_dim, dtype=torch.float32),
+            dones=torch.zeros(rows_n),
+            truncated=torch.ones(rows_n),
+            critic=critic,
+            next_critic=next_critic,
+        )
+        is True
+    )
+
+
 def _expected_pattern(rb: ReplayBuffer, rewards: torch.Tensor) -> dict[str, torch.Tensor]:
     col = rewards.cpu().unsqueeze(1)
     out = {
@@ -220,6 +242,14 @@ class TestGPUResidentPipeline:
         assert pipeline.transfer_manifest["storage_owner"] == "device"
         assert pipeline.transfer_manifest["host_storage_bytes"] == rb.host_storage_bytes
         assert pipeline.transfer_manifest["ingress_depth"] == 2
+        assert pipeline.transfer_manifest["ingress_slot_rows"] == 16
+        diagnostics = pipeline.transfer_manifest["ingress_diagnostics"]
+        assert diagnostics["ingress_depth"] == 2
+        assert diagnostics["ingress_slot_rows"] == 16
+        assert diagnostics["published_sequence"] == 1
+        assert diagnostics["release_sequence"] == 1
+        assert diagnostics["occupancy"] == 0
+        assert diagnostics["high_water_occupancy"] == 1
 
     def test_bounded_ingress_ring_wrap_and_committed_field_order(self, pipeline_factory):
         rb = _make_bounded_replay(capacity=32, slot_rows=8)
@@ -242,6 +272,23 @@ class TestGPUResidentPipeline:
             torch.arange(8, 40, dtype=torch.float32),
         )
         assert (fields["dones"].cpu() == 0).all()
+
+    def test_bounded_ingress_consumes_chunked_collector_vector(self, pipeline_factory):
+        rb = _make_bounded_replay(capacity=64, slot_rows=6)
+        pipeline = pipeline_factory(rb, sample_count=8)
+        _pattern_add_vector(rb, 15)
+        _wait_visible(pipeline, 15)
+
+        assert rb.published_ptr == 15
+        assert int(rb.ptr[0]) == 15
+        diagnostics = rb.ingress_diagnostics()
+        assert diagnostics["published_sequence"] == 3
+        assert diagnostics["release_sequence"] == 3
+        _, fields = pipeline.read_committed_fields(("rewards",), start_ptr=0)
+        torch.testing.assert_close(
+            fields["rewards"].cpu(),
+            torch.arange(15, dtype=torch.float32),
+        )
 
     def test_bounded_ingress_samples_only_committed_rows(self, pipeline_factory):
         rb = _make_bounded_replay(capacity=64, slot_rows=16)

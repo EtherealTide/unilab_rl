@@ -1,21 +1,351 @@
 from __future__ import annotations
 
 import queue
+import statistics
 import threading
+from collections import deque
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 import uni_rl.offpolicy.worker as worker_module
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
+from uni_rl.ipc.inference_ring import SharedInferenceRing
+from uni_rl.logging.metrics_drain import RewardComponentWindow, drain_collector_metrics
+from uni_rl.logging.offpolicy import OffPolicyLogger
+from uni_rl.offpolicy.tensor_metrics import TensorCollectorMetrics
 from uni_rl.offpolicy.worker import (
+    _collector_action_numpy,
     _publish_collector_ready,
     _publish_inference_tick,
     _wait_for_inference_tick,
     resolve_offpolicy_actor_priv_info,
     sample_offpolicy_actions,
 )
+
+
+@pytest.mark.parametrize("actions_is_tensor", [False, True])
+def test_cpu_collector_action_conversion_preserves_legacy_contract(
+    actions_is_tensor: bool,
+) -> None:
+    values = [[1.0, 2.0], [3.0, 4.0]]
+    actions = (
+        torch.tensor(values, dtype=torch.float32)
+        if actions_is_tensor
+        else np.asarray(values, dtype=np.float32)
+    )
+
+    converted = _collector_action_numpy(actions)
+
+    assert isinstance(converted, np.ndarray)
+    assert converted.dtype == np.float32
+    np.testing.assert_array_equal(converted, values)
+
+
+def test_tensor_collector_metrics_resets_done_episodes_and_flushes_one_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = TensorCollectorMetrics(num_envs=3, interval=4, device="cpu")
+    calls = 0
+    original_cpu = torch.Tensor.cpu
+
+    def counting_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return original_cpu(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", counting_cpu)
+
+    metrics.update(
+        rewards=torch.tensor([1.0, 2.0, 3.0]),
+        done=torch.tensor([False, True, False]),
+        timeout=torch.tensor([False, False, False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([4.0, 5.0, 6.0]),
+        done=torch.tensor([True, False, True]),
+        timeout=torch.tensor([False, False, False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([7.0, 8.0, 9.0]),
+        done=torch.tensor([False, False, False]),
+        timeout=torch.tensor([False, False, False]),
+    )
+    assert calls == 0
+    metrics.update(
+        rewards=torch.tensor([10.0, 11.0, 12.0]),
+        done=torch.tensor([True, True, True]),
+        timeout=torch.tensor([True, False, True]),
+    )
+
+    flushed = metrics.flush()
+
+    assert flushed.rewards == [2.0, 5.0, 9.0, 17.0, 24.0, 21.0]
+    assert flushed.lengths == [1, 2, 2, 2, 3, 2]
+    assert flushed.done_count == 6
+    assert flushed.timeout_count == 2
+    assert calls == 1
+    assert metrics.ready is False
+    assert torch.count_nonzero(metrics.current_rewards) == 0
+    assert torch.count_nonzero(metrics.current_lengths) == 0
+
+
+def test_tensor_collector_metrics_supports_no_done_window() -> None:
+    metrics = TensorCollectorMetrics(num_envs=2, interval=2, device="cpu")
+    metrics.update(
+        rewards=torch.tensor([1.0, 2.0]),
+        done=torch.tensor([False, False]),
+        timeout=torch.tensor([False, False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([3.0, 4.0]),
+        done=torch.tensor([False, False]),
+        timeout=torch.tensor([False, False]),
+    )
+
+    flushed = metrics.flush()
+
+    assert flushed.rewards == []
+    assert flushed.lengths == []
+    assert flushed.done_count == 0
+    assert flushed.timeout_count == 0
+    assert metrics.current_rewards.tolist() == [4.0, 6.0]
+    assert metrics.current_lengths.tolist() == [2, 2]
+
+
+def test_tensor_collector_final_flush_handles_empty_and_partial_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = TensorCollectorMetrics(num_envs=2, interval=3, device="cpu")
+    calls = 0
+    original_cpu = torch.Tensor.cpu
+
+    def counting_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return original_cpu(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", counting_cpu)
+
+    empty_before_updates = metrics.final_flush()
+    empty_after_finalize = metrics.final_flush()
+
+    assert empty_before_updates == empty_after_finalize
+    assert calls == 0
+
+    metrics = TensorCollectorMetrics(num_envs=2, interval=3, device="cpu")
+    metrics.update(
+        rewards=torch.tensor([1.0, 10.0]),
+        done=torch.tensor([False, False]),
+        timeout=torch.tensor([False, False]),
+    )
+    no_completed = metrics.final_flush()
+
+    assert no_completed.rewards == []
+    assert no_completed.lengths == []
+    assert no_completed.done_count == 0
+    assert no_completed.timeout_count == 0
+    assert calls == 1
+    assert metrics.current_rewards.tolist() == [1.0, 10.0]
+    assert metrics.current_lengths.tolist() == [1, 1]
+
+
+def test_tensor_collector_final_flush_emits_only_completed_episodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = TensorCollectorMetrics(num_envs=2, interval=3, device="cpu")
+    calls = 0
+    original_cpu = torch.Tensor.cpu
+
+    def counting_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return original_cpu(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", counting_cpu)
+    metrics.update(
+        rewards=torch.tensor([1.0, 10.0]),
+        done=torch.tensor([True, False]),
+        timeout=torch.tensor([False, False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([2.0, 20.0]),
+        done=torch.tensor([False, False]),
+        timeout=torch.tensor([False, False]),
+    )
+
+    flushed = metrics.final_flush()
+
+    assert flushed.rewards == [1.0]
+    assert flushed.lengths == [1]
+    assert flushed.done_count == 1
+    assert flushed.timeout_count == 0
+    assert calls == 1
+    assert metrics.current_rewards.tolist() == [2.0, 30.0]
+    assert metrics.current_lengths.tolist() == [1, 2]
+
+
+def test_tensor_collector_final_flush_emits_multiple_completed_episodes() -> None:
+    metrics = TensorCollectorMetrics(num_envs=2, interval=4, device="cpu")
+    metrics.update(
+        rewards=torch.tensor([1.0, 10.0]),
+        done=torch.tensor([True, False]),
+        timeout=torch.tensor([False, False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([2.0, 20.0]),
+        done=torch.tensor([True, True]),
+        timeout=torch.tensor([False, True]),
+    )
+
+    flushed = metrics.final_flush()
+
+    assert flushed.rewards == [1.0, 2.0, 30.0]
+    assert flushed.lengths == [1, 1, 2]
+    assert flushed.done_count == 3
+    assert flushed.timeout_count == 1
+
+
+def test_tensor_collector_final_flush_after_normal_flush_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = TensorCollectorMetrics(num_envs=1, interval=2, device="cpu")
+    calls = 0
+    original_cpu = torch.Tensor.cpu
+
+    def counting_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return original_cpu(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", counting_cpu)
+    metrics.update(
+        rewards=torch.tensor([1.0]),
+        done=torch.tensor([True]),
+        timeout=torch.tensor([False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([2.0]),
+        done=torch.tensor([True]),
+        timeout=torch.tensor([True]),
+    )
+    normal_flush = metrics.flush()
+    final_flush = metrics.final_flush()
+
+    assert normal_flush.rewards == [1.0, 2.0]
+    assert normal_flush.lengths == [1, 1]
+    assert final_flush.rewards == []
+    assert final_flush.lengths == []
+    assert final_flush.done_count == 0
+    assert final_flush.timeout_count == 0
+    assert calls == 1
+
+
+def test_tensor_collector_metrics_preserves_new_episode_after_done() -> None:
+    metrics = TensorCollectorMetrics(num_envs=1, interval=3, device="cpu")
+    metrics.update(
+        rewards=torch.tensor([1.0]),
+        done=torch.tensor([True]),
+        timeout=torch.tensor([False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([2.0]),
+        done=torch.tensor([False]),
+        timeout=torch.tensor([False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([3.0]),
+        done=torch.tensor([False]),
+        timeout=torch.tensor([False]),
+    )
+
+    first_flush = metrics.flush()
+
+    assert first_flush.rewards == [1.0]
+    assert first_flush.lengths == [1]
+    assert metrics.current_rewards.tolist() == [5.0]
+    assert metrics.current_lengths.tolist() == [2]
+
+    metrics.update(
+        rewards=torch.tensor([4.0]),
+        done=torch.tensor([True]),
+        timeout=torch.tensor([True]),
+    )
+    metrics.update(
+        rewards=torch.tensor([0.0]),
+        done=torch.tensor([False]),
+        timeout=torch.tensor([False]),
+    )
+    metrics.update(
+        rewards=torch.tensor([0.0]),
+        done=torch.tensor([False]),
+        timeout=torch.tensor([False]),
+    )
+    second_flush = metrics.flush()
+
+    assert second_flush.rewards == [9.0]
+    assert second_flush.lengths == [3]
+
+
+def test_tensor_collector_metrics_enforces_window_and_input_contract() -> None:
+    metrics = TensorCollectorMetrics(num_envs=2, interval=1, device="cpu")
+
+    with pytest.raises(RuntimeError, match="window is not ready"):
+        metrics.flush()
+    with pytest.raises(ValueError, match="positive environment count"):
+        TensorCollectorMetrics(num_envs=0, interval=1, device="cpu")
+    with pytest.raises(ValueError, match="positive interval"):
+        TensorCollectorMetrics(num_envs=1, interval=True, device="cpu")
+    with pytest.raises(TypeError, match="rewards must be Torch tensors"):
+        metrics.update(
+            rewards=np.asarray([1.0, 2.0]),
+            done=torch.tensor([False, False]),
+            timeout=torch.tensor([False, False]),
+        )
+    with pytest.raises(TypeError, match="rewards must have a floating dtype"):
+        metrics.update(
+            rewards=torch.tensor([1, 2]),
+            done=torch.tensor([False, False]),
+            timeout=torch.tensor([False, False]),
+        )
+    with pytest.raises(TypeError, match="done and timeout values must be Torch tensors"):
+        metrics.update(
+            rewards=torch.tensor([1.0, 2.0]),
+            done=np.asarray([False, False]),
+            timeout=torch.tensor([False, False]),
+        )
+    with pytest.raises(ValueError, match="environment shape"):
+        metrics.update(
+            rewards=torch.tensor([1.0]),
+            done=torch.tensor([False, False]),
+            timeout=torch.tensor([False, False]),
+        )
+    with pytest.raises(ValueError, match="timeout values must have environment shape"):
+        metrics.update(
+            rewards=torch.tensor([1.0, 2.0]),
+            done=torch.tensor([False, False]),
+            timeout=torch.tensor([False]),
+        )
+    with pytest.raises(TypeError, match="boolean tensors"):
+        metrics.update(
+            rewards=torch.tensor([1.0, 2.0]),
+            done=torch.tensor([0, 0]),
+            timeout=torch.tensor([False, False]),
+        )
+
+    metrics.update(
+        rewards=torch.tensor([1.0, 2.0]),
+        done=torch.tensor([False, False]),
+        timeout=torch.tensor([False, False]),
+    )
+    with pytest.raises(RuntimeError, match="window was not flushed"):
+        metrics.update(
+            rewards=torch.tensor([3.0, 4.0]),
+            done=torch.tensor([False, False]),
+            timeout=torch.tensor([False, False]),
+        )
 
 
 def test_collector_publishes_ready_after_initialization(
@@ -39,6 +369,10 @@ def test_collector_publishes_ready_after_initialization(
 
         def attach_stop_event(self, stop) -> None:
             del stop
+
+        def add_batch(self, *args, **kwargs) -> bool:
+            del args, kwargs
+            return True
 
     def publish_ready(coordination_queue, event) -> bool:
         assert not metrics_queue.empty()
@@ -66,6 +400,7 @@ def test_collector_publishes_ready_after_initialization(
         algo_type="sac",
         actor_adapter_modules=None,
         metrics_queue=metrics_queue,
+        inference_transport="legacy_tensor",
         sim_backend="mujoco",
         backend_device=None,
         env_cfg_override=None,
@@ -77,6 +412,49 @@ def test_collector_publishes_ready_after_initialization(
     assert events == ["env_init", "ready"]
     assert metrics_queue.get_nowait()["runtime_manifest"]["inference_owner"] == "learner"
     assert inference_request_queue.get_nowait() == worker_module.COLLECTOR_READY_TICK
+
+
+def test_collector_requires_batched_replay_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = threading.Event()
+
+    class _Env:
+        state = None
+
+        def init_state(self) -> None:
+            self.state = SimpleNamespace(obs={"obs": torch.zeros((1, 2))}, info={})
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *args, **kwargs: None)
+
+    with pytest.raises(AttributeError, match="add_batch"):
+        worker_module._run_collector(
+            stop_event=stop_event,
+            env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+            num_envs=1,
+            replay_buffer=_ReplayBuffer(),
+            inference_slot=None,
+            inference_request_queue=queue.Queue(),
+            inference_response_queue=queue.Queue(),
+            algo_type="sac",
+            actor_adapter_modules=None,
+            metrics_queue=queue.Queue(),
+            inference_transport="legacy_tensor",
+            sim_backend="mujoco",
+            backend_device=None,
+            env_cfg_override=None,
+            seed=None,
+            trace_enabled=False,
+            trace_thread_time=False,
+        )
 
 
 def test_collector_binds_backend_device_before_env_materialization(
@@ -111,6 +489,7 @@ def test_collector_binds_backend_device_before_env_materialization(
             algo_type="sac",
             actor_adapter_modules=None,
             metrics_queue=None,
+            inference_transport="cpu",
             sim_backend="mjwarp",
             backend_device="cuda:3",
             env_cfg_override=None,
@@ -126,6 +505,330 @@ def test_collector_binds_backend_device_before_env_materialization(
         ("bind", "cuda:3"),
         ("make", "2"),
     ]
+
+
+def test_tensor_collector_reports_bounded_inference_scheduling_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = threading.Event()
+    inference_request_queue: queue.Queue[int] = queue.Queue()
+    inference_response_queue: queue.Queue[int] = queue.Queue()
+    metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=4)
+    events: list[str] = []
+    replay_calls: list[tuple[tuple[torch.Tensor, ...], dict[str, object]]] = []
+
+    initial_obs = {"obs": torch.zeros((2, 2), dtype=torch.float32)}
+    next_obs = {"obs": torch.ones((2, 2), dtype=torch.float32)}
+
+    class _State:
+        obs = initial_obs
+        reward = torch.ones(2)
+        terminated = torch.zeros(2, dtype=torch.bool)
+        truncated = torch.zeros(2, dtype=torch.bool)
+        final_observation = None
+        info = {"timing": {}}
+
+    class _Env:
+        state = _State()
+
+        def step(self, actions):
+            torch.testing.assert_close(actions, torch.zeros((2, 2)))
+            events.append("step")
+            stop_event.set()
+            self.state = SimpleNamespace(
+                obs=next_obs,
+                reward=torch.ones(2),
+                terminated=torch.zeros(2, dtype=torch.bool),
+                truncated=torch.zeros(2, dtype=torch.bool),
+                final_observation=None,
+                info={"timing": {}},
+            )
+            return self.state
+
+        def close(self):
+            events.append("close")
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+        size = torch.zeros(1, dtype=torch.int64)
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+        def add(self, *args, **kwargs) -> None:
+            del args, kwargs
+            events.append("replay_add")
+
+        def add_batch(self, *args, **kwargs) -> bool:
+            replay_calls.append((args, kwargs))
+            del args, kwargs
+            events.append("replay_add_batch")
+            return True
+
+        def release_ipc(self) -> None:
+            events.append("replay_release")
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *a, **kw: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *a, **kw: None)
+    ring = SharedInferenceRing(2, 2, 2, capacity=4)
+
+    def serve_learner_action(
+        coordination_queue,
+        tick_id,
+        stop,
+        **kwargs,
+    ):
+        del coordination_queue, stop, kwargs
+        ring.copy_observation_to(
+            tick_id=tick_id,
+            observations=torch.empty((2, 2)),
+            dones=torch.empty(2),
+            epoch=0,
+        )
+        ring.publish_action(
+            tick_id=tick_id,
+            policy_version=0,
+            actions=torch.zeros((2, 2)),
+            epoch=0,
+        )
+        return True
+
+    monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
+    original_consume_action = ring.consume_action
+
+    def consume_tensor_action(**kwargs):
+        actions, policy_version = original_consume_action(**kwargs)
+        if isinstance(actions, np.ndarray):
+            actions = torch.from_numpy(actions)
+        return actions, policy_version
+
+    ring.consume_action = consume_tensor_action
+
+    worker_module._run_collector(
+        stop_event=stop_event,
+        env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+        num_envs=2,
+        replay_buffer=_ReplayBuffer(),
+        inference_slot=ring,
+        inference_request_queue=inference_request_queue,
+        inference_response_queue=inference_response_queue,
+        algo_type="sac",
+        actor_adapter_modules=None,
+        metrics_queue=metrics_queue,
+        inference_transport="legacy_tensor",
+        sim_backend="mujoco",
+        backend_device=None,
+        env_cfg_override=None,
+        inference_epoch=0,
+        collector_metrics_interval=1,
+        seed=1,
+        trace_enabled=False,
+        trace_thread_time=False,
+    )
+
+    manifest_message = metrics_queue.get_nowait()
+    manifest = manifest_message["runtime_manifest"]
+    assert manifest["inference_queue_capacity"] == 4
+    assert manifest["inference_scheduling_policy"] == "sequential_transition_dependency"
+    assert manifest["inference_legal_max_in_flight"] == 1
+    assert manifest["inference_dependency_graph"]["transition_to_next_observation"] == (
+        "env.step(action[t]) -> observation[t+1]"
+    )
+
+    report_message = metrics_queue.get_nowait()
+    report = report_message["collector_inference"]
+    assert report["queue_depth"] == 0
+    assert report["action_backlog"] == 0
+    assert report["max_action_backlog"] == 0
+    assert report["in_flight"] == 0
+    assert report["max_in_flight"] == 1
+    assert report["wait_time_ms"] >= 0.0
+    assert report["publication_lag"] == 0
+    assert report["max_publication_lag"] == 1
+    manifest_flight = report_message["runtime_manifest"]["inference_flight"]
+    assert manifest_flight == report
+    assert events == ["step", "replay_add_batch", "close", "replay_release"]
+    assert len(replay_calls) == 1
+    replay_args, replay_kwargs = replay_calls[0]
+    assert len(replay_args) == 6
+    assert tuple(tensor.shape[0] for tensor in replay_args) == (2, 2, 2, 2, 2, 2)
+    assert replay_args[1].dtype == torch.float32
+    for key in (
+        "terminal_mask",
+        "terminal_next_obs",
+        "critic",
+        "next_critic",
+        "terminal_next_critic",
+    ):
+        assert key in replay_kwargs
+    terminal_mask = replay_kwargs["terminal_mask"]
+    critic = replay_kwargs["critic"]
+    next_critic = replay_kwargs["next_critic"]
+    assert isinstance(terminal_mask, torch.Tensor)
+    assert isinstance(critic, torch.Tensor)
+    assert isinstance(next_critic, torch.Tensor)
+    assert terminal_mask.shape == (2,)
+    assert critic.shape == (2, 2)
+    assert next_critic.shape == (2, 2)
+    assert inference_request_queue.get_nowait() == worker_module.COLLECTOR_READY_TICK
+    assert inference_request_queue.get_nowait() == 0
+
+
+def test_worker_shutdown_flushes_partial_metrics_before_abnormal_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = threading.Event()
+    inference_request_queue: queue.Queue[int] = queue.Queue()
+    inference_response_queue: queue.Queue[dict] = queue.Queue()
+    metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=4)
+    events: list[str] = []
+
+    class _State:
+        obs = {"obs": torch.zeros((2, 2), dtype=torch.float32)}
+        reward = torch.tensor([4.0, 2.0])
+        terminated = torch.tensor([True, False])
+        truncated = torch.tensor([False, False])
+        final_observation = None
+        info = {"timing": {}}
+
+    class _Env:
+        state = _State()
+
+        def step(self, actions):
+            torch.testing.assert_close(actions, torch.zeros((2, 2)))
+            events.append("step")
+            stop_event.set()
+            self.state = SimpleNamespace(
+                obs={"obs": torch.ones((2, 2), dtype=torch.float32)},
+                reward=torch.tensor([4.0, 2.0]),
+                terminated=torch.tensor([True, False]),
+                truncated=torch.tensor([False, False]),
+                final_observation=None,
+                info={"timing": {}},
+            )
+            return self.state
+
+        def cleanup(self):
+            events.append("cleanup")
+            raise RuntimeError("abnormal shutdown after partial window")
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+        size = torch.tensor([2], dtype=torch.int64)
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+        def add(self, *args, **kwargs) -> None:
+            del args, kwargs
+            events.append("replay_add")
+
+        def add_batch(self, *args, **kwargs) -> bool:
+            del args, kwargs
+            events.append("replay_add")
+            return True
+
+        def release_ipc(self) -> None:
+            events.append("replay_release")
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *a, **kw: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *a, **kw: None)
+    ring = SharedInferenceRing(2, 2, 2, capacity=4)
+
+    def serve_learner_action(
+        coordination_queue,
+        tick_id,
+        stop,
+        **kwargs,
+    ):
+        del coordination_queue, stop, kwargs
+        ring.copy_observation_to(
+            tick_id=tick_id,
+            observations=torch.empty((2, 2)),
+            dones=torch.empty(2),
+            epoch=0,
+        )
+        ring.publish_action(
+            tick_id=tick_id,
+            policy_version=0,
+            actions=torch.zeros((2, 2)),
+            epoch=0,
+        )
+        return True
+
+    monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
+    original_consume_action = ring.consume_action
+
+    def consume_tensor_action(**kwargs):
+        actions, policy_version = original_consume_action(**kwargs)
+        if isinstance(actions, np.ndarray):
+            actions = torch.from_numpy(actions)
+        return actions, policy_version
+
+    ring.consume_action = consume_tensor_action
+
+    with pytest.raises(RuntimeError, match="abnormal shutdown after partial window"):
+        worker_module._run_collector(
+            stop_event=stop_event,
+            env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+            num_envs=2,
+            replay_buffer=_ReplayBuffer(),
+            inference_slot=ring,
+            inference_request_queue=inference_request_queue,
+            inference_response_queue=inference_response_queue,
+            algo_type="sac",
+            actor_adapter_modules=None,
+            metrics_queue=metrics_queue,
+            inference_transport="legacy_tensor",
+            sim_backend="mujoco",
+            backend_device=None,
+            env_cfg_override=None,
+            inference_epoch=0,
+            collector_metrics_interval=3,
+            seed=1,
+            trace_enabled=False,
+            trace_thread_time=False,
+        )
+
+    assert metrics_queue.get_nowait()["runtime_manifest"]["tensor_native_env"] is True
+    final_message = metrics_queue.get_nowait()
+    assert final_message["metric_flush"] == "final"
+    assert final_message["total_steps"] == 2
+    assert final_message["return_mean_ep100"] == 4.0
+    assert final_message["mean_episode_length"] == 1.0
+    assert final_message["timeout_rate"] == 0.0
+    assert metrics_queue.empty()
+
+    reward_history: deque[float] = deque(maxlen=100)
+    logger = OffPolicyLogger(log_backend="none")
+    # Requeue the captured messages so the shared drain under test sees the
+    # exact worker publication sequence.
+    metrics_queue.put_nowait({"runtime_manifest": {"tensor_native_env": True}})
+    metrics_queue.put_nowait(final_message)
+    drain_collector_metrics(
+        metrics_queue,
+        reward_history,
+        RewardComponentWindow(),
+        logger,
+        runner_label="test",
+        raise_on_collector_error=True,
+        require_buffer_size=True,
+    )
+
+    scalars = logger._build_backend_scalars(
+        iteration=1,
+        metrics=None,
+        return_mean_ep100=statistics.mean(reward_history),
+        reward_components={},
+    )
+    assert list(reward_history) == [4.0]
+    assert logger._total_steps == 2
+    assert scalars["Train/mean_reward"] == 4.0
+    assert scalars["Train/mean_episode_length"] == 1.0
+    assert scalars["Episode/timeout_rate"] == 0.0
+    assert events == ["step", "replay_add", "cleanup"]
 
 
 def test_inference_request_publish_timeout_is_explicit() -> None:
@@ -282,6 +985,7 @@ def test_extract_env_step_breakdown_timing_ms_maps_env_owned_keys_only() -> None
                 "step_core_ms": 1.5,
                 "update_state_ms": 2.5,
                 "reset_done_ms": 0.25,
+                "action_validate_ms": 0.1,
                 "apply_action_ms": 9.0,
             }
         }
@@ -291,6 +995,8 @@ def test_extract_env_step_breakdown_timing_ms_maps_env_owned_keys_only() -> None
         "env_step_backend_ms": 1.5,
         "env_step_update_state_ms": 2.5,
         "env_step_reset_done_ms": 0.25,
+        "env_step_action_validate_ms": 0.1,
+        "env_step_apply_action_ms": 9.0,
     }
 
 
@@ -434,3 +1140,107 @@ def test_resolve_offpolicy_actor_priv_info_returns_none_without_adapter() -> Non
     )
 
     assert resolved is None
+
+
+def test_collector_rejects_transport_metadata_in_env_override() -> None:
+    stop_event = threading.Event()
+    ring = SharedInferenceRing(1, 2, 2, device="cpu")
+
+    with pytest.raises(ValueError, match="Collector env override must not set"):
+        worker_module._run_collector(
+            stop_event=stop_event,
+            env_factory=lambda num_envs, env_cfg_override=None: SimpleNamespace(),
+            num_envs=1,
+            replay_buffer=SimpleNamespace(),
+            inference_slot=ring,
+            inference_request_queue=queue.Queue(),
+            inference_response_queue=queue.Queue(),
+            algo_type="sac",
+            actor_adapter_modules=None,
+            metrics_queue=queue.Queue(),
+            inference_transport="cpu",
+            sim_backend="mujoco",
+            backend_device=None,
+            env_cfg_override={"inference_transport": "gpu"},
+            seed=None,
+            trace_enabled=False,
+            trace_thread_time=False,
+        )
+
+
+def test_collector_rejects_cuda_transport_with_cpu_ring() -> None:
+    stop_event = threading.Event()
+    ring = SharedInferenceRing(1, 2, 2, device="cpu")
+
+    with pytest.raises(ValueError, match="CUDA collector inference requires a CUDA inference ring"):
+        worker_module._run_collector(
+            stop_event=stop_event,
+            env_factory=lambda num_envs, env_cfg_override=None: SimpleNamespace(),
+            num_envs=1,
+            replay_buffer=SimpleNamespace(),
+            inference_slot=ring,
+            inference_request_queue=queue.Queue(),
+            inference_response_queue=queue.Queue(),
+            algo_type="sac",
+            actor_adapter_modules=None,
+            metrics_queue=queue.Queue(),
+            sim_backend="mujoco",
+            backend_device=None,
+            env_cfg_override={},
+            inference_transport="cuda",
+            seed=None,
+            trace_enabled=False,
+            trace_thread_time=False,
+        )
+
+
+class _CudaStubDeviceTensor(torch.Tensor):
+    """CPU tensor shaped enough for early CUDA-device validation on CPU CI."""
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cuda")
+
+
+def test_explicit_cpu_transport_rejects_cuda_tensor_observations() -> None:
+    stop_event = threading.Event()
+
+    class _State:
+        obs = {
+            "obs": torch.zeros((1, 2), device="cuda")
+            if torch.cuda.is_available()
+            else _CudaStubDeviceTensor()
+        }
+        info = {}
+
+    class _Env:
+        state = _State()
+
+    ring = SharedInferenceRing(1, 2, 2, device="cpu")
+
+    with pytest.raises(
+        ValueError, match="CPU inference transport received CUDA tensor observations"
+    ):
+        worker_module._run_collector(
+            stop_event=stop_event,
+            env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+            num_envs=1,
+            replay_buffer=SimpleNamespace(
+                trace_recorder=None,
+                trace_thread_time=False,
+                attach_stop_event=lambda stop: None,
+            ),
+            inference_slot=ring,
+            inference_request_queue=queue.Queue(),
+            inference_response_queue=queue.Queue(),
+            algo_type="sac",
+            actor_adapter_modules=None,
+            metrics_queue=queue.Queue(),
+            inference_transport="cpu",
+            sim_backend="mujoco",
+            backend_device=None,
+            env_cfg_override={},
+            seed=None,
+            trace_enabled=False,
+            trace_thread_time=False,
+        )

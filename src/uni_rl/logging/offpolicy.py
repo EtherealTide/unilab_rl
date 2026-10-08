@@ -20,6 +20,7 @@ from uni_rl.logging.metric_schema import (
     reward_term_key,
     validate_metric_tags,
 )
+from uni_rl.logging.runtime_manifest_schema import RUNTIME_MANIFEST_SCHEMA_VERSION
 
 _COLLECTOR_WAIT_TIMING_SPEC = (
     "Perf/learner_collector_wait_ms",
@@ -100,14 +101,35 @@ _COLLECTOR_TIMING_SPECS = {
     "inference_request_ms": (1.0, "Inference Request", "cycle_phase"),
     "learner_action_wait_ms": (1.1, "Learner Action Wait", "cycle_phase"),
     "env_step_ms": (2.0, "Env Step", "cycle_phase"),
+    "env_step_action_validate_ms": (2.05, "  Action Validate", "env_step_detail"),
+    "env_step_apply_action_ms": (2.08, "  Apply Action", "env_step_detail"),
+    "env_step_action_backend_ms": (2.1, "  Action+Backend", "env_step_detail"),
     "env_step_backend_ms": (2.1, "  Backend Step", "env_step_detail"),
     "env_step_update_state_ms": (2.2, "  Update State", "env_step_detail"),
     "env_step_reset_done_ms": (2.3, "  Reset Done", "env_step_detail"),
+    "transition_extract_ms": (2.4, "Transition Extract", "cycle_phase"),
     "replay_write_ms": (3.0, "Replay Write", "cycle_phase"),
+    "metrics_publish_ms": (4.0, "Metrics Publish", "cycle_phase"),
     "rollout_ms": (9.0, "Rollout Wall", "rollout_total"),
 }
 
+_COLLECTOR_INFERENCE_TAG_SPECS: dict[str, str | None] = {
+    "queue_depth": "Perf/collector_inference_queue_depth",
+    "action_backlog": "Perf/collector_inference_action_backlog",
+    "max_action_backlog": "Perf/collector_inference_max_action_backlog",
+    "in_flight": "Perf/collector_inference_in_flight",
+    "max_in_flight": "Perf/collector_inference_max_in_flight",
+    # Wait time is persisted by the collector timing map; keep the value in the
+    # inference snapshot without emitting a duplicate canonical tag.
+    "wait_time_ms": None,
+    "publication_lag": "Perf/collector_inference_publication_lag",
+    "max_publication_lag": "Perf/collector_inference_max_publication_lag",
+}
+
 OFFPOLICY_ENV_STEP_DETAIL_KEYS = (
+    "env_step_action_validate_ms",
+    "env_step_apply_action_ms",
+    "env_step_action_backend_ms",
     "env_step_backend_ms",
     "env_step_update_state_ms",
     "env_step_reset_done_ms",
@@ -221,6 +243,11 @@ class OffPolicyLogger(BaseTrainingLogger):
         self._inference_time: float = 0.0
         self._iteration_time: float | None = None
         self._throughput_env_steps: int = 0
+        # Keep a bounded tail window for a stable end-to-end throughput gate.
+        # The final single iteration is intentionally not authoritative: one
+        # iteration can absorb asynchronous collector/learner jitter.
+        self._tail_iteration_times: deque[float] = deque(maxlen=20)
+        self._tail_throughput_env_steps = 0
         self._env_steps_per_sec_override: float | None = None
         self._learner_replay_rows_per_sec_override: float | None = None
         self._batch_size_per_rank: int = 0
@@ -228,6 +255,7 @@ class OffPolicyLogger(BaseTrainingLogger):
         self._learner_replay_rows_per_iter: int = 0
         self._has_iteration_extra_info: bool = False
         self._collector_timing: dict[str, float] = {}
+        self._collector_inference: dict[str, float] = {}
         if timing_profile not in _LEARNER_TIMING_PROFILES:
             raise ValueError("timing_profile must be 'sac_family' or 'appo'")
         self._timing_profile = timing_profile
@@ -276,6 +304,18 @@ class OffPolicyLogger(BaseTrainingLogger):
         if iter_time is None or iter_time <= 0:
             return None
         return self._throughput_env_steps / iter_time
+
+    def _get_tail_env_steps_per_sec(self) -> float | None:
+        """Aggregate env throughput over the bounded recent-iteration window."""
+        if not self._tail_iteration_times:
+            return None
+        # The first queued sample predates this iteration's freshly assigned
+        # step count only when the queue was empty; use the current aggregate,
+        # which is exact after the per-iteration enqueue above.
+        elapsed = sum(self._tail_iteration_times)
+        if elapsed <= 0.0 or self._tail_throughput_env_steps <= 0:
+            return None
+        return self._tail_throughput_env_steps / elapsed
 
     def _get_learner_replay_rows_per_sec(self) -> float | None:
         if self._learner_replay_rows_per_sec_override is not None:
@@ -458,6 +498,21 @@ class OffPolicyLogger(BaseTrainingLogger):
             raise ValueError(f"unregistered collector timing keys: {names}")
         self._collector_timing.update(normalized)
 
+    def update_collector_inference(self, diagnostics: dict[str, float | int]):
+        unknown = sorted(set(diagnostics) - set(_COLLECTOR_INFERENCE_TAG_SPECS))
+        if unknown:
+            names = ", ".join(unknown)
+            raise ValueError(f"unregistered collector inference keys: {names}")
+        normalized: dict[str, float] = {}
+        for key, value in diagnostics.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"collector inference {key} must be numeric")
+            number = float(value)
+            if number < 0.0:
+                raise ValueError(f"collector inference {key} must be non-negative")
+            normalized[key] = number
+        self._collector_inference.update(normalized)
+
     def update_timeout_rate(self, timeout_rate: float):
         self._timeout_rate = float(timeout_rate)
 
@@ -465,6 +520,19 @@ class OffPolicyLogger(BaseTrainingLogger):
         self._buffer_utilization = float(utilization)
 
     def update_runtime_manifest(self, manifest: dict[str, Any]) -> None:
+        schema_version = manifest.get("schema_version")
+        if schema_version is not None and schema_version != RUNTIME_MANIFEST_SCHEMA_VERSION:
+            raise ValueError(
+                "unsupported runtime_manifest.schema_version "
+                f"{schema_version}; expected {RUNTIME_MANIFEST_SCHEMA_VERSION}"
+            )
+        existing_version = self._runtime_manifest.get("schema_version")
+        if (
+            existing_version is not None
+            and schema_version is not None
+            and existing_version != schema_version
+        ):
+            raise ValueError("runtime_manifest.schema_version cannot change during a run")
         self._runtime_manifest.update(manifest)
 
     def log_collector(self, total_steps: int, buffer_size: int):
@@ -524,6 +592,9 @@ class OffPolicyLogger(BaseTrainingLogger):
         self._has_iteration_extra_info = extra_info is not None
         if extra_info:
             self._throughput_env_steps = int(extra_info.get("throughput_steps", 0))
+        else:
+            self._throughput_env_steps = 0
+        if extra_info:
             steps_per_sec = extra_info.get("env_steps_per_sec")
             self._env_steps_per_sec_override = (
                 float(steps_per_sec) if steps_per_sec is not None else None
@@ -544,14 +615,20 @@ class OffPolicyLogger(BaseTrainingLogger):
                 extra_info.get("learner_replay_rows_per_iter", 0)
             )
         else:
-            self._throughput_env_steps = 0
             self._env_steps_per_sec_override = None
             self._learner_replay_rows_per_sec_override = None
             self._batch_size_per_rank = 0
             self._effective_batch_size = 0
             self._learner_replay_rows_per_iter = 0
+        if iteration_time is not None and iteration_time > 0.0:
+            if len(self._tail_iteration_times) == self._tail_iteration_times.maxlen:
+                self._tail_throughput_env_steps -= self._throughput_env_steps
+            self._tail_iteration_times.append(float(iteration_time))
+            self._tail_throughput_env_steps += self._throughput_env_steps
         if metrics:
             self._latest_metrics.update(metrics)
+        if return_mean_ep100 is not None:
+            self._reward_history.append(float(return_mean_ep100))
         if reward_components:
             self._latest_reward_components = reward_components
         self._status = "Training"
@@ -602,6 +679,11 @@ class OffPolicyLogger(BaseTrainingLogger):
                 _set_backend_scalar(scalars, "Perf/collection_time", value / 1000.0)
             else:
                 _set_backend_scalar(scalars, f"Perf/collector_{key}", value)
+        for key, inference_tag in _COLLECTOR_INFERENCE_TAG_SPECS.items():
+            if inference_tag is None:
+                continue
+            if key in self._collector_inference:
+                _set_backend_scalar(scalars, inference_tag, self._collector_inference[key])
         if iter_steps_per_sec is not None:
             _set_backend_scalar(scalars, "Perf/total_fps", iter_steps_per_sec)
         for key, value in learner_timing_scalars.items():

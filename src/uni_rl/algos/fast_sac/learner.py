@@ -594,7 +594,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
     @property
     def use_update_cycle(self) -> bool:
         """Whether this learner owns the whole-cycle update orchestration."""
-        return self._compile_full_update_cycle
+        return bool(self._compile_full_update_cycle and self._gradient_sync is None)
 
     def prepare_for_collection(self, warmup_context: OffPolicyWarmupContext) -> None:
         """Compile/capture all learner-owned update cold paths before collection.
@@ -659,15 +659,20 @@ class FastSACLearner(LearnerBoilerplateMixin):
                 torch.cuda.synchronize(self.device)
 
     def set_gradient_sync(self, sync: Callable[[Iterable[torch.Tensor]], None] | None) -> None:
-        """Attach gradient averaging at each optimizer boundary.
+        """Attach DP reduction and leave the unsupported whole-cycle graph.
 
-        CUDA callers must supply a capture-safe collective and execute the same
-        update schedule on every rank. Changing the callback invalidates the
-        captured graph, whose communication nodes otherwise retain the old sync.
+        The FastSAC CUDA whole-cycle graph is captured through the ordinary
+        learner update path and does not yet host the runner's graph-safe DP
+        collective. Preserve the develop-line behavior of selecting eager DP
+        updates when synchronization is attached; changing or clearing the
+        callback still invalidates any captured graph and hooks.
         """
         if sync != self._gradient_sync:
             self._reset_update_cycle_graph()
             self._gradient_graph_hooks = None
+        if sync is not None and self._compile_full_update_cycle:
+            self._compile_full_update_cycle = False
+            self._reset_update_cycle_graph()
         self._gradient_sync = sync
 
     def set_gradient_graph_hooks(

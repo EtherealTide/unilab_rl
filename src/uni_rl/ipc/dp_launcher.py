@@ -18,9 +18,10 @@ import time
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
+import torch
+
 UNILAB_DP_RANK = "UNILAB_DP_RANK"
 UNILAB_DP_WORLD_SIZE = "UNILAB_DP_WORLD_SIZE"
-UNILAB_DP_DEVICES = "UNILAB_DP_DEVICES"
 UNILAB_DP_LOG_DIR = "UNILAB_DP_LOG_DIR"
 
 _WATCHDOG_INTERVAL_S = 0.5
@@ -32,34 +33,94 @@ _TERMINATE_TIMEOUT_S = 10.0
 _NORMAL_EXIT_GRACE_S = 600.0
 
 
-def resolve_dp_topology(devices_cfg: Any) -> tuple[int, ...] | None:
-    """Normalize ``training.devices`` into an ordered CUDA-index tuple.
+def reject_removed_device_config(devices_cfg: Any) -> None:
+    """Fail closed if a removed CUDA-index device list is still supplied.
 
-    Returns None for the single-card default (null / empty list). The user
-    given order is preserved: rank i maps to ``cuda:{devices[i]}``.
+    GPU topology is controlled exclusively by rank-local
+    ``CUDA_VISIBLE_DEVICES``. A CUDA-index list in configuration would create a
+    second topology source and cannot be mapped safely when parent visibility
+    contains opaque UUID/MIG tokens.
     """
     if devices_cfg is None:
-        return None
-    devices = list(devices_cfg)
-    if len(devices) == 0:
-        return None
-    normalized: list[int] = []
-    for entry in devices:
-        if isinstance(entry, bool) or not isinstance(entry, int):
-            raise ValueError(
-                f"training.devices entries must be integer CUDA indices, got {entry!r}"
-            )
-        if entry < 0:
-            raise ValueError(f"training.devices entries must be non-negative, got {entry}")
-        normalized.append(int(entry))
-    if len(set(normalized)) != len(normalized):
-        raise ValueError(f"training.devices must not contain duplicates, got {normalized}")
-    return tuple(normalized)
+        return
+    if hasattr(devices_cfg, "__len__") and len(devices_cfg) == 0:
+        return
+    raise ValueError(
+        "training.devices was removed; control GPUs exclusively with rank-local "
+        "CUDA_VISIBLE_DEVICES"
+    )
 
 
 def current_dp_rank() -> int:
     """Data-parallel rank of this process (0 when not spawned as a rank)."""
     return int(os.environ.get(UNILAB_DP_RANK, "0"))
+
+
+def visible_cuda_entries(current_visible_devices: str | None = None) -> tuple[str, ...]:
+    """Return the process-local CUDA visibility entries without touching Torch.
+
+    Entries are opaque: they may be physical indices or CUDA UUID/MIG tokens.
+    An unset variable means the host namespace; an empty value (or ``-1``)
+    means CUDA is deliberately hidden.  This parser is cold-path only and is
+    intentionally usable before the first CUDA query.
+    """
+    raw = (
+        os.environ.get("CUDA_VISIBLE_DEVICES")
+        if current_visible_devices is None
+        else current_visible_devices
+    )
+    if raw is None:
+        return ()
+    entries = tuple(entry.strip() for entry in raw.split(",") if entry.strip())
+    if entries == ("-1",):
+        return ()
+    return entries
+
+
+def rank_local_cuda_device(
+    *,
+    rank: int = 0,
+    current_visible_devices: str | None = None,
+) -> str | None:
+    """Resolve ``cuda:0`` when this rank owns exactly one visible GPU.
+
+    ``CUDA_VISIBLE_DEVICES`` is the authoritative rank-local namespace.  A
+    single entry can come either from an ordinary user launch or from
+    :class:`DpRankSupervisor`; in both cases every in-process consumer must use
+    the local index zero rather than a host-global index.
+
+    On a host with exactly one visible CUDA device, leaving the variable unset
+    is equivalent to a one-entry mask: the rank owns local ordinal zero. This
+    honors the documented single-GPU launch contract without guessing on a
+    multi-GPU host.
+    """
+    entries = visible_cuda_entries(current_visible_devices)
+    if entries:
+        if len(entries) != 1:
+            raise ValueError(
+                "A CUDA rank must own exactly one CUDA_VISIBLE_DEVICES entry; got "
+                f"{','.join(entries)!r}"
+            )
+    else:
+        try:
+            visible_to_torch = torch.cuda.is_available() and torch.cuda.device_count() == 1
+        except RuntimeError:
+            visible_to_torch = False
+        if not visible_to_torch:
+            return None
+    if int(rank) < 0:
+        raise ValueError(f"rank must be non-negative, got {rank}")
+    return "cuda:0"
+
+
+def resolve_dp_rank_device(rank: int = 0) -> str | None:
+    """Return this rank's CUDA device from its visibility namespace.
+
+    A CUDA rank owns exactly one visible GPU. The returned value is always the
+    rank-local ``cuda:0``; opaque parent UUID/MIG tokens never become in-process
+    CUDA indices.
+    """
+    return rank_local_cuda_device(rank=rank)
 
 
 def current_dp_world_size() -> int:
@@ -220,73 +281,50 @@ def _discover_physical_cpu_groups(cpu_ids: Sequence[int]) -> list[list[int]]:
     return [[cpu_id] for cpu_id in ids]
 
 
-def validate_dp_launchable(devices: tuple[int, ...]) -> None:
-    """Fail fast at launch time when the host lacks any requested CUDA device."""
-    import torch
-
-    device_count = torch.cuda.device_count()
-    missing = [index for index in devices if index >= device_count]
-    if missing:
-        raise ValueError(
-            f"training.devices={list(devices)} requires CUDA device index(es) {missing}, "
-            f"but torch.cuda.device_count()={device_count}"
-        )
-
-
-def resolve_cuda_visible_devices(
-    devices: tuple[int, ...],
+def selected_visible_entries(
     *,
+    world_size: int,
     current_visible_devices: str | None = None,
-) -> str:
-    """Map configured logical CUDA indices to a child ``CUDA_VISIBLE_DEVICES`` value.
+) -> tuple[str, ...]:
+    """Return the opaque parent visibility entries selected for a DP launch.
 
-    ``training.devices`` indexes the CUDA devices visible to the parent process.
-    When the parent already has ``CUDA_VISIBLE_DEVICES`` set, preserve that
-    mapping (including UUID entries) instead of accidentally switching back to
-    host-global device indices.
+    Parent ``CUDA_VISIBLE_DEVICES`` may contain physical indices, UUIDs, or MIG
+    tokens. The first ``world_size`` entries define rank order; no integer
+    configuration index is involved.
     """
-    if current_visible_devices is None:
-        return ",".join(str(index) for index in devices)
-
-    visible_entries = [
-        entry.strip() for entry in current_visible_devices.split(",") if entry.strip()
-    ]
-    missing = [index for index in devices if index >= len(visible_entries)]
-    if missing:
+    world_size = int(world_size)
+    if world_size < 1:
+        raise ValueError("multi-rank visibility requires world_size >= 1")
+    entries = visible_cuda_entries(current_visible_devices)
+    if len(entries) != world_size:
         raise ValueError(
-            f"training.devices={list(devices)} requires visible CUDA index(es) {missing}, "
-            f"but CUDA_VISIBLE_DEVICES={current_visible_devices!r} exposes "
-            f"{len(visible_entries)} device(s)"
+            "CUDA_VISIBLE_DEVICES must contain exactly one entry per data-parallel "
+            f"rank for this launch; got {len(entries)} entries for world_size={world_size}"
         )
-    return ",".join(visible_entries[index] for index in devices)
+    if len(set(entries)) != len(entries):
+        raise ValueError(f"CUDA_VISIBLE_DEVICES contains duplicate entries: {entries}")
+    return entries
 
 
 def launch_torchrun_workers(
-    devices: tuple[int, ...],
     *,
+    world_size: int,
     script_path: str | os.PathLike[str],
     argv: Sequence[str],
     log_dir: str,
 ) -> None:
-    """Launch one local torchrun worker per configured CUDA device.
+    """Launch one single-GPU torchrun worker per selected visibility entry.
 
     PyTorch elastic owns worker supervision and failure propagation. Each
     worker re-enters the regular training script with the original Hydra
     arguments, while ``UNILAB_DP_LOG_DIR`` supplies one canonical rank-0-owned
     run directory.
     """
-    if len(devices) < 2:
-        raise ValueError("launch_torchrun_workers requires at least two CUDA devices")
-    validate_dp_launchable(devices)
-
+    selected = selected_visible_entries(world_size=world_size)
     launch_env = os.environ.copy()
-    launch_env["CUDA_VISIBLE_DEVICES"] = resolve_cuda_visible_devices(
-        devices,
-        current_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
-    )
-    # Keep the production transport defaults already used by DpParameterSync:
-    # current RTX 6000D hosts hang with NCCL P2P and can fault with SHM. An
-    # explicit user environment still wins over these compatibility defaults.
+    # torchrun assigns one ordinal per worker; the worker remaps this list to
+    # its own single-entry visibility before constructing CUDA resources.
+    launch_env["CUDA_VISIBLE_DEVICES"] = ",".join(selected)
     launch_env.setdefault("NCCL_P2P_DISABLE", "1")
     launch_env.setdefault("NCCL_SHM_DISABLE", "1")
     launch_env[UNILAB_DP_LOG_DIR] = str(log_dir)
@@ -296,13 +334,13 @@ def launch_torchrun_workers(
         "torch.distributed.run",
         "--standalone",
         "--nnodes=1",
-        f"--nproc_per_node={len(devices)}",
+        f"--nproc_per_node={world_size}",
         str(Path(script_path).resolve()),
         *argv,
     ]
     print(
-        f"Launching RSL-RL data parallel training on CUDA devices {list(devices)} "
-        f"with {len(devices)} workers.",
+        f"Launching RSL-RL data parallel training on {world_size} rank-local "
+        "CUDA_VISIBLE_DEVICES entries.",
         flush=True,
     )
     completed = subprocess.run(command, env=launch_env, check=False)
@@ -310,28 +348,17 @@ def launch_torchrun_workers(
         raise RuntimeError(f"torchrun workers failed with exit code {completed.returncode}")
 
 
-def resolve_dp_rank_device(devices: tuple[int, ...] | None, rank: int) -> str | None:
-    """Return ``cuda:<index>`` for one configured rank, or None for auto selection."""
-    if devices is None:
-        return None
-    if rank < 0 or rank >= len(devices):
-        raise ValueError(
-            f"data-parallel rank {rank} is out of range for training.devices={list(devices)}"
-        )
-    return f"cuda:{devices[rank]}"
-
-
-def apply_dp_rank_config(cfg: Any, devices: tuple[int, ...] | None, rank: int) -> str | None:
-    """Apply the per-rank seed and return this rank's explicit CUDA device.
+def apply_dp_rank_config(cfg: Any, rank: int) -> str | None:
+    """Apply the per-rank seed and return this rank's visibility-local device.
 
     Rank 0 keeps the configured seed; rank i>0 trains with ``seed + i`` until
-    init broadcast lands in a later stage. ``training.devices`` is the sole
-    public off-policy device field, so the resolved runtime device is returned
-    instead of being written back into a synthetic ``training.device`` key.
+    init broadcast lands in a later stage. The resolved rank-local device is
+    returned instead of being written back into a synthetic ``training.device``
+    key; with rank-local CUDA visibility this is always ``cuda:0``.
     """
-    if devices is None:
+    device = resolve_dp_rank_device(rank)
+    if device is None:
         return None
-    device = resolve_dp_rank_device(devices, rank)
     from omegaconf import open_dict
 
     with open_dict(cfg):
@@ -397,10 +424,10 @@ class DpRankSupervisor:
     cleanup before escalating to SIGTERM/SIGKILL.
     """
 
-    def __init__(self, devices: tuple[int, ...], log_dir: str) -> None:
-        self._devices = tuple(devices)
+    def __init__(self, world_size: int, log_dir: str) -> None:
+        self._selected = selected_visible_entries(world_size=world_size)
         self._log_dir = log_dir
-        self._world_size = len(self._devices)
+        self._world_size = len(self._selected)
         self._children: list[subprocess.Popen] = []
         self._watchdog_stop = threading.Event()
         self._watchdog: threading.Thread | None = None
@@ -413,13 +440,15 @@ class DpRankSupervisor:
             return self
         base_env = os.environ | {
             UNILAB_DP_WORLD_SIZE: str(self._world_size),
-            UNILAB_DP_DEVICES: ",".join(str(index) for index in self._devices),
             UNILAB_DP_LOG_DIR: self._log_dir,
         }
         self._install_signal_handlers()
         try:
-            for rank in range(1, self._world_size):
-                env = base_env | {UNILAB_DP_RANK: str(rank)}
+            for rank, entry in enumerate(self._selected[1:], start=1):
+                env = base_env | {
+                    UNILAB_DP_RANK: str(rank),
+                    "CUDA_VISIBLE_DEVICES": entry,
+                }
                 self._children.append(
                     subprocess.Popen(
                         _current_entry_command(),

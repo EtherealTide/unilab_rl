@@ -7,6 +7,7 @@ from collections.abc import Callable
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
+import torch
 from omegaconf import DictConfig
 
 from uni_rl.algos.warp_sac.learner import WarpSACLearner
@@ -18,6 +19,11 @@ from uni_rl.utils.device import get_default_device
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
 from uni_rl.utils.seed import apply_training_seed
+from uni_rl.utils.tensor_runtime import (
+    InferencePlacement,
+    resolve_inference_transport,
+    resolve_tensor_runtime_settings,
+)
 
 if TYPE_CHECKING:
     from uni_rl.ipc.dp_sync import DpParameterSync
@@ -43,6 +49,7 @@ def build_warpsac_double_buffer_runner(
     replay_prefetch_mode: str,
     device: str | None = None,
     nan_guard_cfg: NanGuardCfg | None = None,
+    nan_guard_factory: Callable[[NanGuardCfg, int, bool], Any] | None = None,
     torch_thread_runtime: dict[str, Any] | None = None,
     collector_cpu_ids: list[int] | None = None,
     dp_sync: DpParameterSync | None = None,
@@ -54,6 +61,28 @@ def build_warpsac_double_buffer_runner(
     if replay_prefetch_mode != "one_tick":
         raise ValueError("WarpSAC device replay requires replay_prefetch_mode='one_tick'")
     _validate_warpsac_runtime(cfg)
+    # Resolve public tensor-runtime bounds before constructing a one-env probe.
+    # Invalid training knobs must fail closed without materializing a backend.
+    tensor_runtime_settings = resolve_tensor_runtime_settings(
+        cfg,
+        algo_name="WarpSAC",
+        num_envs=cfg.algo.num_envs,
+    )
+    probe_env = env_factory(1, env_cfg_override)
+    try:
+        probe_state = probe_env.init_state()
+        probe_observation = probe_state.obs.get("obs")
+        env_tensor_native = isinstance(probe_observation, torch.Tensor) and str(
+            probe_observation.device
+        ).startswith("cuda")
+    finally:
+        probe_env.close()
+    inference_placement = resolve_inference_transport(
+        cfg,
+        device=device,
+        algo_name="WarpSAC",
+        env_tensor_native=env_tensor_native,
+    )
 
     if "inference_request_timeout_sec" in cfg.training:
         warnings.warn(
@@ -117,9 +146,9 @@ def build_warpsac_double_buffer_runner(
         env_factory=env_factory,
         num_envs=cfg.algo.num_envs,
         replay_buffer_n=cfg.algo.replay_buffer_n,
-        batch_size=cfg.algo.batch_size,
+        batch_size=tensor_runtime_settings.batch_size,
         learning_starts=cfg.algo.learning_starts,
-        updates_per_step=cfg.algo.updates_per_step,
+        updates_per_step=tensor_runtime_settings.updates_per_step,
         policy_frequency=cfg.algo.policy_frequency,
         target_frequency=int(_param(cfg.algo, "target_frequency", 1)),
         policy_before_critic=True,
@@ -135,10 +164,13 @@ def build_warpsac_double_buffer_runner(
         trace_cuda_events=cfg.training.trace_cuda_events,
         replay_prefetch_mode=replay_prefetch_mode,
         nan_guard_cfg=nan_guard_cfg,
+        nan_guard_factory=nan_guard_factory,
         torch_thread_runtime=torch_thread_runtime,
         collector_cpu_ids=collector_cpu_ids,
         dp_sync=dp_sync,
         backend_device_binder=backend_device_binder,
+        inference_placement=inference_placement,
+        tensor_runtime_settings=tensor_runtime_settings,
         log_interval=int(cfg.training.log_interval),
         replay_pipeline_factory=partial(
             WarpSACReplayPipeline,

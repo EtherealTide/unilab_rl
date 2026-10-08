@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -179,6 +180,9 @@ class _FakeEnv:
     class action_space:
         shape = (2,)
 
+    def init_state(self) -> SimpleNamespace:
+        return SimpleNamespace(obs={"obs": torch.zeros((1, 4)), "critic": torch.zeros((1, 6))})
+
     def close(self) -> None:
         pass
 
@@ -209,6 +213,10 @@ def test_warpsac_builder_uses_regime_aware_replay_factory(
                 "trace_thread_time": False,
                 "trace_cuda_events": False,
                 "log_interval": 2,
+                "inference_slot_capacity": 3,
+                "collector_metrics_interval": 7,
+                "replay_ingress_depth": 4,
+                "replay_ingress_slot_rows": 2,
             },
             "algo": {
                 "num_envs": 4,
@@ -272,6 +280,54 @@ def test_warpsac_builder_uses_regime_aware_replay_factory(
     assert runner.kwargs["algo_type"] == "warpsac"
     assert runner.kwargs["policy_before_critic"] is True
     assert runner.kwargs["target_frequency"] == 1
+    settings = runner.kwargs["tensor_runtime_settings"]
+    assert settings.inference_slot_capacity == 3
+    assert settings.collector_metrics_interval == 7
+    assert settings.replay_ingress_depth == 4
+    assert settings.replay_ingress_slot_rows == 2
+    assert settings.batch_size == 4
+    assert settings.updates_per_step == 1
+    assert settings.learner_sample_count == 4
+
+
+def test_warpsac_builder_rejects_runtime_bounds_before_env_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.warp_sac.double_buffer as module
+
+    monkeypatch.setattr(module, "require_offpolicy_replay_device", lambda device: device)
+    monkeypatch.setattr(module, "apply_training_seed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "WarpSACLearner", lambda *args, **kwargs: pytest.fail())
+
+    def _fail_factory(*args, **kwargs):
+        raise AssertionError("invalid bounds must fail before env probing")
+
+    cfg = OmegaConf.create(
+        {
+            "training": {
+                "replay_ingress_depth": 17,
+                "task_name": "fake",
+                "sim_backend": "mujoco",
+                "env_steps_per_sync": 1,
+                "use_amp": False,
+            },
+            "algo": {
+                "num_envs": 4,
+                "batch_size": 4,
+                "updates_per_step": 1,
+                "seed": 1,
+                "algo_params": {"n_step": 1},
+            },
+        }
+    )
+    with pytest.raises(ValueError, match="replay_ingress_depth.*17"):
+        build_warpsac_double_buffer_runner(
+            cfg,
+            env_factory=_fail_factory,
+            env_cfg_override=None,
+            replay_prefetch_mode="one_tick",
+            device="cpu",
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only inherited whole-cycle graph")

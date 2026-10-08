@@ -82,6 +82,16 @@ metrics.
   group instead of a custom pipeline namespace.
 - Additional timing fields stay under `Perf/*`. Millisecond fields end in `_ms`;
   the two upstream second fields retain their exact names.
+- The learner-owned inference queue reports dynamic observation depth, action
+  backlog, current/maximum in-flight requests, and publication lag under
+  `Perf/collector_inference_*`. These are ordering diagnostics: a serial
+  `observation[t] -> action[t] -> transition[t] -> observation[t+1]` dependency
+  can legally use only one outstanding request even when the configured ring
+  capacity is greater.
+- GPU-resident replay reports configured ingress depth, live/high-water
+  occupancy, cumulative producer backpressure wait, and early-return drops under
+  `Train/replay_ingress_*`. These snapshots use host-shared sequence and counter
+  metadata only and never synchronize or copy a device ingress tensor.
 
 Learner main-thread phases are mutually exclusive. Nested inference and
 env-step diagnostics are descriptions, not additional slices of the parent
@@ -110,6 +120,58 @@ occupancy is also omitted: active count only rises to its configured capacity an
 does not describe training progress. The reward-normalization scale is omitted
 when normalization is disabled rather than persisted as a constant value of one.
 Nested timing diagnostics explain, but are not added to, their parent phase.
+
+## Schema versioning and compatibility
+
+Metric metadata and runtime manifests use separate version namespaces.
+
+- TensorBoard/W&B scalar metadata is versioned by
+  `METRIC_SCHEMA_VERSION = 1`. The current `METRIC_SPECS` registry and the
+  `reward/` family are the v1 schema. Every summary produced by the current
+  runner, including its minimal early-failure and cleanup-failure summaries,
+  records this value as `metric_schema_version`; it is not emitted as a
+  synthetic scalar.
+- Runtime process/device/IPC/lifecycle state is versioned by
+  `RUNTIME_MANIFEST_SCHEMA_VERSION = 1`. New run summaries record it as
+  `runtime_manifest.schema_version`.
+
+Runtime-manifest v1 freezes only fields already consumed by downstream tooling:
+the top-level schema version, the public inference-ring capacity, collector
+metric interval and backend device, inference-flight counters, replay-ingress
+counters/timing, and the CUDA inference IPC event count when that budget is
+present. Stable lifecycle sections are required for normal completed summaries;
+an early failure summary may omit a section that never materialized.
+
+The stable fields use these units and ownership semantics:
+
+| Field | Producer | Unit / semantics |
+|---|---|---|
+| `inference_ring_capacity` | runner configuration | Slot count. |
+| `collector_metrics_interval` | runner configuration | Collector control steps per report. |
+| `collector_backend_device` | runner configuration | Non-empty accelerator device string, or `null` for a backend that needs no accelerator binding. It is required in completed manifests. |
+| `inference_flight.queue_depth` | latest collector report | Instantaneous published-but-not-yet-consumed observation count. |
+| `inference_flight.publication_lag` | latest collector report | Instantaneous in-flight publication lag. |
+| `inference_flight.max_in_flight` | latest collector report | Maximum since the previous successfully published collector report; this is not a run-lifetime high-water. |
+| `inference_flight.max_publication_lag` | latest collector report | Maximum since the previous successfully published collector report; this is not a run-lifetime high-water. |
+| `replay_ingress.published_sequence` / `release_sequence` | replay ingress | Cumulative published / released batch count. |
+| `replay_ingress.occupancy` | replay ingress | Instantaneous `published_sequence - release_sequence`. |
+| `replay_ingress.high_water_occupancy` | replay ingress | Cumulative run high-water occupancy. |
+| `replay_ingress.backpressure_waits` | replay ingress | Cumulative producer wait count. |
+| `replay_ingress.backpressure_wait_s` | replay ingress | Cumulative producer wait time in seconds. |
+| `replay_ingress.early_returns` and related return counters | replay ingress | Cumulative batch counts. |
+| `inference_memory_budget.ipc_event_count` | inference budget preflight | CUDA IPC event count when the section exists. |
+
+All other runtime-manifest fields are producer diagnostics. In particular,
+`runtime_manifest.shutdown` is experimental and opaque in v1: its presence is
+useful for diagnosis, but consumers must not require or interpret its internal
+fields until that section is explicitly promoted to a stable contract.
+
+Within a schema major version, new optional fields may be added together with
+schema, test, and documentation updates. A stable field may not be renamed,
+removed, retyped, or changed in unit or null semantics without incrementing the
+schema version. Unsupported versions fail closed. The historical TensorBoard
+migration table below remains a narrowly scoped reader for old runs; it is not
+a general compatibility layer for future metrics.
 
 ## Old-to-new reference
 

@@ -134,7 +134,7 @@ def test_fast_sac_whole_cycle_uses_max_autotune_without_nested_graphs(monkeypatc
     ]
 
 
-def test_fast_sac_gradient_sync_invalidates_captured_cycle() -> None:
+def test_fast_sac_gradient_sync_leaves_whole_cycle_mode_for_dp() -> None:
     learner = _small_fast_sac_learner()
     learner._compile_full_update_cycle = True
     learner._update_cycle_graph_cache_key = ("old",)
@@ -144,8 +144,11 @@ def test_fast_sac_gradient_sync_invalidates_captured_cycle() -> None:
 
     learner.set_gradient_sync(sync)
     assert learner._gradient_sync is sync
+    assert learner._compile_full_update_cycle is False
     assert learner._update_cycle_graph_cache_key is None
-    assert learner.use_update_cycle is True
+    assert learner._gradient_graph_hooks is None
+    assert learner.use_update_cycle is False
+
     learner.set_gradient_graph_hooks(lambda: None, lambda: None, lambda: None)
     learner._update_cycle_graph_cache_key = ("same",)
     learner.set_gradient_sync(sync)

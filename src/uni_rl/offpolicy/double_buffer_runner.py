@@ -8,7 +8,7 @@ import statistics
 import time
 import warnings
 from collections import defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
@@ -21,15 +21,22 @@ if TYPE_CHECKING:
     from uni_rl.ipc.dp_sync import DpParameterSync
 
 from uni_rl.ipc.async_runner import _SPAWN_CTX
-from uni_rl.ipc.inference_slot import SharedInferenceSlot
-from uni_rl.ipc.replay_buffer import DEFAULT_REPLAY_INGRESS_DEPTH, ReplayBuffer
+from uni_rl.ipc.inference_ring import (
+    SharedInferenceRing,
+    estimate_inference_ring_bytes,
+)
+from uni_rl.ipc.replay_buffer import ReplayBuffer
 from uni_rl.ipc.replay_pipelines.gpu_resident import (
     GPUResidentReplayPipeline,
     require_offpolicy_replay_device,
 )
 from uni_rl.logging import OffPolicyLogger, TraceRecorder
-from uni_rl.logging.metric_schema import metric_spec, normalize_metric_map
+from uni_rl.logging.metric_schema import METRIC_SCHEMA_VERSION, metric_spec, normalize_metric_map
 from uni_rl.logging.metrics_drain import RewardComponentWindow
+from uni_rl.logging.runtime_manifest_schema import (
+    RUNTIME_MANIFEST_SCHEMA_VERSION,
+    validate_runtime_manifest,
+)
 from uni_rl.offpolicy.actor_adapter import get_offpolicy_actor_adapter
 from uni_rl.offpolicy.coordination import LearnerCoordinationState
 from uni_rl.offpolicy.runner import (
@@ -37,6 +44,7 @@ from uni_rl.offpolicy.runner import (
     build_offpolicy_sample_info,
     replay_buffer_ready_for_learning,
 )
+from uni_rl.offpolicy.shutdown_diagnostics import ShutdownDiagnosticsRecorder
 from uni_rl.offpolicy.thread_budget import (
     format_torch_thread_runtime,
     torch_thread_env,
@@ -53,6 +61,14 @@ from uni_rl.offpolicy.worker import (
 )
 from uni_rl.utils.device import resolve_backend_process_device
 from uni_rl.utils.seed import derive_worker_seed
+from uni_rl.utils.tensor_runtime import (
+    DEFAULT_COLLECTOR_METRICS_INTERVAL,
+    DEFAULT_INFERENCE_SLOT_CAPACITY,
+    DEFAULT_REPLAY_INGRESS_DEPTH,
+    InferencePlacement,
+    InferenceTransport,
+    TensorRuntimeSettings,
+)
 
 # Terminal/W&B display names for the off-policy algo types. Keep these
 # user-facing (no internal "Fast*" implementation prefixes).
@@ -174,6 +190,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         replay_pipeline_factory: Callable[..., GPUResidentReplayPipeline] | None = None,
         target_frequency: int = 1,
         policy_before_critic: bool = False,
+        inference_placement: InferencePlacement | None = None,
+        collector_tensor_native: bool | None = None,
+        tensor_runtime_settings: TensorRuntimeSettings | None = None,
+        inference_slot_capacity: int | None = None,
+        inference_epoch: int = 0,
+        collector_metrics_interval: int | None = None,
         **kwargs,
     ):
         kwargs["device"] = require_offpolicy_replay_device(kwargs.get("device"))
@@ -181,6 +203,62 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             str(kwargs.get("sim_backend", "mujoco")),
             kwargs["device"],
         )
+        if tensor_runtime_settings is None:
+            effective_inference_capacity = (
+                DEFAULT_INFERENCE_SLOT_CAPACITY
+                if inference_slot_capacity is None
+                else inference_slot_capacity
+            )
+            effective_metrics_interval = (
+                DEFAULT_COLLECTOR_METRICS_INTERVAL
+                if collector_metrics_interval is None
+                else collector_metrics_interval
+            )
+            tensor_runtime_settings = TensorRuntimeSettings(
+                inference_slot_capacity=effective_inference_capacity,
+                collector_metrics_interval=effective_metrics_interval,
+                replay_ingress_depth=DEFAULT_REPLAY_INGRESS_DEPTH,
+                replay_ingress_slot_rows=kwargs.get("num_envs", 4096),
+                batch_size=kwargs.get("batch_size", 8192),
+                updates_per_step=kwargs.get("updates_per_step", 8),
+                num_envs=kwargs.get("num_envs", 4096),
+            )
+        else:
+            explicit_values = {
+                "inference_slot_capacity": (
+                    inference_slot_capacity,
+                    tensor_runtime_settings.inference_slot_capacity,
+                ),
+                "collector_metrics_interval": (
+                    collector_metrics_interval,
+                    tensor_runtime_settings.collector_metrics_interval,
+                ),
+                "batch_size": (
+                    kwargs.get("batch_size"),
+                    tensor_runtime_settings.batch_size,
+                ),
+                "updates_per_step": (
+                    kwargs.get("updates_per_step"),
+                    tensor_runtime_settings.updates_per_step,
+                ),
+                "num_envs": (kwargs.get("num_envs"), tensor_runtime_settings.num_envs),
+            }
+            for name, (value, _) in explicit_values.items():
+                if value is not None and type(value) is not int:
+                    raise TypeError(f"{name} must be a positive integer, got {value!r}")
+            mismatches = {
+                name: (value, expected)
+                for name, (value, expected) in explicit_values.items()
+                if value is not None and value != expected
+            }
+            if mismatches:
+                details = ", ".join(
+                    f"{name}={value!r} (settings={expected!r})"
+                    for name, (value, expected) in mismatches.items()
+                )
+                raise ValueError(
+                    f"Direct runner arguments conflict with tensor_runtime_settings: {details}"
+                )
         super().__init__(**kwargs)
         if replay_prefetch_mode != "one_tick":
             raise ValueError(
@@ -213,6 +291,73 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         # merged into the collector-only env override at collector startup.
         self.collector_cpu_ids = list(collector_cpu_ids) if collector_cpu_ids is not None else None
         self.collector_backend_device = collector_backend_device
+        if isinstance(collector_tensor_native, bool) and inference_placement is None:
+            inference_placement = InferencePlacement(
+                mode=(
+                    InferenceTransport.CUDA if collector_tensor_native else InferenceTransport.CPU
+                ),
+                env_device=(
+                    str(kwargs["device"])
+                    if collector_tensor_native
+                    and torch.device(str(kwargs["device"])).type == "cuda"
+                    else "cpu"
+                ),
+                ring_device=(
+                    str(kwargs["device"])
+                    if collector_tensor_native
+                    and torch.device(str(kwargs["device"])).type == "cuda"
+                    else "cpu"
+                ),
+                learner_device=str(kwargs["device"]),
+                collector_tensor_native=collector_tensor_native,
+                staging_policy=(
+                    "cuda_no_host_boundary"
+                    if collector_tensor_native
+                    else (
+                        "cpu_ring_explicit_learner_actor_h2d_action_d2h"
+                        if torch.device(str(kwargs["device"])).type == "cuda"
+                        else "cpu_no_device_transfer"
+                    )
+                ),
+            )
+            warnings.warn(
+                "collector_tensor_native is deprecated; construct DoubleBufferOffPolicyRunner "
+                "with resolve_inference_transport()'s inference_placement",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if inference_placement is None:
+            inference_placement = InferencePlacement(
+                mode=InferenceTransport.CPU,
+                env_device="cpu",
+                ring_device="cpu",
+                learner_device=str(kwargs["device"]),
+                collector_tensor_native=False,
+                staging_policy=(
+                    "cpu_ring_explicit_learner_actor_h2d_action_d2h"
+                    if torch.device(str(kwargs["device"])).type == "cuda"
+                    else "cpu_no_device_transfer"
+                ),
+            )
+        if not isinstance(inference_placement, InferencePlacement):
+            raise TypeError(
+                f"inference_placement must be an InferencePlacement, got {inference_placement!r}"
+            )
+        self._validate_inference_placement(
+            inference_placement, learner_device=str(kwargs["device"])
+        )
+        self.inference_placement = inference_placement
+        self.collector_tensor_native = inference_placement.collector_tensor_native
+        self.tensor_runtime_settings = tensor_runtime_settings
+        self.inference_slot_capacity = tensor_runtime_settings.inference_slot_capacity
+        if isinstance(inference_epoch, bool) or not isinstance(inference_epoch, int):
+            raise TypeError(f"inference_epoch must be an integer, got {inference_epoch!r}")
+        if inference_epoch < 0:
+            raise ValueError("inference_epoch must be non-negative")
+        self.inference_epoch = int(inference_epoch)
+        self.collector_metrics_interval = tensor_runtime_settings.collector_metrics_interval
+        self.replay_ingress_depth = tensor_runtime_settings.replay_ingress_depth
+        self.replay_ingress_slot_rows = tensor_runtime_settings.replay_ingress_slot_rows
         # Backend-owned process-device binder forwarded to the collector
         # subprocess (e.g. mjwarp); None for backends that need no binding.
         self.backend_device_binder = backend_device_binder
@@ -228,12 +373,33 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         self.replay_pack_executor = "collector_thread"
         self.replay_h2d_submitter = "auto"
         self.replay_transfer_backend: dict[str, object] = {}
+        self.last_run_summary: dict[str, object] | None = None
+        self._shutdown_recorder = ShutdownDiagnosticsRecorder(inference_epoch=self.inference_epoch)
+        self._active_inference_ring: Any = None
+        self._active_replay_buffer: ReplayBuffer | None = None
         self.runtime_manifest = {
+            "schema_version": RUNTIME_MANIFEST_SCHEMA_VERSION,
             "inference_owner": "learner",
             "collector_actor": False,
             "collector_accelerator_context": self.collector_backend_device is not None,
             "collector_backend_device": self.collector_backend_device,
             "collector_torch_inference": False,
+            "collector_tensor_native": self.collector_tensor_native,
+            "inference_transport": self.inference_placement.manifest(),
+            "inference_ring_device": self.inference_placement.ring_device,
+            "env_public_device": self.inference_placement.env_device,
+            "learner_device": self.inference_placement.learner_device,
+            "inference_staging_policy": self.inference_placement.staging_policy,
+            "inference_ring_capacity": self.inference_slot_capacity,
+            "runtime_limits": self.tensor_runtime_settings.manifest(),
+            "inference_flight": {
+                "queue_depth": 0,
+                "publication_lag": 0,
+                "max_in_flight": 0,
+                "max_publication_lag": 0,
+            },
+            "inference_publication_ordering": "contiguous_ticks",
+            "inference_epoch": self.inference_epoch,
             "learner_actor_reused": True,
             "logger_owner_rank": 0,
             "logger_cross_rank_aggregation": self.dp_sync is not None,
@@ -245,6 +411,57 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "backend": self.dp_sync.backend,
                 "mode": "gradient_mean_per_optimizer_step",
             }
+
+    def _validate_inference_placement(
+        self, placement: InferencePlacement, *, learner_device: str
+    ) -> None:
+        """Fail closed before collector spawn on an incoherent topology."""
+        expected_learner = str(learner_device)
+        placement_learner = placement.learner_device
+        expected_device = torch.device(expected_learner)
+        placement_device = torch.device(placement_learner)
+        same_device = placement_device == expected_device or (
+            expected_device.type == "cuda"
+            and expected_device.index is None
+            and placement_device.type == "cuda"
+            and placement_device.index == torch.cuda.current_device()
+        )
+        if not same_device:
+            raise ValueError(
+                "inference_placement learner device must match the runner device: "
+                f"{placement_learner!r} != {expected_learner!r}"
+            )
+        if placement.mode is InferenceTransport.CUDA:
+            ring = torch.device(placement.ring_device)
+            env = torch.device(placement.env_device)
+            learner = placement_device
+            if learner.type != "cuda":
+                raise ValueError(
+                    "CUDA inference transport requires a CUDA runner device; "
+                    f"got {expected_learner!r}"
+                )
+            if ring != learner or env != learner:
+                raise ValueError(
+                    "CUDA inference transport requires the env, inference ring, and "
+                    f"learner to share one rank-local CUDA device; got env={placement.env_device!r}, "
+                    f"ring={placement.ring_device!r}, learner={expected_learner!r}"
+                )
+            if not placement.collector_tensor_native:
+                raise ValueError("CUDA inference transport requires tensor-native collection")
+            return
+
+        if torch.device(placement.ring_device).type != "cpu":
+            raise ValueError(
+                "CPU inference transport requires a CPU inference ring; "
+                f"got {placement.ring_device!r}"
+            )
+        if placement.collector_tensor_native:
+            raise ValueError("CPU inference transport requires NumPy collector transitions")
+        if torch.device(placement.env_device).type != "cpu":
+            raise ValueError(
+                "CPU inference transport requires CPU env public tensors; "
+                f"got {placement.env_device!r}"
+            )
 
     def _attach_dp_gradient_sync(self) -> None:
         if self.dp_sync is None:
@@ -385,6 +602,47 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         if self.learner_prepare_hook is not None:
             self.learner_prepare_hook(self.learner, context)
 
+    def _persistent_inference_scratch_bytes(self) -> int:
+        """Read algorithm-owned, inference-only persistent scratch categories."""
+        startup_hook = getattr(self.learner, "inference_startup_memory_categories", None)
+        if startup_hook is None:
+            # Unknown custom learners remain covered by the conservative
+            # workspace reserve; no exact per-category claim is made for them.
+            return 0
+        if not callable(startup_hook):
+            raise TypeError(
+                f"{type(self.learner).__name__}.inference_startup_memory_categories "
+                "must be callable"
+            )
+        categories = startup_hook(self.num_envs)
+        if not isinstance(categories, dict) or set(categories) != {
+            "persistent_exploration_scratch"
+        }:
+            raise TypeError(
+                "inference_startup_memory_categories() must return exactly "
+                "{'persistent_exploration_scratch': bytes}"
+            )
+        value = categories["persistent_exploration_scratch"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("persistent exploration scratch bytes must be a non-negative int")
+        return value
+
+    def _prepare_inference_timing_events(self) -> None:
+        """Allocate the two CUDA timing events accounted for by the startup budget."""
+        if torch.device(self.device).type != "cuda":
+            return
+        try:
+            self._inference_forward_cuda_events = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+        except BaseException:
+            # CUDA event wrappers do not expose an explicit close method. Remove
+            # all local references so a partial allocation cannot survive startup.
+            if hasattr(self, "_inference_forward_cuda_events"):
+                delattr(self, "_inference_forward_cuda_events")
+            raise
+
     def _shutdown_collector(self) -> None:
         """Release the lock-step collector without waiting on a tick deadline."""
         # Set the stop event before publishing STOPPED: a collector that
@@ -400,6 +658,28 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 process.terminate()
                 process.join(timeout=5.0)
 
+    def _drain_collector_metrics_after_shutdown(
+        self,
+        metrics_queue,
+        reward_history: deque,
+        latest_reward_components: RewardComponentWindow,
+        logger,
+    ) -> None:
+        """Consume the collector's final metric publication after quiesce.
+
+        ``_shutdown_collector`` joins the process before this call. The worker
+        publishes its final partial tensor-metric window from its ``finally``
+        block, so a bounded queue still preserves every message. Draining here
+        is therefore safe even when the process exits between the learner's
+        normal polling points.
+        """
+        self._drain_metrics(
+            metrics_queue,
+            reward_history,
+            latest_reward_components,
+            logger,
+        )
+
     def _collect_dp_sync_metrics(self, iter_metrics: defaultdict[str, list]) -> None:
         """Move per-optimizer collective timing into this iteration's metrics."""
         if self.dp_sync is None:
@@ -410,6 +690,82 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             if not graph_mode or (self.trace_enabled and self.trace_cuda_events):
                 iter_metrics["Perf/dp_gradient_sync_ms_per_rank"].append(sync_time * 1000.0)
             iter_metrics["Perf/dp_gradient_sync_calls_per_rank"].append(float(sync_calls))
+
+    @staticmethod
+    def _replay_ingress_metrics(replay_pipeline) -> dict[str, float]:
+        """Snapshot host-only bounded ingress gauges/counters for one log step."""
+        diagnostics_method = getattr(replay_pipeline, "ingress_diagnostics", None)
+        if not callable(diagnostics_method):
+            return {}
+        diagnostics = cast(Mapping[str, int | float], diagnostics_method())
+        return {
+            "Train/replay_ingress_depth": float(diagnostics["ingress_depth"]),
+            "Train/replay_ingress_occupancy": float(diagnostics["occupancy"]),
+            "Train/replay_ingress_high_water": float(diagnostics["high_water_occupancy"]),
+            "Train/replay_ingress_backpressure_wait_ms": float(diagnostics["backpressure_wait_s"])
+            * 1000.0,
+            "Train/replay_ingress_dropped_batches": float(diagnostics["dropped_batches"]),
+        }
+
+    def _update_replay_ingress_manifest(
+        self,
+        logger: OffPolicyLogger,
+        replay_pipeline,
+    ) -> None:
+        diagnostics_method = getattr(replay_pipeline, "ingress_diagnostics", None)
+        if not callable(diagnostics_method):
+            return
+        diagnostics = diagnostics_method()
+        self.runtime_manifest["replay_ingress"] = diagnostics
+        logger.update_runtime_manifest({"replay_ingress": diagnostics})
+
+    def _record_final_replay_ingress_diagnostics(
+        self,
+        logger: OffPolicyLogger,
+        replay_buffer,
+    ) -> None:
+        diagnostics_method = getattr(replay_buffer, "ingress_diagnostics", None)
+        if not callable(diagnostics_method):
+            return
+        diagnostics = diagnostics_method()
+        self.runtime_manifest["replay_ingress"] = diagnostics
+        logger_runtime_manifest = getattr(logger, "_runtime_manifest", None)
+        if isinstance(logger_runtime_manifest, dict):
+            logger_runtime_manifest["replay_ingress"] = diagnostics
+        if isinstance(self.last_run_summary, dict):
+            summary_manifest = self.last_run_summary.get("runtime_manifest")
+            if isinstance(summary_manifest, dict):
+                summary_manifest["replay_ingress"] = diagnostics
+
+    def _minimal_failed_summary(self, status: str) -> dict[str, object]:
+        """Build a schema-stamped summary when normal summary assembly fails."""
+
+        return {
+            "status": status,
+            "metric_schema_version": METRIC_SCHEMA_VERSION,
+            "runtime_manifest": dict(self.runtime_manifest),
+        }
+
+    def _record_shutdown_diagnostics(self, logger: OffPolicyLogger) -> dict[str, object]:
+        try:
+            diagnostics = self._shutdown_recorder.snapshot(
+                learner_coordination=self._learner_coordination,
+                inference_ring=self._active_inference_ring,
+                replay_buffer=getattr(self, "_active_replay_buffer", None),
+                collector_process=getattr(self, "_collector_process", None),
+            )
+        except BaseException as exc:
+            self._shutdown_recorder.record_cleanup_error(exc)
+            return {}
+        self.runtime_manifest["shutdown"] = diagnostics
+        logger_runtime_manifest = getattr(logger, "_runtime_manifest", None)
+        if isinstance(logger_runtime_manifest, dict):
+            logger_runtime_manifest["shutdown"] = diagnostics
+        if isinstance(self.last_run_summary, dict):
+            summary_manifest = self.last_run_summary.get("runtime_manifest")
+            if isinstance(summary_manifest, dict):
+                summary_manifest["shutdown"] = diagnostics
+        return diagnostics
 
     def _aggregate_log_statistics(
         self,
@@ -626,6 +982,33 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         logger.log_save(ckpt_path)
         return ckpt_path
 
+    def _restore_resume_checkpoint(self, resume_checkpoint: str) -> int:
+        """Restore learner state and return the first training iteration.
+
+        Checkpoints are produced by :meth:`_save_checkpoint` and may contain
+        optimizer state, so this path is intentionally not restricted to
+        tensor-only loading. Malformed progress metadata fails closed rather
+        than silently restarting training from old model weights.
+        """
+        state = torch.load(resume_checkpoint, map_location=self.device, weights_only=False)
+        if not isinstance(state, dict):
+            raise TypeError("resume checkpoint must contain a learner state dictionary")
+        try:
+            update_count = int(state["update_count"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("resume checkpoint is missing a valid integer update_count") from exc
+        if update_count < 0:
+            raise ValueError(
+                f"resume checkpoint update_count must be non-negative, got {update_count}"
+            )
+
+        self.learner.load_state_dict(state)
+        print(
+            f"Resumed learner state from {resume_checkpoint} "
+            f"(update_count={update_count}, next_iteration={update_count + 1})"
+        )
+        return update_count + 1
+
     def close(self) -> None:
         try:
             # Rank 0 owns the live terminal, and every rank owns a collector and
@@ -649,9 +1032,19 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         the affinity list must only reach the collector's copy — never the
         learner-side probe envs, which keep the base override untouched.
         """
-        if self.collector_cpu_ids is None:
-            return self.env_cfg_override
-        return {**(self.env_cfg_override or {}), "cpu_ids": list(self.collector_cpu_ids)}
+        override = dict(self.env_cfg_override or {})
+        if self.collector_cpu_ids is not None:
+            override["cpu_ids"] = list(self.collector_cpu_ids)
+        # Keep the resolved env public-device request on the same rank-local
+        # CUDA device as the ring. Copying here avoids mutating the probe env's
+        # opaque owner mapping while still validating it before spawn.
+        override.pop("tensor_runtime", None)
+        override.pop("tensor_runtime_device", None)
+        # Inference transport is process-local metadata, not an EnvCfg field.
+        # The resolved placement reaches the worker only through the explicit
+        # collector argument below; EnvCfg remains owned by UniLab.
+        override.pop("inference_transport", None)
+        return override or None
 
     def _wait_for_inference_request(
         self,
@@ -710,12 +1103,15 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
     def _serve_learner_inference(
         self,
-        inference_slot: SharedInferenceSlot,
+        inference_slot: SharedInferenceRing,
         *,
         tick_id: int,
         policy_version: int,
         obs_device: torch.Tensor,
         dones_device: torch.Tensor,
+        actor_obs_device: torch.Tensor,
+        actor_dones_device: torch.Tensor,
+        actions_host: torch.Tensor | None,
         trace_recorder: TraceRecorder | None,
     ) -> dict[str, float]:
         device = torch.device(self.device)
@@ -725,14 +1121,22 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             observations=obs_device,
             dones=dones_device,
             non_blocking=False,
+            epoch=self.inference_epoch,
         )
         h2d_end_ns = time.perf_counter_ns()
 
-        actor_obs = obs_device[:, : self.obs_dim]
+        # CPU transport owns exactly one persistent ring->actor H2D boundary.
+        if self.inference_placement.mode is InferenceTransport.CPU:
+            actor_obs_device.copy_(obs_device, non_blocking=False)
+            actor_dones_device.copy_(dones_device, non_blocking=False)
+        else:
+            if actor_obs_device is not obs_device or actor_dones_device is not dones_device:
+                raise RuntimeError("CUDA inference transport must reuse ring-device scratch")
+        actor_obs = actor_obs_device[:, : self.obs_dim]
         actor_adapter = get_offpolicy_actor_adapter(self.algo_type)
         actor_context = None
         if actor_adapter is not None and actor_adapter.actor_context_from_obs is not None:
-            actor_context = actor_adapter.actor_context_from_obs(obs_device, self.obs_dim)
+            actor_context = actor_adapter.actor_context_from_obs(actor_obs_device, self.obs_dim)
         if self.obs_normalization:
             actor_obs = self.learner.obs_normalizer(actor_obs, update=False)
         forward_start_ns = time.perf_counter_ns()
@@ -740,18 +1144,14 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         if device.type == "cuda":
             cuda_forward_events = getattr(self, "_inference_forward_cuda_events", None)
             if cuda_forward_events is None:
-                cuda_forward_events = (
-                    torch.cuda.Event(enable_timing=True),
-                    torch.cuda.Event(enable_timing=True),
-                )
-                self._inference_forward_cuda_events = cuda_forward_events
+                raise RuntimeError("CUDA inference timing events were not prepared at startup")
             cuda_forward_events[0].record(torch.cuda.current_stream(device))
         with torch.no_grad():
             actions_device = sample_offpolicy_actions(
                 actor=self.learner.actor,
                 algo_type=self.algo_type,
                 obs_torch=actor_obs,
-                prev_dones_torch=dones_device,
+                prev_dones_torch=actor_dones_device,
                 priv_info_torch=actor_context,
             )
         if cuda_forward_events is not None:
@@ -764,15 +1164,25 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         forward_end_ns = time.perf_counter_ns()
 
         d2h_start_ns = time.perf_counter_ns()
+        # CPU transport owns exactly one actor->host action D2H boundary into a
+        # persistent tensor; CUDA actions remain on the ring device.
+        actions_for_ring = actions_device
+        if self.inference_placement.mode is InferenceTransport.CPU:
+            if actions_host is None:
+                raise RuntimeError("CPU inference transport lost its action staging tensor")
+            actions_host.copy_(actions_device, non_blocking=False)
+            actions_for_ring = actions_host
         inference_slot.publish_action(
             tick_id=tick_id,
             policy_version=policy_version,
-            actions=actions_device,
+            actions=actions_for_ring,
             non_blocking=False,
+            epoch=self.inference_epoch,
         )
         d2h_end_ns = time.perf_counter_ns()
         inference_forward_time = (forward_end_ns - forward_start_ns) / 1e9
         if cuda_forward_events is not None:
+            cuda_forward_events[1].synchronize()
             inference_forward_time = (
                 cuda_forward_events[0].elapsed_time(cuda_forward_events[1]) / 1e3
             )
@@ -828,21 +1238,32 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         ckpt_path: str | None,
         train_start_wall: float,
     ) -> None:
-        logger.log_status("[red]ERROR: Collector died[/]")
-        self._sync_logger_replay_counters(logger, replay_buffer)
-        logger.close()
-        self.last_run_summary = self._make_summary(
-            "collector_died",
-            iteration,
-            logger,
-            None,
-            None,
-            ckpt_path,
-            train_start_wall,
-            None,
-        )
-        replay_pipeline.close()
-        raise RuntimeError("Collector process died during off-policy training")
+        failure = RuntimeError("Collector process died during off-policy training")
+        self._shutdown_recorder.record_collector_failure(failure)
+        try:
+            logger.log_status("[red]ERROR: Collector died[/]")
+            self._record_shutdown_diagnostics(logger)
+            self._sync_logger_replay_counters(logger, replay_buffer)
+            logger.close()
+            self.last_run_summary = self._make_summary(
+                "collector_died",
+                iteration,
+                logger,
+                None,
+                None,
+                ckpt_path,
+                train_start_wall,
+                None,
+            )
+        except BaseException as cleanup_exc:
+            self._shutdown_recorder.record_cleanup_error(cleanup_exc)
+            if not isinstance(self.last_run_summary, dict):
+                self.last_run_summary = self._minimal_failed_summary("collector_died")
+        try:
+            replay_pipeline.close()
+        except BaseException as cleanup_exc:
+            self._shutdown_recorder.record_cleanup_error(cleanup_exc)
+        raise failure
 
     def _publish_inference_response(
         self,
@@ -947,6 +1368,55 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         save_interval: int = 50,
         log_dir: str = "logs",
         logger_type: str = "tensorboard",
+        resume_checkpoint: str | None = None,
+    ) -> None:
+        resume_start_iteration = 1
+        if resume_checkpoint is not None:
+            resume_start_iteration = self._restore_resume_checkpoint(resume_checkpoint)
+        self.resume_start_iteration = resume_start_iteration
+        if resume_start_iteration > max_iterations + 1:
+            raise ValueError(
+                "resume checkpoint is newer than max_iterations: "
+                f"next_iteration={resume_start_iteration}, max_iterations={max_iterations}"
+            )
+        self._shutdown_recorder.reset(inference_epoch=self.inference_epoch)
+        self.runtime_manifest.pop("shutdown", None)
+        self.last_run_summary = None
+        self._active_logger = None
+        self._active_replay_buffer = None
+        self._active_inference_ring = None
+        try:
+            self._learn_impl(
+                max_iterations=max_iterations,
+                save_interval=save_interval,
+                log_dir=log_dir,
+                logger_type=logger_type,
+            )
+        except BaseException as exc:
+            if "shutdown" not in self.runtime_manifest:
+                self._shutdown_recorder.record_failure(exc)
+                self._record_startup_shutdown_diagnostics()
+            if not isinstance(self.last_run_summary, dict):
+                self.last_run_summary = self._minimal_failed_summary("failed")
+            raise
+
+    def _record_startup_shutdown_diagnostics(self) -> None:
+        try:
+            self.runtime_manifest["shutdown"] = self._shutdown_recorder.snapshot(
+                learner_coordination=self._learner_coordination,
+                inference_ring=self._active_inference_ring,
+                replay_buffer=getattr(self, "_active_replay_buffer", None),
+                collector_process=getattr(self, "_collector_process", None),
+            )
+        except BaseException as diagnostics_exc:
+            self._shutdown_recorder.record_cleanup_error(diagnostics_exc)
+
+    def _learn_impl(
+        self,
+        max_iterations: int = 1500,
+        save_interval: int = 50,
+        log_dir: str = "logs",
+        logger_type: str = "tensorboard",
     ) -> None:
         self._collector_ready = False
         if self._is_primary_rank():
@@ -962,25 +1432,98 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         last_mean_reward = 0.0
         ckpt_path: str | None = None
         iteration = 0
+        start_iteration = self.resume_start_iteration
 
+        self._shutdown_recorder.set_phase(owner="learner", phase="startup/memory_budget")
         # --- memory budget check ---
         from uni_rl.ipc.memory_budget import (
+            estimate_cuda_inference_ipc_bytes,
+            estimate_cuda_tensor_runtime_bytes,
             estimate_offpolicy_bytes,
+            raise_if_cuda_memory_over_budget,
             raise_if_shared_memory_over_budget,
             warn_if_over_budget,
         )
 
+        gpu_centric_collector = self.collector_tensor_native
+        inference_ring_device = self.inference_placement.ring_device
+        actor_context_dim = int(getattr(self.learner, "priv_info_dim", 0))
+        inference_input_dim = self.obs_dim + actor_context_dim
+        inference_ring_bytes = estimate_inference_ring_bytes(
+            self.num_envs,
+            inference_input_dim,
+            self.action_dim,
+            capacity=self.inference_slot_capacity,
+        )
         mem_est = estimate_offpolicy_bytes(
             num_envs=self.num_envs,
             replay_buffer_n=self.replay_buffer_n,
             obs_dim=self.obs_dim,
             action_dim=self.action_dim,
             critic_dim=self.critic_obs_dim,
-            ingress_depth=DEFAULT_REPLAY_INGRESS_DEPTH,
+            ingress_depth=self.replay_ingress_depth,
+            ingress_slot_rows=self.replay_ingress_slot_rows,
+            inference_ring_bytes=0 if gpu_centric_collector else inference_ring_bytes,
+            ingress_on_device=gpu_centric_collector,
         )
         warn_if_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
         raise_if_shared_memory_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
 
+        self._shutdown_recorder.set_phase(owner="learner", phase="startup/cuda_preflight")
+        # This guard runs before replay ingress, the inference ring, IPC events,
+        # or learner inference scratch is materialized. It intentionally uses a
+        # conservative reserve rather than claiming exact allocator accounting.
+        learner_device = torch.device(self.device)
+        if learner_device.type == "cuda":
+            cuda_free_bytes, _cuda_total_bytes = torch.cuda.mem_get_info(learner_device)
+            cuda_inference_budget = estimate_cuda_inference_ipc_bytes(
+                self.num_envs,
+                inference_input_dim,
+                self.action_dim,
+                capacity=self.inference_slot_capacity,
+                ring_on_device=gpu_centric_collector,
+                persistent_exploration_scratch=self._persistent_inference_scratch_bytes(),
+            )
+            cuda_tensor_budget = estimate_cuda_tensor_runtime_bytes(
+                num_envs=self.num_envs,
+                replay_buffer_n=self.replay_buffer_n,
+                obs_dim=self.obs_dim,
+                action_dim=self.action_dim,
+                critic_dim=self.critic_obs_dim,
+                inference_obs_dim=inference_input_dim,
+                sample_count=self.tensor_runtime_settings.learner_sample_count,
+                inference_slot_capacity=self.inference_slot_capacity,
+                replay_ingress_depth=self.replay_ingress_depth,
+                replay_ingress_slot_rows=self.replay_ingress_slot_rows,
+                collector_tensor_native=gpu_centric_collector,
+                persistent_exploration_scratch=self._persistent_inference_scratch_bytes(),
+            )
+            raise_if_cuda_memory_over_budget(
+                cuda_tensor_budget,
+                label=f"Off-policy ({self.algo_type})",
+                available_bytes=cuda_free_bytes,
+                user_knob=(
+                    "training.inference_slot_capacity, training.replay_ingress_depth, "
+                    "training.replay_ingress_slot_rows, algo.batch_size, "
+                    "algo.updates_per_step, algo.replay_buffer_n, or algo.num_envs"
+                ),
+                budget_kind="CUDA tensor runtime (inference + replay)",
+            )
+            self.runtime_manifest["inference_memory_budget"] = {
+                **cuda_inference_budget,
+                "available_bytes": cuda_free_bytes,
+                "threshold": 0.8,
+                "allowed_bytes": int(cuda_free_bytes * 0.8),
+            }
+            self.runtime_manifest["tensor_memory_budget"] = {
+                **cuda_tensor_budget,
+                "available_bytes": cuda_free_bytes,
+                "threshold": 0.8,
+                "allowed_bytes": int(cuda_free_bytes * 0.8),
+            }
+            self._prepare_inference_timing_events()
+
+        self._shutdown_recorder.set_phase(owner="learner", phase="startup/replay_resources")
         # --- bounded collector ingress (the complete ring lives on device) ---
         buffer_capacity = self.replay_buffer_n * self.num_envs
         replay_buffer = ReplayBuffer(
@@ -989,16 +1532,19 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             action_dim=self.action_dim,
             device=self.device,
             critic_dim=self.critic_obs_dim,
-            ingress_slot_rows=self.num_envs,
-            ingress_depth=DEFAULT_REPLAY_INGRESS_DEPTH,
+            ingress_slot_rows=self.replay_ingress_slot_rows,
+            ingress_depth=self.replay_ingress_depth,
+            ingress_device=self.device if gpu_centric_collector else "cpu",
+            # CPU transport still owns a CUDA replay device and CPU ingress.
         )
+        self._active_replay_buffer = replay_buffer
         self._shared_resources.append(replay_buffer)
         replay_buffer.trace_recorder = trace_recorder
         replay_buffer.trace_thread_time = self.trace_thread_time
         replay_buffer.trace_cuda_events = self.trace_cuda_events
 
         # --- authoritative device ring and hot/cold learner batches ---
-        sample_count = self.batch_size * self.updates_per_step
+        sample_count = self.tensor_runtime_settings.learner_sample_count
         replay_pipeline_factory = self.replay_pipeline_factory or GPUResidentReplayPipeline
         replay_pipeline = replay_pipeline_factory(
             replay_buffer,
@@ -1019,35 +1565,88 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "transfer_manifest",
             {},
         )
+        ingress_diagnostics_method = getattr(
+            replay_pipeline,
+            "ingress_diagnostics",
+            None,
+        )
         self.runtime_manifest.update(
             {
                 "replay_h2d_submitter": self.replay_h2d_submitter,
                 "replay_device_submission_thread": self.replay_transfer_backend.get(
                     "device_submission_thread"
                 ),
+                "replay_ingress": (
+                    ingress_diagnostics_method() if callable(ingress_diagnostics_method) else {}
+                ),
             }
         )
 
-        actor_context_dim = int(getattr(self.learner, "priv_info_dim", 0))
-        inference_input_dim = self.obs_dim + actor_context_dim
-        inference_slot = SharedInferenceSlot(
+        self._shutdown_recorder.set_phase(owner="learner", phase="startup/inference_resources")
+        inference_slot = SharedInferenceRing(
             self.num_envs,
             inference_input_dim,
             self.action_dim,
+            device=inference_ring_device,
+            capacity=self.inference_slot_capacity,
+            epoch=self.inference_epoch,
         )
+        self._active_inference_ring = inference_slot
         self._shared_resources.append(inference_slot)
         inference_obs_device = torch.empty(
             (self.num_envs, inference_input_dim),
             dtype=torch.float32,
-            device=self.device,
+            device=inference_ring_device,
         )
         inference_dones_device = torch.empty(
             self.num_envs,
             dtype=torch.float32,
-            device=self.device,
+            device=inference_ring_device,
         )
-        self.runtime_manifest["inference_slot_bytes"] = inference_slot.nbytes
+        # CPU transport owns persistent learner-side actor staging. Copies into
+        # these tensors are its sole ring->actor H2D boundary; CUDA transport
+        # deliberately reuses the ring-device scratch with no host detour.
+        if self.inference_placement.mode is InferenceTransport.CPU:
+            inference_obs_actor = torch.empty(
+                inference_obs_device.shape,
+                dtype=inference_obs_device.dtype,
+                device=self.device,
+            )
+            inference_dones_actor = torch.empty(
+                inference_dones_device.shape,
+                dtype=inference_dones_device.dtype,
+                device=self.device,
+            )
+            inference_actions_host = torch.empty(
+                (self.num_envs, self.action_dim), dtype=torch.float32, device="cpu"
+            )
+            self.runtime_manifest.update(
+                {
+                    "inference_learner_scratch_device": self.inference_placement.learner_device,
+                    "inference_action_host_staging": True,
+                }
+            )
+        else:
+            inference_obs_actor = inference_obs_device
+            inference_dones_actor = inference_dones_device
+            inference_actions_host = None
+            self.runtime_manifest.update(
+                {
+                    "inference_learner_scratch_device": self.inference_placement.learner_device,
+                    "inference_action_host_staging": False,
+                }
+            )
+        self.runtime_manifest.update(
+            {
+                "inference_slot_bytes": inference_slot.nbytes,
+                "inference_publication_sync": (
+                    "cuda_ipc_events" if inference_slot.device.type == "cuda" else "cpu_synchronous"
+                ),
+                "collector_metrics_interval": self.collector_metrics_interval,
+            }
+        )
 
+        self._shutdown_recorder.set_phase(owner="learner", phase="startup/logger")
         # --- logger ---
         logger = OffPolicyLogger(
             algo_name=algo_display_name(self.algo_type),
@@ -1091,6 +1690,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         self._active_logger = logger
         logger.start()
         try:
+            self._shutdown_recorder.set_phase(owner="learner", phase="startup/dp_init")
             # --- inference coordination queues ---
             inference_request_queue = _SPAWN_CTX.Queue(maxsize=1)
             inference_response_queue = _SPAWN_CTX.Queue(maxsize=1)
@@ -1100,16 +1700,18 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             # --- DP init broadcast must land before the collector's first ---
             # --- inference request reaches learner.actor ---
             self._dp_init_broadcast()
+            self._shutdown_recorder.set_phase(owner="learner", phase="startup/learner_prepare")
 
             # Algorithm-owned compilation, graph capture, actor warmup, and
             # custom preparation hooks complete before a collector can request
             # tick 0. DP initialization remains first so warmup sees broadcast
             # parameters and can capture rank-aligned graphs.
             self._prepare_learner(
-                inference_observations=inference_obs_device,
-                inference_dones=inference_dones_device,
+                inference_observations=inference_obs_actor,
+                inference_dones=inference_dones_actor,
                 replay_pipeline=replay_pipeline,
             )
+            self._shutdown_recorder.set_phase(owner="learner", phase="startup/collector_start")
 
             # --- start collector ---
             collector_kwargs = {
@@ -1124,11 +1726,15 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "sim_backend": self.sim_backend,
                 "backend_device": self.collector_backend_device,
                 "env_cfg_override": self._collector_env_cfg_override(),
+                "inference_transport": self.inference_placement.mode.value,
                 "inference_slot": inference_slot,
+                "inference_epoch": self.inference_epoch,
+                "collector_metrics_interval": self.collector_metrics_interval,
                 "seed": derive_worker_seed(self.seed, worker_index=0),
                 "trace_enabled": self.trace_enabled,
                 "trace_thread_time": self.trace_thread_time,
                 "nan_guard_cfg": self.nan_guard_cfg,
+                "nan_guard_factory": self.nan_guard_factory,
                 "torch_thread_runtime": self.torch_thread_runtime,
                 "backend_device_binder": self.backend_device_binder,
                 "learner_coordination": self._learner_coordination,
@@ -1143,6 +1749,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     target_fn=off_policy_collector_fn,
                     kwargs={"stop_event": self._stop_event, **collector_kwargs},
                 )
+            self._shutdown_recorder.set_phase(owner="learner", phase="training/startup_complete")
 
             time.sleep(0.5)
 
@@ -1175,7 +1782,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             training_e2e_start_ns = 0
 
             # ---- training loop ----
-            for iteration in range(1, max_iterations + 1):
+            for iteration in range(start_iteration, max_iterations + 1):
+                self._shutdown_recorder.set_phase(
+                    owner="learner",
+                    phase="training/wait_for_inference_request",
+                    iteration=iteration,
+                )
                 self._restore_local_logger_statistics(logger)
                 iteration_start = time.perf_counter()
                 # -- wait for data --
@@ -1202,13 +1814,28 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                         ckpt_path=ckpt_path,
                         train_start_wall=train_start_wall,
                     )
+                    self._shutdown_recorder.set_phase(
+                        owner="learner",
+                        phase="training/learner_inference",
+                        iteration=iteration,
+                        coordination_tick=request_tick,
+                    )
                     inference_timings = self._serve_learner_inference(
                         inference_slot,
                         tick_id=request_tick,
                         policy_version=inference_scheduler.policy_version,
                         obs_device=inference_obs_device,
                         dones_device=inference_dones_device,
+                        actor_obs_device=inference_obs_actor,
+                        actor_dones_device=inference_dones_actor,
+                        actions_host=inference_actions_host,
                         trace_recorder=trace_recorder,
+                    )
+                    self._shutdown_recorder.set_phase(
+                        owner="learner",
+                        phase="training/inference_response",
+                        iteration=iteration,
+                        coordination_tick=request_tick,
                     )
                     inference_h2d_time += inference_timings["inference_h2d_time"]
                     inference_forward_time += inference_timings["inference_forward_time"]
@@ -1228,6 +1855,13 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     collector_wait_overhead += _coord_d
                     if frozen_prepare_ptr is not None:
                         next_prepare_min_snapshot_ptr = frozen_prepare_ptr
+
+                    self._shutdown_recorder.set_phase(
+                        owner="learner",
+                        phase="training/replay_prepare",
+                        iteration=iteration,
+                        coordination_tick=request_tick,
+                    )
 
                     self._drain_metrics(
                         metrics_queue,
@@ -1329,6 +1963,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                         sample_count=sample_count,
                     )
                     learner_replay_sample_time = time.perf_counter() - replay_sample_start
+                    self._shutdown_recorder.set_phase(
+                        owner="learner",
+                        phase="training/learner_update",
+                        iteration=iteration,
+                        coordination_tick=request_tick,
+                    )
                     replay_ingress_h2d_submit_time = float(
                         getattr(replay_pipeline, "last_incremental_h2d_time_s", 0.0)
                     )
@@ -1526,6 +2166,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 logger.update_buffer_utilization(write_read_ema)
 
                 avg_metrics = {k: statistics.mean(v) for k, v in iter_metrics.items() if v}
+                avg_metrics.update(self._replay_ingress_metrics(replay_pipeline))
+                self._update_replay_ingress_manifest(logger, replay_pipeline)
                 mean_return_reports10 = statistics.mean(reward_history) if reward_history else None
 
                 self._sync_logger_replay_counters(logger, replay_buffer)
@@ -1603,7 +2245,46 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 )
 
             # -- finalize --
+            self._shutdown_recorder.set_phase(
+                owner="learner", phase="finalize/collector_quiesce", iteration=iteration
+            )
+            # Stop the collector before closing the replay pipeline. The
+            # collector may already be inside its final vectorized transition
+            # when the learner reaches max_iterations. Ingress publication is
+            # chunk-granular: shutdown may retain a valid prefix of that vector,
+            # but quiescing first prevents an unpublished suffix from racing
+            # pipeline.close(), which drains and releases every published chunk.
+            self._shutdown_collector()
+            self._shutdown_recorder.set_phase(
+                owner="learner",
+                phase="finalize/collector_metrics_drain",
+                iteration=iteration,
+            )
+            self._drain_collector_metrics_after_shutdown(
+                metrics_queue,
+                reward_history,
+                latest_reward_components,
+                logger,
+            )
+            # The final partial episode window is not represented by the last
+            # periodic scalar. Recompute both summary values from the complete
+            # collector history after shutdown so best/final can differ when an
+            # earlier episode window was stronger.
+            if reward_history:
+                last_mean_reward = float(reward_history[-1])
+                best_mean_reward = max(best_mean_reward, last_mean_reward)
+                has_logged_reward = True
+            self._shutdown_recorder.set_phase(
+                owner="learner", phase="finalize/replay_pipeline_close", iteration=iteration
+            )
             replay_pipeline.close()
+            self._shutdown_recorder.set_phase(
+                owner="learner", phase="finalize/replay_ingress_snapshot", iteration=iteration
+            )
+            try:
+                self._record_final_replay_ingress_diagnostics(logger, replay_buffer)
+            except BaseException as diagnostics_exc:
+                self._shutdown_recorder.record_cleanup_error(diagnostics_exc)
             final_ckpt_path = os.path.join(log_dir, f"model_{max_iterations}.pt")
             if ckpt_path != final_ckpt_path:
                 saved_path = self._save_checkpoint(
@@ -1615,6 +2296,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     ckpt_path = saved_path
             if self.dp_sync is None:
                 self._sync_logger_replay_counters(logger, replay_buffer)
+            self._shutdown_recorder.set_phase(
+                owner="learner", phase="finalize/logger_finish", iteration=iteration
+            )
             logger.finish()
             if trace_recorder and trace_output_path:
                 trace_recorder.write_json(trace_output_path)
@@ -1629,6 +2313,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 train_start_wall,
                 str(trace_output_path) if trace_output_path else None,
             )
+            self._shutdown_recorder.record_normal_completion()
+            self._record_shutdown_diagnostics(logger)
             self._active_logger = None
         except _CollectorDiedError:
             self._fail_collector_died(
@@ -1640,10 +2326,36 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 train_start_wall,
             )
             raise
+        except BaseException as exc:
+            self._shutdown_recorder.record_failure(exc)
+            self._record_shutdown_diagnostics(logger)
+            try:
+                self.last_run_summary = self._make_summary(
+                    "failed",
+                    iteration,
+                    logger,
+                    None,
+                    None,
+                    ckpt_path,
+                    train_start_wall,
+                    None,
+                )
+            except BaseException as summary_exc:
+                self._shutdown_recorder.record_cleanup_error(summary_exc)
+                self.last_run_summary = self._minimal_failed_summary("failed")
+            raise
         finally:
             # Learner stop/death must release the collector even when the active
             # exception is unrelated to collector liveness.
-            self._shutdown_collector()
+            try:
+                self._shutdown_collector()
+            except BaseException as cleanup_exc:
+                self._shutdown_recorder.record_cleanup_error(cleanup_exc)
+            try:
+                self._record_final_replay_ingress_diagnostics(logger, replay_buffer)
+            except BaseException as cleanup_exc:
+                self._shutdown_recorder.record_cleanup_error(cleanup_exc)
+            self._record_shutdown_diagnostics(logger)
 
     @staticmethod
     def _make_summary(
@@ -1656,7 +2368,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         train_start_wall,
         trace_path,
     ) -> dict:
-        return {
+        summary = {
             "status": status,
             "completed_iterations": iteration,
             "total_env_steps": int(logger._total_steps),
@@ -1666,8 +2378,11 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "last_checkpoint": ckpt_path,
             "trace_path": trace_path,
             "training_wall_time_sec": time.time() - train_start_wall,
+            "metric_schema_version": METRIC_SCHEMA_VERSION,
             "runtime_manifest": dict(getattr(logger, "_runtime_manifest", {})),
             "final_env_steps_per_sec": logger._get_iter_env_steps_per_sec(),
+            "tail_env_steps_per_sec": logger._get_tail_env_steps_per_sec(),
+            "tail_iteration_count": len(getattr(logger, "_tail_iteration_times", ())),
             "final_learner_replay_rows_per_sec": (logger._get_learner_replay_rows_per_sec()),
             "final_cycle_wall_ms": logger._get_iter_wall_time() * 1000.0,
             "final_inference_ms": getattr(logger, "_inference_time", 0.0) * 1000.0,
@@ -1675,3 +2390,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "final_inference_forward_ms": getattr(logger, "_inference_forward_time", 0.0) * 1000.0,
             "final_inference_d2h_ms": getattr(logger, "_inference_d2h_time", 0.0) * 1000.0,
         }
+        validate_runtime_manifest(
+            summary["runtime_manifest"],
+            completed=status == "completed",
+        )
+        return summary

@@ -70,6 +70,22 @@ def test_source_metrics_must_already_be_canonical() -> None:
             normalize_metric_map({retired: 1.0})
 
 
+def test_replay_ingress_diagnostics_are_registered_as_cumulative_pipeline_metrics() -> None:
+    tags = {
+        "Train/replay_ingress_depth",
+        "Train/replay_ingress_occupancy",
+        "Train/replay_ingress_high_water",
+        "Train/replay_ingress_backpressure_wait_ms",
+        "Train/replay_ingress_dropped_batches",
+    }
+
+    assert tags <= set(METRIC_SPECS)
+    for tag in tags:
+        spec = METRIC_SPECS[tag]
+        assert spec.owner == "ipc/replay"
+        assert spec.distributed_aggregation == "cross-rank sum"
+
+
 def test_schema_is_closed_except_reward_terms() -> None:
     validate_metric_tags(
         ["Loss/surrogate", "reward/term", "Train/rollouts_read", "Perf/learner_inference_ms"]

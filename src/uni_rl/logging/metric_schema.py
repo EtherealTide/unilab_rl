@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
+METRIC_SCHEMA_VERSION = 1
+
 
 @dataclass(frozen=True)
 class MetricSpec:
@@ -259,6 +261,46 @@ METRIC_SPECS: dict[str, MetricSpec] = {
             "Rollouts drained from the ring in this iteration.",
         ),
         _spec(
+            "Train/replay_ingress_depth",
+            "ipc/replay",
+            "slots",
+            "configured constant at the logged iteration",
+            "Configured bounded replay-ingress ring depth.",
+            distributed_aggregation="cross-rank sum",
+        ),
+        _spec(
+            "Train/replay_ingress_occupancy",
+            "ipc/replay",
+            "slots",
+            "published-minus-released snapshot at the logged iteration",
+            "Live bounded replay-ingress occupancy, including transfers awaiting commit.",
+            distributed_aggregation="cross-rank sum",
+        ),
+        _spec(
+            "Train/replay_ingress_high_water",
+            "ipc/replay",
+            "slots",
+            "monotonic maximum since replay ingress creation",
+            "Bounded replay-ingress occupancy high-water.",
+            distributed_aggregation="cross-rank sum",
+        ),
+        _spec(
+            "Train/replay_ingress_backpressure_wait_ms",
+            "ipc/replay",
+            "ms",
+            "cumulative producer-side bounded-ingress wait time",
+            "Wall time replay producers spent waiting for an ingress slot.",
+            distributed_aggregation="cross-rank sum",
+        ),
+        _spec(
+            "Train/replay_ingress_dropped_batches",
+            "ipc/replay",
+            "batches",
+            "cumulative early returns at closed or stopping ingress",
+            "Transition batches dropped instead of published to replay.",
+            distributed_aggregation="cross-rank sum",
+        ),
+        _spec(
             "Train/approx_kl",
             "learner",
             "nats",
@@ -393,7 +435,68 @@ METRIC_SPECS: dict[str, MetricSpec] = {
         _collector_ms("Perf/collector_mlp_infer_ms", "Collector MLP inference time."),
         _collector_ms("Perf/collector_inference_request_ms", "Request policy inference."),
         _collector_ms("Perf/collector_learner_action_wait_ms", "Wait for learner actions."),
+        _spec(
+            "Perf/collector_inference_queue_depth",
+            "collector",
+            "requests",
+            "published observations not yet copied by the learner at the report",
+            "Dynamic observation backlog; configured ring capacity is reported in the runtime manifest.",
+        ),
+        _spec(
+            "Perf/collector_inference_action_backlog",
+            "collector",
+            "requests",
+            "published actions not yet consumed by the collector at the report",
+            "Distinguishes response backlog from observation publication backlog.",
+        ),
+        _spec(
+            "Perf/collector_inference_max_action_backlog",
+            "collector",
+            "requests",
+            "maximum action backlog since the previous collector report",
+            "Observed response backlog without attributing speculative capacity to a serial chain.",
+        ),
+        _spec(
+            "Perf/collector_inference_in_flight",
+            "collector",
+            "requests",
+            "latest published-but-unconsumed inference count",
+            "Current outstanding requests after the collector's latest action consumption.",
+        ),
+        _spec(
+            "Perf/collector_inference_max_in_flight",
+            "collector",
+            "requests",
+            "maximum in-flight count since the previous collector report",
+            "Observed depth without attributing speculative capacity to a serial transition chain.",
+        ),
+        _spec(
+            "Perf/collector_inference_publication_lag",
+            "collector",
+            "ticks",
+            "latest published tick minus consumed tick",
+            "Current ordered publication backlog in inference ticks.",
+        ),
+        _spec(
+            "Perf/collector_inference_max_publication_lag",
+            "collector",
+            "ticks",
+            "maximum publication lag since the previous collector report",
+            "Observed ordered backlog without converting it into an out-of-order environment action.",
+        ),
         _collector_ms("Perf/collector_env_step_ms", "Environment step wall time."),
+        _collector_ms(
+            "Perf/collector_env_step_action_validate_ms",
+            "Validate public policy actions.",
+        ),
+        _collector_ms(
+            "Perf/collector_env_step_apply_action_ms",
+            "Process actions and publish control tensors.",
+        ),
+        _collector_ms(
+            "Perf/collector_env_step_action_backend_ms",
+            "Apply actions and execute the backend step.",
+        ),
         _collector_ms("Perf/collector_env_step_backend_ms", "Backend environment step."),
         _collector_ms(
             "Perf/collector_env_step_update_state_ms",
@@ -404,8 +507,16 @@ METRIC_SPECS: dict[str, MetricSpec] = {
             "Process resets and done observations.",
         ),
         _collector_ms(
+            "Perf/collector_transition_extract_ms",
+            "Extract one transition from the environment state without crossing the replay boundary.",
+        ),
+        _collector_ms(
             "Perf/collector_replay_write_ms",
             "Write transitions to replay storage.",
+        ),
+        _collector_ms(
+            "Perf/collector_metrics_publish_ms",
+            "Update and publish collector episode metrics.",
         ),
     )
 }

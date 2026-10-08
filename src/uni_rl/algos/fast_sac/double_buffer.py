@@ -6,6 +6,7 @@ import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
+import torch
 from omegaconf import DictConfig, OmegaConf
 
 from uni_rl.algos.fast_sac.learner import FastSACLearner
@@ -15,6 +16,11 @@ from uni_rl.offpolicy.double_buffer_runner import DoubleBufferOffPolicyRunner
 from uni_rl.offpolicy.runtime import resolve_actor_adapter_modules, resolve_custom_offpolicy_runtime
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
+from uni_rl.utils.tensor_runtime import (
+    InferencePlacement,
+    resolve_inference_transport,
+    resolve_tensor_runtime_settings,
+)
 
 if TYPE_CHECKING:
     from uni_rl.ipc.dp_sync import DpParameterSync
@@ -28,6 +34,7 @@ def build_sac_double_buffer_runner(
     replay_prefetch_mode: str,
     device: str,
     nan_guard_cfg: NanGuardCfg | None = None,
+    nan_guard_factory: Callable[[NanGuardCfg, int, bool], Any] | None = None,
     torch_thread_runtime: dict[str, Any] | None = None,
     collector_cpu_ids: list[int] | None = None,
     dp_sync: DpParameterSync | None = None,
@@ -41,6 +48,28 @@ def build_sac_double_buffer_runner(
     # forwards the list to the spawn collector.
     actor_adapter_modules = resolve_actor_adapter_modules(rl_cfg, custom_runtime)
     import_actor_adapter_modules(actor_adapter_modules)
+    # Resolve public tensor-runtime bounds before constructing a one-env probe.
+    # Invalid training knobs must fail closed without materializing a backend.
+    tensor_runtime_settings = resolve_tensor_runtime_settings(
+        cfg,
+        algo_name="FastSAC",
+        num_envs=cfg.algo.num_envs,
+    )
+    probe_env = env_factory(1, env_cfg_override)
+    try:
+        probe_state = probe_env.init_state()
+        probe_observation = probe_state.obs.get("obs")
+        env_tensor_native = isinstance(probe_observation, torch.Tensor) and str(
+            probe_observation.device
+        ).startswith("cuda")
+    finally:
+        probe_env.close()
+    inference_placement = resolve_inference_transport(
+        cfg,
+        device=device,
+        algo_name="FastSAC",
+        env_tensor_native=env_tensor_native,
+    )
 
     if "inference_request_timeout_sec" in cfg.training:
         warnings.warn(
@@ -57,8 +86,6 @@ def build_sac_double_buffer_runner(
         action_dim = int(action_shape[0])
     finally:
         env.close()
-
-    batch_size = cfg.algo.batch_size
 
     learner_cls: type[Any] = FastSACLearner
     algo_type = "sac"
@@ -108,9 +135,9 @@ def build_sac_double_buffer_runner(
         env_factory=env_factory,
         num_envs=cfg.algo.num_envs,
         replay_buffer_n=cfg.algo.replay_buffer_n,
-        batch_size=batch_size,
+        batch_size=tensor_runtime_settings.batch_size,
         learning_starts=cfg.algo.learning_starts,
-        updates_per_step=cfg.algo.updates_per_step,
+        updates_per_step=tensor_runtime_settings.updates_per_step,
         policy_frequency=cfg.algo.policy_frequency,
         env_steps_per_sync=cfg.training.env_steps_per_sync,
         device=device,
@@ -124,6 +151,7 @@ def build_sac_double_buffer_runner(
         replay_prefetch_mode=replay_prefetch_mode,
         seed=cfg.algo.seed,
         nan_guard_cfg=nan_guard_cfg,
+        nan_guard_factory=nan_guard_factory,
         torch_thread_runtime=torch_thread_runtime,
         collector_cpu_ids=collector_cpu_ids,
         dp_sync=dp_sync,
@@ -132,5 +160,7 @@ def build_sac_double_buffer_runner(
         ),
         backend_device_binder=backend_device_binder,
         actor_adapter_modules=actor_adapter_modules,
+        inference_placement=inference_placement,
+        tensor_runtime_settings=tensor_runtime_settings,
         log_interval=int(cfg.training.log_interval),
     )

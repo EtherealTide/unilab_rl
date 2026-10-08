@@ -157,6 +157,10 @@ class RewardNormalizer:
 class FlashSACLearner(LearnerBoilerplateMixin):
     supports_deferred_update_metrics = True
 
+    def inference_startup_memory_categories(self, batch_size: int) -> dict[str, int]:
+        """Expose exact inference-owned persistent scratch before collection."""
+        return self.actor.inference_startup_memory_categories(batch_size)
+
     def __init__(
         self,
         obs_dim: int,
@@ -338,7 +342,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
     @property
     def use_update_cycle(self) -> bool:
         """Whether this learner owns the whole-cycle update orchestration."""
-        return self._compile_full_update_cycle
+        return bool(self._compile_full_update_cycle and self._gradient_sync is None)
 
     def prepare_for_collection(self, warmup_context: OffPolicyWarmupContext) -> None:
         """Compile/capture learner update cold paths before collection starts.
@@ -403,9 +407,10 @@ class FlashSACLearner(LearnerBoilerplateMixin):
                 torch.cuda.synchronize(self.device)
 
     def set_gradient_sync(self, sync: Callable[[Iterable[torch.Tensor]], None] | None) -> None:
-        """Attach the compatibility-device DP reduction."""
+        """Attach DP reduction and permanently leave the whole-cycle graph."""
         if sync is not None and self._compile_full_update_cycle:
-            raise RuntimeError("FlashSAC NVIDIA CUDA whole-cycle mode does not support DP fallback")
+            self._compile_full_update_cycle = False
+            self._reset_update_cycle_graph()
         self._gradient_sync = sync
 
     def _compile_training_methods(self) -> None:

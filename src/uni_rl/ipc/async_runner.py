@@ -150,6 +150,7 @@ class AsyncRunner(ABC):
                 resource.cleanup()
             elif hasattr(resource, "close"):
                 resource.close()
+        self._shared_resources.clear()
 
         if self._error_recv is not None:
             try:
