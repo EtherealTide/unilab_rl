@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.4.6] - 2026-10-08
+## [1.5.0] - 2026-10-08
 
 ### Added
 
@@ -38,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- APPO collection is tensor-native (#84). The environment contract now requires
+  contiguous float32 Torch actions, Torch observations/rewards/flags, and
+  one-dimensional Torch reset indices. APPO rollout IPC and learner staging use
+  tensor-owned shared storage with explicit device copies; NumPy is no longer
+  a trainer boundary. APPO also accepts the off-policy tensor NaN-guard factory.
+- Gaussian APPO target/current standard deviations are derived directly from
+  distribution parameters (`std_param` or `log_std_param`), eliminating
+  dependence on `MLPModel.output_std` sample-time cache state.
 - Made `SAC` the sole public identity for the high-performance SAC
   implementation, with no compatibility layer: the package is
   `uni_rl.algos.sac`, the learner class is `SACLearner`, and display/log names

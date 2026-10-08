@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import queue
 
-import numpy as np
+import torch
 
 from uni_rl.algos.appo.worker import (
     compute_timeout_bootstrap_correction,
@@ -21,12 +21,12 @@ def test_compute_timeout_bootstrap_correction_uses_final_observation_value():
         critic=_FakeCritic(),
         collector_device="cpu",
         gamma=0.5,
-        timeout_mask=np.array([True, False]),
-        final_obs=np.array([[2.0, 3.0], [9.0, 9.0]], dtype=np.float32),
-        final_critic=np.array([[2.0, 3.0], [9.0, 9.0]], dtype=np.float32),
+        timeout_mask=torch.tensor([True, False]),
+        final_obs=torch.tensor([[2.0, 3.0], [9.0, 9.0]], dtype=torch.float32),
+        final_critic=torch.tensor([[2.0, 3.0], [9.0, 9.0]], dtype=torch.float32),
     )
 
-    np.testing.assert_allclose(correction, np.array([2.5, 0.0], dtype=np.float32))
+    torch.testing.assert_close(correction, torch.tensor([2.5, 0.0], dtype=torch.float32))
 
 
 def test_compute_timeout_bootstrap_correction_prefers_explicit_final_critic():
@@ -34,12 +34,12 @@ def test_compute_timeout_bootstrap_correction_prefers_explicit_final_critic():
         critic=_FakeCritic(),
         collector_device="cpu",
         gamma=0.5,
-        timeout_mask=np.array([True, False]),
-        final_obs=np.array([[2.0, 3.0], [9.0, 9.0]], dtype=np.float32),
-        final_critic=np.array([[11.0, 13.0], [0.0, 0.0]], dtype=np.float32),
+        timeout_mask=torch.tensor([True, False]),
+        final_obs=torch.tensor([[2.0, 3.0], [9.0, 9.0]], dtype=torch.float32),
+        final_critic=torch.tensor([[11.0, 13.0], [0.0, 0.0]], dtype=torch.float32),
     )
 
-    np.testing.assert_allclose(correction, np.array([12.0, 0.0], dtype=np.float32))
+    torch.testing.assert_close(correction, torch.tensor([12.0, 0.0], dtype=torch.float32))
 
 
 def test_put_latest_metrics_replaces_stale_item_when_queue_is_full(capsys):

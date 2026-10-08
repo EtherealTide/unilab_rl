@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import numpy as np
-from conftest import FakeVecEnv
+import torch
+from conftest import FakeVecEnv, _FakePlayCapabilities, _FakeSpace
 
 from uni_rl.env_contract import (
     EnvAlgoCapabilities,
     EnvAlgoCapabilitiesProtocol,
+    EnvProtocol,
+    EnvStateProtocol,
     SupportsAlgoCapabilitiesProtocol,
     get_algo_capabilities,
 )
@@ -71,3 +74,43 @@ def test_default_carrier_is_frozen():
         pass
     else:  # pragma: no cover
         raise AssertionError("EnvAlgoCapabilities must be frozen")
+
+
+def test_env_state_protocol_accepts_tensor_carriers() -> None:
+    class _TensorState:
+        obs = {"obs": torch.zeros(2, 3)}
+        reward = torch.zeros(2)
+        terminated = torch.zeros(2, dtype=torch.bool)
+        truncated = torch.zeros(2, dtype=torch.bool)
+        info: dict = {}
+        final_observation = None
+
+    assert isinstance(_TensorState(), EnvStateProtocol)
+
+
+def test_env_protocol_requires_authoritative_device() -> None:
+    class _NoDeviceEnv:
+        num_envs = 1
+        obs_groups_spec = {"obs": 1}
+        observation_space = _FakeSpace((1,))
+        action_space = _FakeSpace((1,))
+        state = None
+        cfg = object()
+        play_capabilities = _FakePlayCapabilities()
+
+        def init_state(self):
+            return None
+
+        def step(self, actions):
+            return None
+
+        def reset(self, env_indices):
+            return {}, {}
+
+        def set_nan_guard(self, guard):
+            return None
+
+        def close(self):
+            return None
+
+    assert not isinstance(_NoDeviceEnv(), EnvProtocol)

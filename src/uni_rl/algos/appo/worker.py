@@ -1,6 +1,6 @@
 """APPO Rollout Worker — runs in a subprocess.
 
-Collects rollout payloads and writes them to RolloutRingBuffer.
+Collects rollout payloads and writes them to the tensor rollout ring.
 """
 
 from __future__ import annotations
@@ -12,13 +12,10 @@ from collections import defaultdict, deque
 from queue import Empty, Full
 from typing import Any, Dict
 
-import numpy as np
 import torch
 from rsl_rl.utils import resolve_callable
 
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
-from uni_rl.utils.final_observation import resolve_terminal_observation_contract
-from uni_rl.utils.observations import split_obs_dict
 from uni_rl.utils.seed import apply_training_seed
 
 
@@ -56,26 +53,25 @@ def compute_timeout_bootstrap_correction(
     critic: Any,
     collector_device: str,
     gamma: float,
-    timeout_mask: np.ndarray,
-    final_obs: np.ndarray,
-    final_critic: np.ndarray,
-) -> np.ndarray:
-    """Compute gamma * V(final_observation) for current timeout envs."""
-    corrections = np.zeros(timeout_mask.shape, dtype=np.float32)
-    if not np.any(timeout_mask):
+    timeout_mask: torch.Tensor,
+    final_obs: torch.Tensor,
+    final_critic: torch.Tensor,
+) -> torch.Tensor:
+    """Compute ``gamma * V(final_observation)`` for current timeout rows."""
+    corrections = torch.zeros_like(timeout_mask, dtype=torch.float32)
+    if not bool(torch.any(timeout_mask)):
         return corrections
 
     from tensordict import TensorDict
 
-    critic_input_np = final_critic
-    critic_input = torch.from_numpy(critic_input_np[timeout_mask]).to(collector_device)
+    critic_input = final_critic[timeout_mask].to(device=collector_device)
     critic_td = TensorDict(
         {"policy": critic_input},
         batch_size=critic_input.shape[0],
         device=collector_device,
     )
     with torch.no_grad():
-        bootstrap = critic(critic_td).squeeze(-1).cpu().numpy().astype(np.float32, copy=False)
+        bootstrap = critic(critic_td).squeeze(-1).to(device=timeout_mask.device)
     corrections[timeout_mask] = float(gamma) * bootstrap
     return corrections
 
@@ -100,6 +96,7 @@ def appo_collector_fn(
     env_cfg_override: dict | None = None,
     seed: int | None = None,
     nan_guard_cfg=None,
+    nan_guard_factory=None,
 ):
     """Entry point for the APPO collector subprocess.
 
@@ -111,12 +108,12 @@ def appo_collector_fn(
 
     from tensordict import TensorDict
 
-    from uni_rl.ipc import RolloutRingBuffer, SharedWeightSync
+    from uni_rl.ipc import SharedWeightSync, TensorRolloutRingBuffer
 
     apply_training_seed(seed, torch_runtime=True, cuda=True)
 
     # Connect to shared memory
-    ring_buffer = RolloutRingBuffer(
+    ring_buffer = TensorRolloutRingBuffer(
         num_envs=num_envs,
         num_steps=steps_per_env,
         obs_dim=obs_dim,
@@ -139,8 +136,9 @@ def appo_collector_fn(
     if nan_guard_cfg is not None and nan_guard_cfg.enabled:
         from uni_rl.utils.nan_guard import NanGuard
 
+        guard_factory = NanGuard if nan_guard_factory is None else nan_guard_factory
         env.set_nan_guard(
-            NanGuard(
+            guard_factory(
                 nan_guard_cfg,
                 num_envs=env.num_envs,
                 supports_state_playback=env.play_capabilities.supports_physics_state_playback,
@@ -195,34 +193,27 @@ def appo_collector_fn(
     critic.load_state_dict(critic_sd)
     local_critic_weight_version = critic_weight_sync.version
 
-    # Reset environment
-    env_indices = np.arange(num_envs, dtype=np.int32)
-    try:
-        obs_out, _ = env.reset(env_indices)
-    except TypeError:
-        obs_out, _ = env.reset()
+    # Reset environment using its authoritative tensor device.
+    obs_out, _ = env.reset(None)
+    obs_t = obs_out["obs"]
+    if not isinstance(obs_t, torch.Tensor):
+        raise TypeError(f"APPO actor observation must be torch.Tensor, got {type(obs_t).__name__}")
+    obs_t = obs_t.to(device=collector_device, dtype=torch.float32)
+    critic_obs_t = obs_out.get("critic")
+    if critic_obs_t is not None:
+        critic_obs_t = critic_obs_t.to(device=collector_device, dtype=torch.float32)
 
-    def to_float32_np(x):
-        if hasattr(x, "cpu"):
-            x = x.cpu().numpy()
-        return np.asarray(x, dtype=np.float32)
-
-    obs_np, critic_np = split_obs_dict(obs_out)
-    obs_np = to_float32_np(obs_np)
-    critic_np = to_float32_np(critic_np)
-
-    # Pre-allocate obs TensorDict once; update in-place each step to avoid
-    # repeated TensorDict construction overhead in the hot loop.
-    obs_torch = torch.zeros((num_envs, obs_dim), dtype=torch.float32, device=collector_device)
-    obs_td = TensorDict({"policy": obs_torch}, batch_size=num_envs, device=collector_device)
+    # Pre-allocate actor inference TensorDict once. The persistent actor input
+    # moves once to the collector device at each observation boundary.
+    obs_td = TensorDict({"policy": obs_t}, batch_size=num_envs, device=collector_device)
 
     total_steps = 0
     # Bounded rolling window of the most recent completed episodes; an
     # unbounded list here grows for the entire run.
     ep_rewards: deque[float] = deque(maxlen=100)
     ep_lengths: deque[int] = deque(maxlen=100)
-    current_ep_rewards = np.zeros(num_envs, dtype=np.float32)
-    current_ep_lengths = np.zeros(num_envs, dtype=np.int32)
+    current_ep_rewards = torch.zeros(num_envs, dtype=torch.float32, device=obs_t.device)
+    current_ep_lengths = torch.zeros(num_envs, dtype=torch.int64, device=obs_t.device)
     ep_reward_components = defaultdict(list)
 
     # Episode completion counters (reset after each metrics report)
@@ -252,26 +243,31 @@ def appo_collector_fn(
             # Collect one rollout of length steps_per_env
             write_buf = ring_buffer.write_buffer
             for step in range(steps_per_env):
-                # --- MLP inference (timed) ---
                 t_mlp = time.perf_counter()
                 with torch.no_grad():
-                    obs_torch.copy_(torch.from_numpy(obs_np))
                     actions_torch = actor(obs_td, stochastic_output=True)
                     log_probs_torch = actor.get_output_log_prob(actions_torch)
-                    actions_np = actions_torch.cpu().numpy()
                 ema_mlp_infer_ms = (1 - _EMA) * ema_mlp_infer_ms + _EMA * (
                     (time.perf_counter() - t_mlp) * 1000
                 )
 
-                write_buf["obs"][:, step, :] = obs_np
-                if critic_np is not None:
-                    write_buf["critic"][:, step, :] = critic_np
-                write_buf["actions"][:, step, :] = actions_np
-                write_buf["log_probs"][:, step] = log_probs_torch.cpu().numpy().ravel()
+                write_buf["obs"][:, step].copy_(obs_t, non_blocking=False)
+                if critic_obs_t is not None:
+                    write_buf["critic"][:, step].copy_(critic_obs_t, non_blocking=False)
+                write_buf["actions"][:, step].copy_(actions_torch, non_blocking=False)
+                write_buf["log_probs"][:, step].copy_(
+                    log_probs_torch.reshape(num_envs), non_blocking=False
+                )
 
-                # --- Env step (timed) ---
+                # Move once to the environment's authoritative device. This is
+                # the only action transfer; there is no host carrier.
+                action_env = actions_torch.to(
+                    device=env.device, dtype=torch.float32, copy=True
+                ).contiguous()
+                if action_env.shape != (num_envs, action_dim):
+                    raise ValueError(f"APPO action shape must be {(num_envs, action_dim)}")
                 t_env = time.perf_counter()
-                state = env.step(actions_np)
+                state = env.step(action_env)
                 ema_env_step_ms = (1 - _EMA) * ema_env_step_ms + _EMA * (
                     (time.perf_counter() - t_env) * 1000
                 )
@@ -280,71 +276,84 @@ def appo_collector_fn(
                         key, 0.0
                     ) + _EMA * value
 
-                next_obs_raw = state.obs
-                reward_raw = np.asarray(state.reward, dtype=np.float32).ravel()
-                truncated_raw = state.truncated.astype(np.float32, copy=False).ravel()
-                combined_done_raw = (
-                    (state.terminated | state.truncated).astype(np.float32, copy=False).ravel()
+                next_obs = state.obs
+                next_obs_t = next_obs["obs"]
+                next_critic_t = next_obs.get("critic")
+                required_state = {
+                    "obs": next_obs_t,
+                    "reward": state.reward,
+                    "terminated": state.terminated,
+                    "truncated": state.truncated,
+                }
+                if next_critic_t is not None:
+                    required_state["critic"] = next_critic_t
+                for label, value in required_state.items():
+                    if not isinstance(value, torch.Tensor):
+                        raise TypeError(
+                            f"APPO env {label} must be torch.Tensor, got {type(value).__name__}"
+                        )
+                if state.terminated.dtype != torch.bool or state.truncated.dtype != torch.bool:
+                    raise TypeError("APPO terminated/truncated tensors must be torch.bool")
+                if not state.reward.is_floating_point():
+                    raise TypeError("APPO reward tensor must be floating-point")
+
+                reward_t = state.reward.to(device=obs_t.device, dtype=torch.float32).reshape(
+                    num_envs
                 )
-
-                next_actor_obs_np, next_critic_np = split_obs_dict(next_obs_raw)
-                next_actor_obs_np = to_float32_np(next_actor_obs_np)
-                next_critic_np = to_float32_np(next_critic_np)
-                terminal_contract = resolve_terminal_observation_contract(
-                    next_obs_batch_size=next_actor_obs_np.shape[0],
-                    final_observation=state.final_observation,
-                    done=combined_done_raw > 0.5,
-                    info=state.info,
-                    truncated=truncated_raw,
+                truncated_t = state.truncated.to(device=obs_t.device).float()
+                combined_done_t = (
+                    (state.terminated | state.truncated).to(device=obs_t.device).float()
                 )
-
-                environment_rewards = reward_raw.copy()
-                reward_raw += compute_timeout_bootstrap_correction(
-                    critic=critic,
-                    collector_device=collector_device,
-                    gamma=float(cfg["algorithm"].get("gamma", 0.99)),
-                    timeout_mask=terminal_contract.timeout_terminal_mask,
-                    final_obs=(
-                        terminal_contract.terminal_obs
-                        if terminal_contract.terminal_obs is not None
-                        else next_actor_obs_np
-                    ),
-                    final_critic=(
-                        terminal_contract.terminal_critic
-                        if terminal_contract.terminal_critic is not None
-                        else next_critic_np
-                    ),
+                final_observation = state.final_observation
+                final_obs = (
+                    final_observation["obs"]
+                    if final_observation is not None and "obs" in final_observation
+                    else None
                 )
+                final_critic = (
+                    final_observation["critic"]
+                    if final_observation is not None and "critic" in final_observation
+                    else None
+                )
+                timeout_mask = torch.logical_and(combined_done_t > 0.5, truncated_t > 0.5)
+                environment_rewards = reward_t.clone()
+                if bool(torch.any(timeout_mask)):
+                    bootstrap_critic = final_critic if final_critic is not None else next_critic_t
+                    if bootstrap_critic is None:
+                        bootstrap_critic = next_obs_t
+                    reward_t += compute_timeout_bootstrap_correction(
+                        critic=critic,
+                        collector_device=collector_device,
+                        gamma=float(cfg["algorithm"].get("gamma", 0.99)),
+                        timeout_mask=timeout_mask,
+                        final_obs=final_obs if final_obs is not None else next_obs_t,
+                        final_critic=bootstrap_critic,
+                    )
 
-                write_buf["rewards"][:, step] = reward_raw
-                write_buf["dones"][:, step] = combined_done_raw
-                write_buf["truncated"][:, step] = truncated_raw
+                write_buf["rewards"][:, step].copy_(reward_t, non_blocking=False)
+                write_buf["dones"][:, step].copy_(combined_done_t, non_blocking=False)
+                write_buf["truncated"][:, step].copy_(truncated_t, non_blocking=False)
 
-                # Episode tracking (vectorized)
                 total_steps += num_envs
                 current_ep_rewards += environment_rewards
                 current_ep_lengths += 1
-                reset_indices = np.where(combined_done_raw > 0.5)[0]
-                if len(reset_indices) > 0:
-                    ep_rewards.extend(current_ep_rewards[reset_indices].tolist())
-                    ep_lengths.extend(current_ep_lengths[reset_indices].tolist())
-                    current_ep_rewards[reset_indices] = 0.0
-                    current_ep_lengths[reset_indices] = 0
-                    ep_completions += len(reset_indices)
-                    ep_timeouts += int(np.sum(truncated_raw[reset_indices] > 0.5))
+                done_rows = torch.nonzero(combined_done_t > 0.5, as_tuple=False).flatten()
+                if done_rows.numel() > 0:
+                    ep_rewards.extend(current_ep_rewards[done_rows].detach().cpu().tolist())
+                    ep_lengths.extend(current_ep_lengths[done_rows].detach().cpu().tolist())
+                    current_ep_rewards[done_rows] = 0.0
+                    current_ep_lengths[done_rows] = 0
+                    ep_completions += int(done_rows.numel())
+                    ep_timeouts += int(torch.sum(truncated_t[done_rows] > 0.5).item())
 
                 log_info = state.info.get("log", {})
                 for k, v in log_info.items():
                     if k.startswith("reward/"):
                         ep_reward_components[k.removeprefix("reward/")].append(v)
 
-                # Report every env step so learner-side reward and throughput
-                # displays track the current policy without extra lag.
                 if metrics_queue is not None:
                     try:
-                        msg: dict[str, Any] = {
-                            "total_steps": total_steps,
-                        }
+                        msg: dict[str, Any] = {"total_steps": total_steps}
                         if ep_rewards:
                             msg["return_mean_ep100"] = statistics.mean(ep_rewards)
                             msg["mean_episode_length"] = (
@@ -354,7 +363,6 @@ def appo_collector_fn(
                             msg["timeout_rate"] = ep_timeouts / ep_completions
                             ep_timeouts = 0
                             ep_completions = 0
-                        # Collector-side timing breakdown
                         collector_timing_ms = {
                             "mlp_infer_ms": ema_mlp_infer_ms,
                             "env_step_ms": ema_env_step_ms,
@@ -375,12 +383,13 @@ def appo_collector_fn(
                             file=sys.stderr,
                         )
 
-                obs_np = next_actor_obs_np
-                critic_np = next_critic_np
+                obs_t = next_obs_t.to(device=collector_device, dtype=torch.float32)
+                obs_td = TensorDict({"policy": obs_t}, batch_size=num_envs, device=collector_device)
+                if next_critic_t is not None:
+                    critic_obs_t = next_critic_t.to(device=collector_device, dtype=torch.float32)
+                else:
+                    critic_obs_t = None
 
-            write_buf["last_obs"][:] = obs_np
-            if critic_np is not None:
-                write_buf["last_critic"][:] = critic_np
             ring_buffer.signal_write_done()  # atomic increment, non-blocking
             latest_rollout_ms = (time.perf_counter() - t_rollout_start) * 1000
 

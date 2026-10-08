@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 import torch.nn as nn
 
 from uni_rl.algos.appo.learner import APPOLearner
 from uni_rl.logging.metric_schema import normalize_metric_map
+
+
+class _Distribution:
+    def __init__(self, std_param: torch.Tensor) -> None:
+        self.std_type = "scalar"
+        self.std_param = std_param
 
 
 class _Actor(nn.Module):
@@ -18,7 +22,7 @@ class _Actor(nn.Module):
         self.output_mean = torch.zeros(1, action_dim)
         self.output_std = torch.ones(1, action_dim)
         self.output_entropy = torch.tensor(0.0)
-        self.distribution = SimpleNamespace(std_type="scalar", std_param=self.log_std)
+        self.distribution = _Distribution(self.log_std.exp().detach())
         self.mlp = self.linear
         self.obs_normalizer = lambda obs: obs
 
@@ -92,7 +96,7 @@ def test_appo_process_batch_syncs_target_actor_normalization_buffers():
     with torch.inference_mode():
         learner.actor(obs_td, stochastic_output=True)
         mu = learner.actor.output_mean
-        sigma = learner.actor.output_std
+        sigma = learner.actor.log_std.exp().expand_as(mu)
         old_mu = batch["_old_mu"]
         old_sigma = batch["_old_sigma"]
         kl = torch.sum(

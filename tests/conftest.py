@@ -157,3 +157,125 @@ class FakeEnvFactory:
 @pytest.fixture
 def fake_env_factory() -> FakeEnvFactory:
     return FakeEnvFactory()
+
+
+@dataclass
+class StrictTensorEnvState:
+    obs: dict[str, torch.Tensor]
+    reward: torch.Tensor
+    terminated: torch.Tensor
+    truncated: torch.Tensor
+    info: dict[str, Any] = field(default_factory=dict)
+    final_observation: dict[str, torch.Tensor] | None = None
+
+
+class StrictTensorEnv:
+    """Tensor-native env that rejects NumPy actions/reset indices."""
+
+    def __init__(self, num_envs: int = 1, obs_dim: int = 3, action_dim: int = 2) -> None:
+        self._num_envs = num_envs
+        self._obs_dim = obs_dim
+        self._action_dim = action_dim
+        self._device = torch.device("cpu")
+        self._step_index = 0
+        self._state: StrictTensorEnvState | None = None
+
+    @property
+    def num_envs(self) -> int:
+        return self._num_envs
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @property
+    def obs_groups_spec(self) -> dict[str, int]:
+        return {"obs": self._obs_dim, "critic": self._obs_dim + 1}
+
+    @property
+    def observation_space(self) -> _FakeSpace:
+        return _FakeSpace((self._obs_dim + self._obs_dim + 1,))
+
+    @property
+    def action_space(self) -> _FakeSpace:
+        return _FakeSpace((self._action_dim,))
+
+    @property
+    def state(self) -> StrictTensorEnvState | None:
+        return self._state
+
+    @property
+    def cfg(self) -> Any:
+        return type("Cfg", (), {"max_episode_seconds": 1.0, "ctrl_dt": 0.02})()
+
+    @property
+    def play_capabilities(self) -> _FakePlayCapabilities:
+        return _FakePlayCapabilities()
+
+    def _obs(self) -> dict[str, torch.Tensor]:
+        return {
+            "obs": torch.full(
+                (self._num_envs, self._obs_dim), float(self._step_index), dtype=torch.float32
+            ),
+            "critic": torch.full(
+                (self._num_envs, self._obs_dim + 1), float(self._step_index), dtype=torch.float32
+            ),
+        }
+
+    def _new_state(self, terminal: bool) -> StrictTensorEnvState:
+        return StrictTensorEnvState(
+            obs=self._obs(),
+            reward=torch.full((self._num_envs,), float(self._step_index), dtype=torch.float32),
+            terminated=torch.full((self._num_envs,), terminal, dtype=torch.bool),
+            truncated=torch.full((self._num_envs,), terminal, dtype=torch.bool),
+            info={},
+            final_observation=self._obs() if terminal else None,
+        )
+
+    def init_state(self) -> StrictTensorEnvState:
+        self._step_index = 0
+        self._state = self._new_state(False)
+        return self._state
+
+    def step(self, actions: torch.Tensor) -> StrictTensorEnvState:
+        if not isinstance(actions, torch.Tensor):
+            raise TypeError(f"action must be torch.Tensor, got {type(actions).__name__}")
+        if actions.dtype != torch.float32 or not actions.is_contiguous():
+            raise TypeError("action must be contiguous float32")
+        if actions.device != self._device or actions.shape != (
+            self._num_envs,
+            self._action_dim,
+        ):
+            raise ValueError("action device/shape mismatch")
+        self._step_index += 1
+        self._state = self._new_state(self._step_index >= 2)
+        return self._state
+
+    def reset(self, env_indices: torch.Tensor | None) -> tuple[dict[str, torch.Tensor], dict]:
+        if env_indices is not None:
+            if not isinstance(env_indices, torch.Tensor):
+                raise TypeError("reset indices must be torch.Tensor")
+            if (
+                env_indices.dtype not in (torch.int32, torch.int64)
+                or env_indices.device != self._device
+            ):
+                raise TypeError("reset indices must be integer tensors on env.device")
+        return self._obs(), {}
+
+    def set_nan_guard(self, guard: Any) -> None:
+        del guard
+
+    def close(self) -> None:
+        pass
+
+
+class StrictTensorEnvFactory:
+    """Picklable factory for :class:`StrictTensorEnv`."""
+
+    def __init__(self, obs_dim: int = 3, action_dim: int = 2) -> None:
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+
+    def __call__(self, num_envs: int, env_cfg_override: Any = None) -> StrictTensorEnv:
+        del env_cfg_override
+        return StrictTensorEnv(num_envs, self.obs_dim, self.action_dim)
