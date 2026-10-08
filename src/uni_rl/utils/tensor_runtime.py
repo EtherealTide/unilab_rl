@@ -202,7 +202,9 @@ def _canonical_device(value: str, *, label: str, algo_name: str) -> str:
     if device.type == "cuda" and device.index is None:
         try:
             return f"cuda:{torch.cuda.current_device()}"
-        except RuntimeError:
+        except (AssertionError, RuntimeError):
+            # CPU-only test/CI builds can parse CUDA requests before a fake
+            # device is injected; preserve the explicitly requested topology.
             return "cuda"
     return str(device)
 

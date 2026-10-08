@@ -1194,11 +1194,23 @@ def test_collector_rejects_cuda_transport_with_cpu_ring() -> None:
         )
 
 
+class _CudaStubDeviceTensor(torch.Tensor):
+    """CPU tensor shaped enough for early CUDA-device validation on CPU CI."""
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cuda")
+
+
 def test_explicit_cpu_transport_rejects_cuda_tensor_observations() -> None:
     stop_event = threading.Event()
 
     class _State:
-        obs = {"obs": torch.zeros((1, 2), device="cuda")}
+        obs = {
+            "obs": torch.zeros((1, 2), device="cuda")
+            if torch.cuda.is_available()
+            else _CudaStubDeviceTensor()
+        }
         info = {}
 
     class _Env:
