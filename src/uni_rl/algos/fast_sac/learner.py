@@ -459,6 +459,11 @@ class FastSACLearner(LearnerBoilerplateMixin):
             device_gated=self._device_type == "cuda" and self.use_compile,
         )
         self._gradient_sync: Callable[[Iterable[torch.Tensor]], None] | None = None
+        self._gradient_graph_hooks: tuple[Callable[[], None], ...] | None = None
+        self._gradient_loss_flag = torch.empty(
+            (), device=device, dtype=torch.float32, requires_grad=True
+        )
+        self._gradient_loss_flag.grad = torch.zeros_like(self._gradient_loss_flag)
         self.nvtx_profile_ranges = bool(nvtx_profile_ranges) and self._device_type == "cuda"
         self.amp_dtype = amp_dtype
         self._amp_dtype = self._resolve_amp_dtype(amp_dtype, self._device_type)
@@ -654,10 +659,48 @@ class FastSACLearner(LearnerBoilerplateMixin):
                 torch.cuda.synchronize(self.device)
 
     def set_gradient_sync(self, sync: Callable[[Iterable[torch.Tensor]], None] | None) -> None:
-        """Attach the compatibility-device DP reduction."""
-        if sync is not None and self._compile_full_update_cycle:
-            raise RuntimeError("FastSAC NVIDIA CUDA whole-cycle mode does not support DP fallback")
+        """Attach gradient averaging at each optimizer boundary.
+
+        CUDA callers must supply a capture-safe collective and execute the same
+        update schedule on every rank. Changing the callback invalidates the
+        captured graph, whose communication nodes otherwise retain the old sync.
+        """
+        if sync != self._gradient_sync:
+            self._reset_update_cycle_graph()
+            self._gradient_graph_hooks = None
         self._gradient_sync = sync
+
+    def set_gradient_graph_hooks(
+        self,
+        begin_capture: Callable[[], None],
+        end_capture: Callable[[], None],
+        before_replay: Callable[[], None],
+    ) -> None:
+        """Register instrumentation at the actual graph lifecycle boundaries."""
+        hooks = (begin_capture, end_capture, before_replay)
+        if hooks != self._gradient_graph_hooks:
+            self._reset_update_cycle_graph()
+        self._gradient_graph_hooks = hooks
+
+    def _sync_loss_gradients(self, parameters: Iterable[torch.Tensor], loss: torch.Tensor) -> None:
+        """Piggyback loss validity on the existing CUDA gradient collective.
+
+        The sentinel is not an optimizer parameter or checkpoint field. Its
+        stable gradient address is reused by graph replay. Compatibility and
+        GradScaler paths retain their existing synchronization behavior.
+        """
+        if (
+            self._gradient_sync is None
+            or self._device_type != "cuda"
+            or self._host_finite_checks
+            or self.scaler is not None
+        ):
+            self._sync_gradients(parameters)
+            return
+        sentinel = self._gradient_loss_flag
+        assert sentinel.grad is not None
+        sentinel.grad.copy_(torch.logical_not(torch.isfinite(loss.detach()).all()))
+        self._sync_gradients((*parameters, sentinel))
 
     def normalize_obs(self, obs: torch.Tensor, update: bool = False) -> torch.Tensor:
         """Normalize actor observations using running statistics."""
@@ -684,8 +727,12 @@ class FastSACLearner(LearnerBoilerplateMixin):
         if self._host_finite_checks or self._device_type != "cuda":
             return
         found_inf = self._optimizer_found_inf
-        found_inf.copy_(torch.logical_not(torch.isfinite(loss.detach()).all()))
         if self._gradient_sync is not None:
+            assert self._gradient_loss_flag.grad is not None
+            if self.scaler is None:
+                found_inf.copy_(self._gradient_loss_flag.grad > 0)
+            else:
+                found_inf.copy_(torch.logical_not(torch.isfinite(loss.detach()).all()))
             gradients = [
                 parameter.grad
                 for group in optimizer.param_groups
@@ -700,8 +747,10 @@ class FastSACLearner(LearnerBoilerplateMixin):
                 )
             if optimizer is self.q_optimizer:
                 self._q_update_finite.copy_(torch.logical_not(found_inf.detach()))
-        elif optimizer is self.q_optimizer:
-            self._q_update_finite.copy_(torch.isfinite(loss.detach().all()))
+        else:
+            found_inf.copy_(torch.logical_not(torch.isfinite(loss.detach()).all()))
+            if optimizer is self.q_optimizer:
+                self._q_update_finite.copy_(torch.logical_not(found_inf.detach()))
         setattr(optimizer, "grad_scale", self._optimizer_grad_scale)
         setattr(optimizer, "found_inf", found_inf)
 
@@ -1063,24 +1112,31 @@ class FastSACLearner(LearnerBoilerplateMixin):
             key: value.detach().clone() for key, value in large_batch.items()
         }
         static_batch = self._update_cycle_static_batch
-        self._warm_update_cycle_graph(
-            static_batch,
-            updates_per_step=updates_per_step,
-            policy_frequency=policy_frequency,
-            target_frequency=target_frequency,
-            policy_before_critic=policy_before_critic,
-        )
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.device(self.device), torch.cuda.graph(graph):
-            self._run_update_cycle_core(
+        hooks = self._gradient_graph_hooks
+        if hooks is not None:
+            hooks[0]()
+        try:
+            self._warm_update_cycle_graph(
                 static_batch,
                 updates_per_step=updates_per_step,
                 policy_frequency=policy_frequency,
                 target_frequency=target_frequency,
                 policy_before_critic=policy_before_critic,
             )
-        self._update_cycle_graph = graph
-        self._update_cycle_graph_metric_values = self._pending_cycle_metric_values
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.device(self.device), torch.cuda.graph(graph):
+                self._run_update_cycle_core(
+                    static_batch,
+                    updates_per_step=updates_per_step,
+                    policy_frequency=policy_frequency,
+                    target_frequency=target_frequency,
+                    policy_before_critic=policy_before_critic,
+                )
+            self._update_cycle_graph = graph
+            self._update_cycle_graph_metric_values = self._pending_cycle_metric_values
+        finally:
+            if hooks is not None:
+                hooks[1]()
 
     def update_cycle(
         self,
@@ -1107,6 +1163,8 @@ class FastSACLearner(LearnerBoilerplateMixin):
             policy_before_critic=policy_before_critic,
         )
         assert self._update_cycle_graph is not None
+        if self._gradient_graph_hooks is not None:
+            self._gradient_graph_hooks[2]()
         self._update_cycle_graph.replay()
         self._pending_cycle_metric_values = self._update_cycle_graph_metric_values
 
@@ -1146,7 +1204,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
             if self.scaler:
                 with _cuda_nvtx_range("critic/backward", self.nvtx_profile_ranges):
                     self.scaler.scale(qf_loss).backward()
-                self._sync_gradients(self.qnet.parameters())
+                self._sync_loss_gradients(self.qnet.parameters(), qf_loss)
                 self.scaler.unscale_(self.q_optimizer)
                 if self.max_grad_norm > 0:
                     with _cuda_nvtx_range("critic/grad_clip", self.nvtx_profile_ranges):
@@ -1161,7 +1219,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
             else:
                 with _cuda_nvtx_range("critic/backward", self.nvtx_profile_ranges):
                     qf_loss.backward()
-                self._sync_gradients(self.qnet.parameters())
+                self._sync_loss_gradients(self.qnet.parameters(), qf_loss)
                 if self.max_grad_norm > 0:
                     with _cuda_nvtx_range("critic/grad_clip", self.nvtx_profile_ranges):
                         critic_grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1185,7 +1243,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
             if self._finite_check_ok(alpha_loss, read_metrics):
                 with _cuda_nvtx_range("critic/alpha_backward", self.nvtx_profile_ranges):
                     alpha_loss.backward()
-                self._sync_gradients((self.log_alpha,))
+                self._sync_loss_gradients((self.log_alpha,), alpha_loss)
                 with _cuda_nvtx_range("critic/alpha_optimizer_step", self.nvtx_profile_ranges):
                     self._arm_optimizer_finite_gate(self.alpha_optimizer, alpha_loss)
                     self.alpha_optimizer.step()
@@ -1245,7 +1303,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
             if self.scaler:
                 with _cuda_nvtx_range("actor/backward", self.nvtx_profile_ranges):
                     self.scaler.scale(actor_loss).backward()
-                self._sync_gradients(self.actor.parameters())
+                self._sync_loss_gradients(self.actor.parameters(), actor_loss)
                 self.scaler.unscale_(self.actor_optimizer)
                 if self.max_grad_norm > 0:
                     with _cuda_nvtx_range("actor/grad_clip", self.nvtx_profile_ranges):
@@ -1260,7 +1318,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
             else:
                 with _cuda_nvtx_range("actor/backward", self.nvtx_profile_ranges):
                     actor_loss.backward(inputs=list(self.actor.parameters()))
-                self._sync_gradients(self.actor.parameters())
+                self._sync_loss_gradients(self.actor.parameters(), actor_loss)
                 if self.max_grad_norm > 0:
                     with _cuda_nvtx_range("actor/grad_clip", self.nvtx_profile_ranges):
                         actor_grad_norm = torch.nn.utils.clip_grad_norm_(
