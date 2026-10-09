@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Clarified the `Perf/collector_env_step_ms` and `Perf/collection_time`
+  metric descriptions (unilabsim/UniLab#2102): the former is the EMA of one
+  vectorized environment step, the latter one complete rollout
+  (`steps_per_env` steps plus bookkeeping), so the two must not be compared
+  directly.
+
 ## [1.4.10] - 2026-10-09
 
 ### Fixed
