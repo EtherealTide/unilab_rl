@@ -15,6 +15,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`steps_per_env` steps plus bookkeeping), so the two must not be compared
   directly.
 
+### Fixed
+
+- Orphaned collector processes after an abnormal learner exit
+  (SIGKILL, OOM killer, test-timeout kill). `daemon=True` only cleans up
+  when the parent exits through the Python interpreter, so spawn collectors
+  were reparented to PID 1 and kept running the env hot loop on a
+  `stop_event` nobody would ever set. Every collector entry point now
+  installs a parent-death watchdog (`uni_rl.ipc.parent_watchdog`): a daemon
+  thread compares `os.getppid()` against the learner PID handed over at
+  spawn (handed, not read back — a learner killed during the child's slow
+  spawn boot leaves it reparented before its entry point runs). On parent
+  death the watchdog sets `stop_event` for a graceful drain and, after a
+  bounded grace period, forces `os._exit` so a wedged interpreter
+  finalization (native thread join) cannot keep the process alive either.
+  The mechanism is POSIX-portable and covers both macOS and Linux without
+  relying on `daemon=True` or `prctl(PR_SET_PDEATHSIG)`. Entry points
+  running inline in the spawner's own process (test doubles) install no
+  watchdog.
+
 ## [1.4.10] - 2026-10-09
 
 ### Fixed

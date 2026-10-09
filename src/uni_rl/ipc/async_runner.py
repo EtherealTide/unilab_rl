@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import sys
 from abc import ABC, abstractmethod
 from typing import Any, Callable
@@ -12,6 +13,11 @@ from uni_rl.ipc.collector_error import (
     collector_error_guard,
     create_error_pipe,
     format_collector_death,
+)
+from uni_rl.ipc.parent_watchdog import (
+    DEFAULT_GRACE_PERIOD_S,
+    DEFAULT_POLL_INTERVAL_S,
+    install_parent_watchdog,
 )
 
 _SPAWN_CTX = mp.get_context("spawn")
@@ -26,8 +32,20 @@ def _collector_entry_wrapper(
 
     Ensures ALL exceptions (including import errors and env creation
     failures) are captured and sent to the parent via the error pipe.
+
+    Also installs the parent-death watchdog: ``daemon=True`` only covers
+    parents that exit through the Python interpreter, so a SIGKILLed
+    learner would otherwise leave the collector orphaned on a stop_event
+    nobody sets.
     """
     label = kwargs.pop("_error_label", "collector")
+    install_parent_watchdog(
+        stop_event=kwargs.get("stop_event"),
+        parent_pid=kwargs.pop("_parent_pid", None),
+        poll_interval=kwargs.pop("_parent_watchdog_poll_interval", DEFAULT_POLL_INTERVAL_S),
+        grace_period=kwargs.pop("_parent_watchdog_grace_period", DEFAULT_GRACE_PERIOD_S),
+        label=label,
+    )
     with collector_error_guard(
         error_conn=error_conn,
         metrics_queue=kwargs.get("metrics_queue"),
@@ -89,6 +107,11 @@ class AsyncRunner(ABC):
     def _start_collector(self, target_fn: Callable, kwargs: dict) -> None:
         self._error_recv, self._error_send = create_error_pipe()
 
+        # Hand the learner PID to the collector for its parent-death
+        # watchdog. The child cannot read it back from getppid(): a learner
+        # killed during the child's slow spawn boot leaves it reparented to
+        # PID 1 before the entry point runs.
+        kwargs = {**kwargs, "_parent_pid": os.getpid()}
         self._collector_process = _SPAWN_CTX.Process(
             target=_collector_entry_wrapper,
             args=(target_fn, self._error_send, kwargs),
