@@ -355,7 +355,8 @@ METRIC_SPECS: dict[str, MetricSpec] = {
             "collector",
             "s",
             "most recently completed rollout phase",
-            "Upstream-RSL-RL-compatible collection phase timing.",
+            "Upstream-RSL-RL-compatible collection phase timing; one complete rollout "
+            "(all vectorized env steps), unlike the per-step Perf/collector_env_step_ms EMA.",
         ),
         _spec(
             "Perf/learning_time",
@@ -484,7 +485,12 @@ METRIC_SPECS: dict[str, MetricSpec] = {
             "maximum publication lag since the previous collector report",
             "Observed ordered backlog without converting it into an out-of-order environment action.",
         ),
-        _collector_ms("Perf/collector_env_step_ms", "Environment step wall time."),
+        _collector_ms(
+            "Perf/collector_env_step_ms",
+            "Single vectorized environment step wall time. One complete rollout is "
+            "steps_per_env of these steps plus rollout bookkeeping; compare rollout "
+            "cost against Perf/collection_time, not this per-step EMA.",
+        ),
         _collector_ms(
             "Perf/collector_env_step_action_validate_ms",
             "Validate public policy actions.",
